@@ -75,7 +75,8 @@ try {
     git add package.json
     if (Test-Path "$root\package-lock.json") { git add package-lock.json }
     git commit -m "chore(release): $tag"
-    git tag $tag
+    # Annotated tag so `git push --follow-tags` actually pushes it.
+    git tag -a $tag -m "Release $tag"
     git push origin main --follow-tags
 
     Write-Host "[release] Creating GitHub Release with asset..." -ForegroundColor Cyan
