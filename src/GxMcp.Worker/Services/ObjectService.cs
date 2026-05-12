@@ -1157,10 +1157,67 @@ namespace GxMcp.Worker.Services
                         }
                     }
                 }
+
+                TryResolveParameterTypes(obj, parameters);
             }
             catch { }
 
             return (parmRule, parameters);
+        }
+
+        private static void TryResolveParameterTypes(KBObject obj, List<ParameterInfo> parameters)
+        {
+            if (parameters == null || parameters.Count == 0) return;
+            try
+            {
+                dynamic vPart = obj.Parts
+                    .Cast<KBObjectPart>()
+                    .FirstOrDefault(p => p.GetType().Name.Equals("VariablesPart", StringComparison.OrdinalIgnoreCase));
+                if (vPart == null) return;
+
+                var byName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var v in vPart.Variables)
+                {
+                    string name = null;
+                    string formatted = null;
+                    try
+                    {
+                        name = (string)((dynamic)v).Name;
+                        string baseType = ((dynamic)v).Type?.ToString() ?? "Unknown";
+                        int len = 0, dec = 0;
+                        try { len = (int)((dynamic)v).Length; } catch { }
+                        try { dec = (int)((dynamic)v).Decimals; } catch { }
+
+                        // SDT-typed: prefer SDT name when available
+                        string sdtName = null;
+                        try { sdtName = ((dynamic)v).PromptInformation?.SDTName as string; } catch { }
+                        if (!string.IsNullOrEmpty(sdtName))
+                        {
+                            formatted = sdtName;
+                        }
+                        else if (len > 0)
+                        {
+                            formatted = dec > 0 ? $"{baseType}({len},{dec})" : $"{baseType}({len})";
+                        }
+                        else
+                        {
+                            formatted = baseType;
+                        }
+                    }
+                    catch { }
+
+                    if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(formatted))
+                        byName[name] = formatted;
+                }
+
+                foreach (var p in parameters)
+                {
+                    if (string.IsNullOrEmpty(p.Name)) continue;
+                    if (byName.TryGetValue(p.Name, out var t) && !string.IsNullOrEmpty(t))
+                        p.Type = t;
+                }
+            }
+            catch { /* keep "Unknown" on failure */ }
         }
 
         private static void InvalidateCache(object obj)
