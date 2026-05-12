@@ -353,6 +353,26 @@ namespace GxMcp.Worker.Services
                     catch { /* swallow — keep response valid */ }
                 }
 
+                // DataProvider-specific: returnsSDT + readsFromTables
+                if (obj is Artech.Genexus.Common.Objects.DataProvider dpObj)
+                {
+                    try
+                    {
+                        string returnsSdt = TryGetDataProviderReturnsSdt(dpObj);
+                        if (!string.IsNullOrEmpty(returnsSdt))
+                            result["returnsSDT"] = returnsSdt;
+
+                        var tables = ResolveDataProviderTablesRead(dpObj);
+                        if (tables.Count > 0)
+                        {
+                            var arr = new JArray();
+                            foreach (var t in tables) arr.Add(t);
+                            result["readsFromTables"] = arr;
+                        }
+                    }
+                    catch { /* swallow — keep response valid */ }
+                }
+
                 bool includeAll = (include == null || include.Count == 0);
                 HashSet<string> requested = includeAll ? new HashSet<string>() : new HashSet<string>(include.Select(i => i.ToString().ToLower()));
 
@@ -591,6 +611,124 @@ namespace GxMcp.Worker.Services
             {
                 return "{\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
             }
+        }
+
+        private string TryGetDataProviderReturnsSdt(Artech.Genexus.Common.Objects.DataProvider dp)
+        {
+            // 1) Look for output() rule
+            try
+            {
+                string rules = ((dynamic)dp).Rules?.Source as string ?? "";
+                if (!string.IsNullOrEmpty(rules))
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(rules,
+                        @"\boutput\s*\(\s*&?(\w+)\s*\)",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (m.Success)
+                    {
+                        string varName = m.Groups[1].Value;
+                        string sdtFromVar = TryResolveSdtFromVariable(dp, varName);
+                        if (!string.IsNullOrEmpty(sdtFromVar)) return sdtFromVar;
+                        return varName;
+                    }
+                }
+            }
+            catch { }
+
+            // 2) Try direct properties exposed by the SDK
+            foreach (string prop in new[] { "OutputType", "ReturnType", "ReturnTypeName" })
+            {
+                try
+                {
+                    var pi = dp.GetType().GetProperty(prop);
+                    if (pi == null) continue;
+                    var v = pi.GetValue(dp);
+                    if (v != null)
+                    {
+                        string s = v.ToString();
+                        if (!string.IsNullOrEmpty(s) && !s.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) return s;
+                    }
+                }
+                catch { }
+            }
+
+            return null;
+        }
+
+        private string TryResolveSdtFromVariable(KBObject obj, string variableName)
+        {
+            if (string.IsNullOrEmpty(variableName)) return null;
+            try
+            {
+                dynamic vPart = obj.Parts.Cast<KBObjectPart>()
+                    .FirstOrDefault(p => p.GetType().Name.Equals("VariablesPart", StringComparison.OrdinalIgnoreCase));
+                if (vPart == null) return null;
+                foreach (var v in vPart.Variables)
+                {
+                    try
+                    {
+                        string name = (string)((dynamic)v).Name;
+                        if (!string.Equals(name, variableName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                        string sdtName = null;
+                        try { sdtName = ((dynamic)v).PromptInformation?.SDTName as string; } catch { }
+                        if (!string.IsNullOrEmpty(sdtName)) return sdtName;
+
+                        string baseType = ((dynamic)v).Type?.ToString();
+                        if (!string.IsNullOrEmpty(baseType) && baseType.IndexOf("SDT", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return baseType;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private List<string> ResolveDataProviderTablesRead(Artech.Genexus.Common.Objects.DataProvider dp)
+        {
+            var tables = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 1) Use the resolved navigation report if available
+            if (_navigationService != null)
+            {
+                try
+                {
+                    string navJson = _navigationService.GetNavigation(dp.Name);
+                    var nav = JObject.Parse(navJson);
+                    if (nav["error"] == null && nav["levels"] is JArray levels)
+                    {
+                        foreach (var l in levels)
+                        {
+                            string t = (string)l["baseTable"];
+                            if (!string.IsNullOrWhiteSpace(t) && seen.Add(t)) tables.Add(t);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            // 2) Fallback: enriched index entry's Tables list (filter to actual Tables only)
+            if (tables.Count == 0)
+            {
+                try
+                {
+                    var index = _indexCacheService.GetIndex();
+                    if (index.Objects.TryGetValue($"DataProvider:{dp.Name}", out var entry) && entry?.Tables != null)
+                    {
+                        foreach (var name in entry.Tables)
+                        {
+                            if (string.IsNullOrWhiteSpace(name)) continue;
+                            if (index.Objects.TryGetValue($"Table:{name}", out _) && seen.Add(name))
+                                tables.Add(name);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return tables;
         }
 
         public string ExplainCode(string target, string codeSnippet)
