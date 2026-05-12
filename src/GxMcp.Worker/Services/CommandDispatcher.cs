@@ -63,7 +63,7 @@ namespace GxMcp.Worker.Services
             _navigationService = new NavigationService(_kbService);
             _listService = new ListService(_kbService, _indexCacheService);
             _uiService = new UIService(_kbService, _objectService);
-            _analyzeService = new AnalyzeService(_kbService, _objectService, _indexCacheService, _uiService);
+            _analyzeService = new AnalyzeService(_kbService, _objectService, _indexCacheService, _navigationService, _uiService);
             _summarizeService = new SummarizeService(_kbService, _objectService);
             _injectionService = new InjectionService(_kbService, _objectService, _analyzeService);
             _patternAnalysisService = new PatternAnalysisService(_objectService);

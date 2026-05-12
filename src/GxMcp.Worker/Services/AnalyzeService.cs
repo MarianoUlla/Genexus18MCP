@@ -19,12 +19,14 @@ namespace GxMcp.Worker.Services
         private readonly IndexCacheService _indexCacheService;
 
         private readonly UIService _uiService;
+        private readonly NavigationService _navigationService;
 
-        public AnalyzeService(KbService kbService, ObjectService objectService, IndexCacheService indexCacheService, UIService uiService = null)
+        public AnalyzeService(KbService kbService, ObjectService objectService, IndexCacheService indexCacheService, NavigationService navigationService = null, UIService uiService = null)
         {
             _kbService = kbService;
             _objectService = objectService;
             _indexCacheService = indexCacheService;
+            _navigationService = navigationService;
             _uiService = uiService;
         }
 
@@ -448,6 +450,24 @@ namespace GxMcp.Worker.Services
                 // 5.1 Controls + valid events repertoire (opt-in: include=["controls"] or include=["events_repertoire"])
                 if (_uiService != null && (requested.Contains("controls") || requested.Contains("events_repertoire"))) {
                     try { result["controls"] = _uiService.GetControlsRepertoire(obj); } catch {}
+                }
+
+                // 5.2 Navigation (For Each / Group base tables, indexes, filters) — opt-in only (heavy)
+                if (_navigationService != null && requested.Contains("navigation"))
+                {
+                    try
+                    {
+                        string navJson = _navigationService.GetNavigation(obj.Name);
+                        var navObj = Newtonsoft.Json.Linq.JObject.Parse(navJson);
+                        if (navObj["error"] != null)
+                            result["navigation"] = new JObject { ["error"] = navObj["error"] };
+                        else
+                            result["navigation"] = navObj;
+                    }
+                    catch (Exception ex)
+                    {
+                        result["navigation"] = new JObject { ["error"] = ex.Message };
+                    }
                 }
 
                 // 6. Metadata (Sync)
