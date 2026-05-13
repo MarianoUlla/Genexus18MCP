@@ -223,7 +223,36 @@ namespace GxMcp.Worker.Services
                 response["nextOffset"] = consumed;
             }
             response["results"] = results;
+
+            var suggestion = BuildSuggestedNext(results);
+            if (suggestion != null)
+            {
+                var meta = new JObject();
+                meta["suggested_next"] = suggestion;
+                response["_meta"] = meta;
+            }
+
             return response;
+        }
+
+        public static JObject BuildSuggestedNext(JArray items)
+        {
+            if (items == null || items.Count == 0)
+                return null;
+
+            var top = items[0] as JObject;
+            if (top == null)
+                return null;
+
+            return new JObject
+            {
+                ["tool"] = "genexus_read",
+                ["args"] = new JObject
+                {
+                    ["name"] = top["name"]?.ToString(),
+                    ["type"] = top["type"]?.ToString()
+                }
+            };
         }
 
         private JObject BuildItem(string name, string type, string description, string parent, string module, string path, string parentPath)
