@@ -36,6 +36,15 @@ namespace GxMcp.Worker.Services
         public bool IsIndexing => _isIndexing;
         public bool IsOpen { get { lock (_kbLock) { return _kb != null; } } }
 
+        public string GetKbPath()
+        {
+            lock (_kbLock)
+            {
+                if (_kb == null) return null;
+                try { return (string)_kb.Location; } catch { return null; }
+            }
+        }
+
         public dynamic GetKB()
         {
             lock (_kbLock) 

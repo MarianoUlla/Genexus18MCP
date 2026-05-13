@@ -49,6 +49,19 @@ try {
     $tag = "v$newVersion"
     Write-Host "   > New version: $newVersion" -ForegroundColor Gray
 
+    # Mirror the bumped version into the Gateway csproj so whoami.serverVersion
+    # (read at runtime from AssemblyInformationalVersion) stays in sync with
+    # the npm-published version. Without this, the gateway surface lies.
+    Write-Host "[release] Mirroring version into Gateway csproj..." -ForegroundColor Cyan
+    $csprojPath = Join-Path $root 'src\GxMcp.Gateway\GxMcp.Gateway.csproj'
+    $csproj = Get-Content $csprojPath -Raw
+    $assemblyVersion = "$newVersion.0"
+    $csproj = [regex]::Replace($csproj, '<Version>[^<]*</Version>',                 "<Version>$newVersion</Version>")
+    $csproj = [regex]::Replace($csproj, '<AssemblyVersion>[^<]*</AssemblyVersion>', "<AssemblyVersion>$assemblyVersion</AssemblyVersion>")
+    $csproj = [regex]::Replace($csproj, '<FileVersion>[^<]*</FileVersion>',         "<FileVersion>$assemblyVersion</FileVersion>")
+    $csproj = [regex]::Replace($csproj, '<InformationalVersion>[^<]*</InformationalVersion>', "<InformationalVersion>$newVersion</InformationalVersion>")
+    Set-Content -Path $csprojPath -Value $csproj -NoNewline
+
     Write-Host "[release] Building .NET artifacts (build.ps1)..." -ForegroundColor Cyan
     & "$root\build.ps1"
     if ($LASTEXITCODE -ne 0) {
@@ -74,6 +87,7 @@ try {
     Write-Host "[release] Committing version bump and tagging..." -ForegroundColor Cyan
     git add package.json
     if (Test-Path "$root\package-lock.json") { git add package-lock.json }
+    git add (Join-Path $root 'src\GxMcp.Gateway\GxMcp.Gateway.csproj')
     git commit -m "chore(release): $tag"
     # Annotated tag so `git push --follow-tags` actually pushes it.
     git tag -a $tag -m "Release $tag"

@@ -10,8 +10,31 @@ namespace GxMcp.Gateway
 {
     public class McpRouter
     {
-        public const string ServerVersion = "2.1.3";
+        public static readonly string ServerVersion = ResolveServerVersion();
         public const string SupportedProtocolVersion = "2025-11-25";
+
+        private static string ResolveServerVersion()
+        {
+            // Prefer the InformationalVersion (set in the csproj via <InformationalVersion>),
+            // fall back to FileVersion, then AssemblyVersion. release.ps1 keeps the csproj
+            // in sync with package.json so this surface always matches the published build.
+            var asm = Assembly.GetExecutingAssembly();
+            try
+            {
+                var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+                if (!string.IsNullOrWhiteSpace(info))
+                {
+                    int plus = info.IndexOf('+');
+                    return plus > 0 ? info.Substring(0, plus) : info;
+                }
+                var file = asm.GetCustomAttribute<AssemblyFileVersionAttribute>()?.Version;
+                if (!string.IsNullOrWhiteSpace(file)) return file;
+                var name = asm.GetName().Version;
+                if (name != null) return name.ToString(3);
+            }
+            catch { }
+            return "0.0.0";
+        }
 
         private static readonly string[] _objectParts = { "Source", "Rules", "Events", "Variables", "Structure", "Layout", "WebForm", "PatternInstance", "PatternVirtual" };
         private static readonly string[] _analysisIncludes = { "metadata", "variables", "signature", "structure" };

@@ -114,13 +114,16 @@ namespace GxMcp.Worker.Services
                         }
                     }
                 }
-                else if (type.Equals("SDT", StringComparison.OrdinalIgnoreCase) || type.Equals("StructuredDataType", StringComparison.OrdinalIgnoreCase))
+                string seededDescription = null;
+                if (type.Equals("SDT", StringComparison.OrdinalIgnoreCase) || type.Equals("StructuredDataType", StringComparison.OrdinalIgnoreCase))
                 {
                     InitializeSDTWithDefaultItem(newObj, name);
+                    seededDescription = "Item1 : VARCHAR(40)";
                 }
                 else if (newObj is Artech.Genexus.Common.Objects.Transaction newTrn)
                 {
                     InitializeTransactionWithDefaultKey(newTrn, name);
+                    seededDescription = name + "Id : Numeric(8,0) [Key]";
                 }
 
                 newObj.Save();
@@ -137,7 +140,26 @@ namespace GxMcp.Worker.Services
                 Logger.Info(string.Format("Object created successfully in {0}ms", sw.ElapsedMilliseconds));
                 string idStr = "";
                 try { idStr = newObj.Key?.Id.ToString() ?? ""; } catch { try { idStr = newObj.Guid.ToString(); } catch { } }
-                return "{\"status\":\"Success\", \"type\":\"" + type + "\", \"name\":\"" + name + "\", \"id\":\"" + CommandDispatcher.EscapeJsonString(idStr) + "\"}";
+                var response = new JObject
+                {
+                    ["status"] = "Success",
+                    ["type"] = type,
+                    ["name"] = name,
+                    ["id"] = idStr
+                };
+                if (!string.IsNullOrEmpty(seededDescription))
+                {
+                    // Surface the auto-seeded payload so the agent knows the object isn't empty
+                    // before calling read/edit. Agents that immediately overwrite Structure
+                    // need this signal to avoid being surprised by the seed item appearing in
+                    // round-trip reads.
+                    response["_meta"] = new JObject
+                    {
+                        ["seeded"] = new JArray { seededDescription },
+                        ["seededHint"] = "An initial item was auto-added so the SDK accepts the empty Save. Overwrite via genexus_edit part=Structure (full mode) to replace it."
+                    };
+                }
+                return response.ToString(Newtonsoft.Json.Formatting.None);
             }
             catch (Exception ex)
             {

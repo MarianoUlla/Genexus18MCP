@@ -99,7 +99,9 @@ namespace GxMcp.Worker.Services
                 TaskId = taskId,
                 Action = action,
                 Target = target,
-                Targets = targets.Count > 1 ? targets : null,
+                // Always echo the parsed list so the agent can confirm what got dispatched,
+                // including the single-target case. Doc contract says "the parsed list".
+                Targets = targets.Count > 0 ? targets : null,
                 Status = "Running",
                 Phase = "Starting",
                 StartTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
@@ -127,7 +129,7 @@ namespace GxMcp.Worker.Services
                     ? $"Batch build started for {targets.Count} objects in a single KB-open cycle. Poll action='status' target=<taskId> for progress."
                     : "Build task started in background. Poll genexus_lifecycle action='status' with target=<taskId> for progress.",
                 taskId = taskId,
-                targets = targets.Count > 1 ? targets : null,
+                targets = targets.Count > 0 ? targets : null,
                 callersToAlsoBuild = status.CallersToAlsoBuild,
                 hint = status.Hint
             });
@@ -142,6 +144,46 @@ namespace GxMcp.Worker.Services
                 .Where(s => s.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetOEMCP();
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetConsoleOutputCP();
+
+        private static Encoding _msbuildEncodingCached;
+        private static Encoding ResolveMsbuildEncoding()
+        {
+            if (_msbuildEncodingCached != null) return _msbuildEncodingCached;
+            try
+            {
+                // Worker runs detached from a console — Console.OutputEncoding falls back to
+                // UTF-8 in that mode. MSBuild however emits bytes using the host's OEM /
+                // console code page (CP850/CP1252 on PT-BR Windows, CP437 on en-US). Ask
+                // Win32 directly so we don't trust the framework's stub: GetConsoleOutputCP
+                // → live console CP, GetOEMCP → system-wide OEM CP. Either is right; OEM is
+                // a stable fallback when no console is attached.
+                uint cp = 0;
+                try { cp = GetConsoleOutputCP(); } catch { }
+                if (cp == 0 || cp == 65001) { try { cp = GetOEMCP(); } catch { } }
+                if (cp != 0)
+                {
+                    // .NET Framework 4.8 ships all OEM/ANSI code pages natively, so no
+                    // CodePagesEncodingProvider registration is required (that lives in the
+                    // System.Text.Encoding.CodePages NuGet package, .NET 5+ only).
+                    _msbuildEncodingCached = Encoding.GetEncoding((int)cp);
+                }
+                else
+                {
+                    _msbuildEncodingCached = Console.OutputEncoding ?? Encoding.UTF8;
+                }
+            }
+            catch
+            {
+                _msbuildEncodingCached = Encoding.UTF8;
+            }
+            return _msbuildEncodingCached;
         }
 
         public string GetStatus(string taskId)
@@ -274,7 +316,15 @@ namespace GxMcp.Worker.Services
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     CreateNoWindow = true,
-                    WorkingDirectory = _gxDir
+                    WorkingDirectory = _gxDir,
+                    // MSBuild on Windows writes via the system OEM/ANSI code page (PT-BR usually
+                    // 850/1252). Reading the streams as UTF-8 mangles accented characters
+                    // ("Compila��o", "n�", etc.) which is unreadable for LLM consumers. Pin
+                    // both streams to the console's actual output encoding so TailLines/Output
+                    // stay legible. Fall back to UTF-8 only when CodePagesEncodingProvider
+                    // isn't registered.
+                    StandardOutputEncoding = ResolveMsbuildEncoding(),
+                    StandardErrorEncoding = ResolveMsbuildEncoding()
                 };
 
                 using (var process = new Process { StartInfo = psi, EnableRaisingEvents = true })

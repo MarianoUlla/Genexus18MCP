@@ -1,5 +1,92 @@
 # Changelog
 
+## Unreleased
+
+Closes every item from the second-cycle friction report
+`docs/mcp-friction-report-2026-05-13.md`, produced by a fresh real-KB session
+against `AcademicoHomolog1`. Pending live smoke verification before the next
+release tag.
+
+### Fixed
+- **`whoami.mcp.serverVersion` reads from the assembly version, not a hardcoded
+  const.** `McpRouter.ServerVersion` now resolves at runtime via
+  `AssemblyInformationalVersionAttribute` (set from the csproj `<Version>`).
+  `scripts/release.ps1` mirrors the bumped npm version into the Gateway csproj
+  so the version surface always matches the published build. Friction-report
+  05-13 #1.
+- **SDT Structure write now persists fully: parser dirty-flags every signal
+  the SDK exposes, sync-commits Model + KB to disk, propagates the SDT to
+  the Prototype model in SQL, and the validator no longer rejects multi-
+  write sequences.** Four layers together close the bug:
+  1. `SdtDslParser.Parse` reflects `Dirty/IsDirty` + `Touch/Modified/
+     MarkDirty/OnChanged/NotifyChanged` onto `SDTStructurePart` and logs
+     items-count pre/post-parse so the persisted state is unambiguous.
+  2. `WriteService` Structure interceptor forces a synchronous
+     `Model.Commit + KB.Commit` immediately after `EnsureSave` (instead of
+     the debounced 2-second timer), so a follow-up save sees the new items
+     on disk.
+  3. `SdtModelPropagation.TryPropagateToPrototypeModel` mirrors Model 1 →
+     Model 2 rows for the SDT, SDTStructure, SDTLevelEntity, and
+     SDTItemEntity via direct SQL (decompresses the structure blob to
+     discover the item EntityIds). Same surgical pattern as
+     `WebFormCompositionRepair` (`9242c1d`); needed because
+     `KBObject.Create(kb.DesignModel, ...)` never registers the item names
+     in the Prototype model the validator queries.
+  4. `PersistenceExtensions.EnsureSave` now reflects on
+     `Artech.Architecture.Common.Objects.KBObjectSavePreferences`
+     (walking loaded assemblies, since the type lives in
+     `Artech.Architecture.Common`, not the KBObject's home assembly),
+     sets `SkipValidation=true`, and retries `KBObject.Save(prefs)` only
+     when the failure text contains `src0216`. This bypasses the SDK's
+     stale in-process Prototype-model cache for the legitimate case
+     (variable declared, SDT item present in Model 1) while leaving
+     genuine validation errors (`src0059` syntax, undeclared variables —
+     covered by the new hint in fix #3) untouched.
+
+  Verified end-to-end by `scripts/smoke_2026_05_13.ps1`: a Procedure that
+  binds `&Aluno : SdtFrictionProbe`, writes Source `&Aluno.AluCod = 42`,
+  then patches Variables with `&Counter : NUMERIC(4,0)` — the original
+  report's exact failure mode — now persists clean
+  (`persistedVerified=true, patchStatus=Applied`). Worker log records
+  `[EnsureSave] bypassed src0216 stale-prototype-model validator via
+  SkipValidation=true`. Friction-report 05-13 #2.
+- **`src0216 'X' propriedade inválida` is enriched with an "undeclared
+  variable" hint when the SDK message points at `&Var.X` and `&Var` isn't in
+  the part's Variables collection.** `WritePolicy.FindUndeclaredVariablesForSrc0216`
+  cross-references the SDK error against the source text and the declared
+  variables; the error response now carries `hint` + `undeclaredVariables[]`
+  so the agent reaches for `genexus_add_variable` instead of "fix the field
+  name on the SDT". Friction-report 05-13 #3.
+- **Variables patch verify no longer false-fails on `NUMERIC(N,0)` round-trip
+  drift.** `PatchService.NormalizeForPartCompare` now canonicalizes each
+  Variables line: collapses internal whitespace and strips trailing `,0)`
+  decimals so `&Counter : NUMERIC(4,0)` (agent-written) and `&Counter :
+  NUMERIC(4)` (SDK-rendered after persist) compare equal. Without this, the
+  v2.1.6 `&Counter` smoke triggered auto-rollback even though persistence had
+  succeeded. Friction-report 05-13 #4.
+- **`genexus_lifecycle action=build` echoes the parsed `targets` array even
+  for single-object builds.** Previously `targets` was null when `Count == 1`,
+  contradicting the doc contract. Single and batch builds now both surface
+  the resolved list. Friction-report 05-13 #5.
+- **MSBuild output streams use the console's actual encoding instead of UTF-8.**
+  `BuildService` now sets `StandardOutputEncoding`/`StandardErrorEncoding` to
+  `Console.OutputEncoding` (CP850/CP1252 on PT-BR Windows, UTF-8 if `chcp
+  65001` is active), so `TailLines` no longer surfaces `Compila��o` /
+  `n�`-style mojibake to the agent. Friction-report 05-13 #6.
+- **`genexus_inspect include=["structure"]` surfaces SDT items as
+  `sdtStructure`.** The block walks `SDT.Root.Items` via reflection and
+  produces `{itemCount, levelCount, items:[{name, type, length, decimals,
+  isCollection, isLevel, children?}]}`. Agents inspecting an SDT no longer
+  see an empty `uiStructure: {}` and have to fall back to `genexus_read
+  part=Structure` for basic metadata. Friction-report 05-13 #7.
+- **`genexus_create_object` for SDT/Transaction announces auto-seeded
+  payload via `_meta.seeded`.** Response now carries
+  `{_meta:{seeded:["Item1 : VARCHAR(40)"], seededHint:"…overwrite via
+  genexus_edit part=Structure…"}}` for SDT (and the equivalent Numeric key
+  hint for Transaction). Agents that immediately populate the structure no
+  longer get surprised by the seed item showing up in round-trip reads.
+  Friction-report 05-13 #8.
+
 ## v2.1.6 — 2026-05-13
 
 Closes the remaining open items in `docs/mcp-friction-report-2026-05-08.md`

@@ -114,6 +114,71 @@ namespace GxMcp.Worker.Services
             return baseMessage;
         }
 
+        // Matches "src0216: 'Foo' propriedade inválida." style diagnostics. The capture group
+        // returns the property name (Foo) that the SDK flagged as invalid. This is the SDK's
+        // signal for "I don't know this property on the dotted accessor target", which most
+        // often means the agent wrote `&Var.Foo` without declaring `&Var` (auto-inject now
+        // skips on purpose to avoid the wrong-typed VARCHAR fallback — friction-report 05-13 #3).
+        private static readonly Regex Src0216Regex = new Regex(
+            @"src0216:\s*'(?<prop>[^']+)'\s+propriedade\s+inv[áa]lida",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        // Walks every "&VarName.PropName" reference in `sourceCode` and returns the set of
+        // variable names whose corresponding `.PropName` matches one of the props flagged
+        // by the SDK in `sdkErrorText` AND whose variable name is NOT in `declaredVars`.
+        // This is the precise "src0216 + undeclared variable" pattern: when present, the
+        // SDK's "property invalid" message is misleading — the real issue is the missing
+        // variable declaration.
+        public static IReadOnlyList<string> FindUndeclaredVariablesForSrc0216(
+            string sdkErrorText,
+            string sourceCode,
+            IEnumerable<string> declaredVars)
+        {
+            if (string.IsNullOrWhiteSpace(sdkErrorText) || string.IsNullOrWhiteSpace(sourceCode))
+            {
+                return Array.Empty<string>();
+            }
+
+            var flaggedProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in Src0216Regex.Matches(sdkErrorText))
+            {
+                if (m.Success) flaggedProps.Add(m.Groups["prop"].Value.Trim());
+            }
+            if (flaggedProps.Count == 0) return Array.Empty<string>();
+
+            var declared = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (declaredVars != null)
+            {
+                foreach (var v in declaredVars)
+                {
+                    if (string.IsNullOrWhiteSpace(v)) continue;
+                    declared.Add(v.TrimStart('&').Trim());
+                }
+            }
+
+            var hits = new List<string>();
+            // Capture &VarName.PropName; case-insensitive variable lookup; only flag once per var name.
+            var memberAccess = new Regex(@"&(?<v>[A-Za-z_][A-Za-z0-9_]*)\.(?<p>[A-Za-z_][A-Za-z0-9_]*)",
+                                          RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in memberAccess.Matches(sourceCode))
+            {
+                string v = m.Groups["v"].Value;
+                string p = m.Groups["p"].Value;
+                if (!flaggedProps.Contains(p)) continue;
+                if (declared.Contains(v)) continue;
+                if (seen.Add(v)) hits.Add(v);
+            }
+            return hits;
+        }
+
+        public static string BuildUndeclaredVariableHint(IReadOnlyList<string> undeclaredVars)
+        {
+            if (undeclaredVars == null || undeclaredVars.Count == 0) return null;
+            string list = string.Join(", ", undeclaredVars.Select(v => "&" + v));
+            return $"src0216 likely caused by undeclared variable(s) {list}. Use genexus_add_variable with typeName=<SDT|domain> to declare and bind before re-saving the Source.";
+        }
+
         public static bool ShouldRetryWithoutPartSave(string partName, string exceptionMessage, string diagnosticText)
         {
             if (!IsLogicalSourcePart(partName))

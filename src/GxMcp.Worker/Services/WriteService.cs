@@ -355,7 +355,7 @@ namespace GxMcp.Worker.Services
             return WritePolicy.ShouldRetryWithoutPartSave(partName, exceptionMessage, diagnosticText);
         }
 
-        private static JObject CreateTransactionErrorResponse(string target, string partName, string stage, Exception ex, JArray issues, string retryStrategy, string sdkMessages)
+        private static JObject CreateTransactionErrorResponse(string target, string partName, string stage, Exception ex, JArray issues, string retryStrategy, string sdkMessages, global::Artech.Architecture.Common.Objects.KBObject obj = null, string decodedCode = null)
         {
             // Friction-report #2: if the SDK threw bare "Erro" but GetSdkMessages / GetDiagnostics
             // produced the real message (e.g. "src0059: Esperando 'EndFor'..."), surface it as the
@@ -369,6 +369,33 @@ namespace GxMcp.Worker.Services
             if (!string.Equals(enrichedError, (ex.Message ?? string.Empty).Trim(), System.StringComparison.Ordinal))
             {
                 errorRes["originalError"] = ex.Message;
+            }
+
+            // Friction-report 05-13 #3: when the SDK fires src0216 ("'Foo' propriedade inválida")
+            // and the variable on the dotted accessor was never declared, the real fix is
+            // genexus_add_variable, not changing the field name. Detect this and surface a
+            // structured hint so the agent doesn't chase the wrong rabbit.
+            try
+            {
+                string corpus = (enrichedError ?? string.Empty) + "\n" + (sdkMessages ?? string.Empty);
+                if (obj != null && !string.IsNullOrEmpty(decodedCode) &&
+                    corpus.IndexOf("src0216", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var declared = CollectDeclaredVariableNames(obj);
+                    var undeclared = WritePolicy.FindUndeclaredVariablesForSrc0216(corpus, decodedCode, declared);
+                    string hint = WritePolicy.BuildUndeclaredVariableHint(undeclared);
+                    if (!string.IsNullOrEmpty(hint))
+                    {
+                        errorRes["hint"] = hint;
+                        var arr = new JArray();
+                        foreach (var v in undeclared) arr.Add("&" + v);
+                        errorRes["undeclaredVariables"] = arr;
+                    }
+                }
+            }
+            catch (Exception hintEx)
+            {
+                Logger.Debug("[CreateTransactionErrorResponse] undeclared-var hint failed: " + hintEx.Message);
             }
 
             if (!string.IsNullOrWhiteSpace(target))
@@ -405,6 +432,71 @@ namespace GxMcp.Worker.Services
             errorRes["stackTrace"] = ex.StackTrace;
             errorRes["issues"] = issues;
             return errorRes;
+        }
+
+        // Loose equality on the Structure DSL: compare on the set of `Name : Type` tokens,
+        // not exact whitespace/length round-trip. We just want to know whether the items we
+        // requested are actually present in the persisted state.
+        private static bool StructureDslMatches(string expected, string actual)
+        {
+            var e = ExtractStructureLineSet(expected);
+            var a = ExtractStructureLineSet(actual);
+            if (e.Count == 0) return true; // nothing was requested; treat as ok
+            // Every requested line must appear (by name) in the persisted result.
+            return e.IsSubsetOf(a);
+        }
+
+        private static HashSet<string> ExtractStructureLineSet(string text)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(text)) return set;
+            foreach (var raw in text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+                if (line.StartsWith("{") || line.StartsWith("}")) continue;
+                // Reduce "AluCod : NUMERIC(8,0)" → "AluCod : NUMERIC" so length/decimals drift
+                // doesn't cause a false negative when the DSL renderer drops them.
+                int colon = line.IndexOf(':');
+                if (colon < 0) { set.Add(line); continue; }
+                string name = line.Substring(0, colon).Trim();
+                string rest = line.Substring(colon + 1).Trim();
+                int paren = rest.IndexOf('(');
+                if (paren >= 0) rest = rest.Substring(0, paren).Trim();
+                set.Add(name + " : " + rest);
+            }
+            return set;
+        }
+
+        private static string Truncate(string s, int max) =>
+            string.IsNullOrEmpty(s) ? s : (s.Length <= max ? s : s.Substring(0, max) + "…");
+
+        // Reads the declared variable names from the object's Variables part. Used to
+        // distinguish "user wrote &Var.Foo without declaring &Var" (real bug) from
+        // "&Var is declared but the SDT has no Foo" (different real bug — leave alone).
+        private static IEnumerable<string> CollectDeclaredVariableNames(global::Artech.Architecture.Common.Objects.KBObject obj)
+        {
+            if (obj == null) yield break;
+            global::Artech.Genexus.Common.Parts.VariablesPart varPart = null;
+            try
+            {
+                foreach (var p in obj.Parts)
+                {
+                    if (p is global::Artech.Genexus.Common.Parts.VariablesPart vp) { varPart = vp; break; }
+                }
+            }
+            catch { }
+            if (varPart == null) yield break;
+
+            System.Collections.IEnumerable vars = null;
+            try { vars = varPart.Variables as System.Collections.IEnumerable; } catch { }
+            if (vars == null) yield break;
+            foreach (dynamic v in vars)
+            {
+                string name = null;
+                try { name = v.Name; } catch { }
+                if (!string.IsNullOrWhiteSpace(name)) yield return name;
+            }
         }
 
         public string WriteObject(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)
@@ -468,9 +560,78 @@ namespace GxMcp.Worker.Services
                         try {
                             StructureParser.ParseFromText(objToUpdate, decodedCode);
                             objToUpdate.EnsureSave();
-                            ScheduleFlush();
+                            // Friction-report 05-13 #2: a Structure write on an SDT or Transaction
+                            // must commit synchronously, not via the debounced ScheduleFlush()
+                            // timer. Subsequent requests (e.g. a Procedure that references
+                            // &Var.Field) re-validate against the persisted KB. If the SDT items
+                            // are still only in-memory when the next save runs, the validator
+                            // reloads from disk (still seed-only) and fires `src0216 propriedade
+                            // inválida` on the field access. Force the flush here so disk reflects
+                            // the new items before we return Success.
+                            ScheduleFlush(force: true);
+
+                            // Friction-report 05-13 #2 deeper finding: the SDK persists the
+                            // SDT to the Design model and to disk, but a parallel Prototype
+                            // model (model id 2) — used by the validator when other objects
+                            // consume this SDT — never gets the corresponding
+                            // ModelEntityVersion rows for the SDTLevelEntity/SDTItemEntity
+                            // names. IDE-created SDTs have those rows; SDK-create-via-MCP
+                            // doesn't propagate them. Mirror Model 1 → Model 2 for our
+                            // newly-saved SDT directly in SQL so the validator can resolve
+                            // `&Var.<Field>` from the prototype model after this Structure
+                            // write.
+                            if (objToUpdate.TypeDescriptor.Name.Equals("SDT", StringComparison.OrdinalIgnoreCase))
+                            {
+                                try
+                                {
+                                    string kbPath = _objectService.GetKbService().GetKbPath();
+                                    GxMcp.Worker.Helpers.SdtModelPropagation.TryPropagateToPrototypeModel(objToUpdate, kbPath);
+                                }
+                                catch (Exception propEx)
+                                {
+                                    Logger.Warn("[SDT-PROP] propagation failed for " + target + ": " + propEx.Message);
+                                }
+                            }
+
                             _objectService.MarkReadCacheDirty(objToUpdate, partName);
-                            return Models.McpResponse.Success("Write", target, new JObject { ["details"] = "Structure DSL successfully applied" });
+
+                            // Friction-report 05-13 #2: confirm the Save actually persisted the
+                            // new items by re-reading the structure from a forced cache miss.
+                            // If the DSL we just wrote doesn't round-trip, the SDT structure
+                            // part is in the stale-tree failure mode and the validator on the
+                            // next consumer (Procedure that references &Var.Field) will report
+                            // `src0216` even though our Success response said otherwise.
+                            string roundTripError = null;
+                            try
+                            {
+                                var verifyObj = _objectService.FindObject(target, typeFilter);
+                                if (verifyObj != null)
+                                {
+                                    _objectService.MarkReadCacheDirty(verifyObj, partName);
+                                    string persisted = GxMcp.Worker.Helpers.StructureParser.SerializeToText(verifyObj);
+                                    if (!StructureDslMatches(decodedCode, persisted))
+                                    {
+                                        roundTripError = "Structure DSL applied in-memory but post-Save read-back didn't include all items. The SDK may have persisted the prior version. Re-read with genexus_read part=Structure and retry; if still wrong, the SDT's persisted EntityVersion is stale (see WebFormCompositionRepair pattern).";
+                                        Logger.Warn("[DEBUG-SAVE] SDT Structure round-trip mismatch for " + target + ". expected=\"" + Truncate(decodedCode, 200) + "\" persisted=\"" + Truncate(persisted, 200) + "\"");
+                                    }
+                                }
+                            }
+                            catch (Exception verEx)
+                            {
+                                Logger.Debug("[DEBUG-SAVE] SDT round-trip verify threw: " + verEx.Message);
+                            }
+
+                            var okPayload = new JObject { ["details"] = "Structure DSL successfully applied" };
+                            if (!string.IsNullOrEmpty(roundTripError))
+                            {
+                                okPayload["persistedVerified"] = false;
+                                okPayload["persistedVerifyError"] = roundTripError;
+                            }
+                            else
+                            {
+                                okPayload["persistedVerified"] = true;
+                            }
+                            return Models.McpResponse.Success("Write", target, okPayload);
                         } catch (Exception ex) {
                             Logger.Error("[DEBUG-SAVE] Error parsing Structure DSL: " + ex.Message);
                             return Models.McpResponse.Error($"Invalid Structure Syntax: {ex.Message}", target);
@@ -751,7 +912,7 @@ namespace GxMcp.Worker.Services
                         }
                         transactionFinished = true;
                         lastSdkMessages = string.IsNullOrWhiteSpace(lastSdkMessages) ? GetSdkMessagesSafe(part) : lastSdkMessages;
-                        return CreateTransactionErrorResponse(target, partName, failureStage, ex, issues, retryStrategy, lastSdkMessages).ToString();
+                        return CreateTransactionErrorResponse(target, partName, failureStage, ex, issues, retryStrategy, lastSdkMessages, obj, decodedCode).ToString();
                     }
                     finally
                     {

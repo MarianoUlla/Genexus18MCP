@@ -161,7 +161,85 @@ namespace GxMcp.Worker.Parsers
                 dynamic root = null;
                 try { root = ds.Root; } catch { try { root = ds.StructureRoot; } catch { } }
                 if (root == null) { Logger.Error("[SDT PARSE] Root not found for " + obj.Name); return; }
+
+                int preItemCount = CountItemsSafe(root);
                 SyncSDTNodes(root, parsedNodes);
+                int postItemCount = CountItemsSafe(root);
+                Logger.Info($"[SDT PARSE] {obj.Name}: items {preItemCount} -> {postItemCount} (requested {parsedNodes.Count})");
+
+                // Friction-report 05-13 #2: even when AddItem/AddLevel succeed on the in-memory
+                // Items collection, the SDTStructurePart may not flag itself dirty, so the
+                // subsequent obj.Save() persists the OLD serialized XML (with only the seed).
+                // External reads — including the validator running when a Procedure consumes the
+                // SDT — then resolve fields against the stale persisted version and reject the
+                // member access (`src0216: 'AluCod' propriedade inválida.`).
+                //
+                // Force the part dirty via every avenue the SDK exposes so the next Save round
+                // writes the live items. Each branch is defensive — if a property/method doesn't
+                // exist we just keep going.
+                MarkPartDirty(structure, obj.Name);
+            }
+        }
+
+        private static int CountItemsSafe(dynamic root)
+        {
+            int n = 0;
+            try { foreach (var _ in root.Items) n++; } catch { }
+            return n;
+        }
+
+        private static void MarkPartDirty(object part, string objName)
+        {
+            if (part == null) return;
+            // 1) part.Dirty = true (most SDK parts expose this directly)
+            TryWriteBool(part, "Dirty", true, objName);
+            TryWriteBool(part, "IsDirty", true, objName);
+
+            // 2) Invoke "Modified()" / "Touch()" / "MarkDirty()" if present
+            foreach (var name in new[] { "Touch", "Modified", "MarkDirty", "OnChanged", "NotifyChanged" })
+            {
+                try
+                {
+                    var mi = part.GetType().GetMethod(name, BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                    if (mi != null) { mi.Invoke(part, null); Logger.Debug($"[SDT PARSE] {objName}: {name}() invoked."); }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug($"[SDT PARSE] {objName}: {name}() threw: {ex.Message}");
+                }
+            }
+
+            // 3) Some SDK parts track a private DirtyProperties bag — clearing it forces re-serialize
+            try
+            {
+                var dp = part.GetType().GetProperty("DirtyProperties", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (dp != null)
+                {
+                    var bag = dp.GetValue(part);
+                    if (bag is System.Collections.ICollection c && c.Count == 0)
+                    {
+                        // Touch Description/Mode/... to seed a dirty property if the bag is empty.
+                        try { ((dynamic)part).Mode = ((dynamic)part).Mode; } catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void TryWriteBool(object target, string propName, bool value, string objName)
+        {
+            try
+            {
+                var p = target.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
+                if (p != null && p.CanWrite && p.PropertyType == typeof(bool))
+                {
+                    p.SetValue(target, value);
+                    Logger.Debug($"[SDT PARSE] {objName}: {propName}=true via reflection.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug($"[SDT PARSE] {objName}: set {propName} threw: {ex.Message}");
             }
         }
 

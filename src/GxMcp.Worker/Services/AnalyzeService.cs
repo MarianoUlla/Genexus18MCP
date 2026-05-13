@@ -467,6 +467,23 @@ namespace GxMcp.Worker.Services
                     try { result["uiStructure"] = _uiService.GetSimplifiedUIStructure(obj); } catch {}
                 }
 
+                // 5.0.1 SDT items — surfaces the structural items of an SDT so the agent can
+                // confirm field names/types/lengths from inspect without an additional
+                // genexus_read part=Structure call. Friction-report 2026-05-13 #7.
+                if ((includeAll || requested.Contains("structure")) &&
+                    obj.TypeDescriptor.Name.Equals("SDT", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var sdtItems = BuildSdtItemsJson(obj);
+                        if (sdtItems != null) result["sdtStructure"] = sdtItems;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug("[Analyze] BuildSdtItemsJson failed for " + obj.Name + ": " + ex.Message);
+                    }
+                }
+
                 // 5.1 Controls + valid events repertoire (opt-in: include=["controls"] or include=["events_repertoire"])
                 if (_uiService != null && (requested.Contains("controls") || requested.Contains("events_repertoire"))) {
                     try { result["controls"] = _uiService.GetControlsRepertoire(obj); } catch {}
@@ -743,6 +760,133 @@ namespace GxMcp.Worker.Services
             {
                 return "{\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
             }
+        }
+
+        private static readonly Guid SDT_STRUCTURE_PART_GUID = Guid.Parse("8597371d-1941-4c12-9c17-48df9911e2f3");
+
+        // Walk an SDT's structural items via reflection over the SDK's SDTLevel surface and
+        // produce a JSON-friendly tree the agent can inspect without a follow-up read call.
+        // Returns null when the SDT structure part can't be located so callers fall back to
+        // their existing surfaces; callers also surface the DSL text for human eyes.
+        private static JObject BuildSdtItemsJson(KBObject sdt)
+        {
+            if (sdt == null) return null;
+
+            KBObjectPart structure = null;
+            foreach (KBObjectPart p in sdt.Parts)
+            {
+                try
+                {
+                    string descName = p.TypeDescriptor?.Name ?? "";
+                    string className = p.GetType().Name;
+                    if (p.Type == SDT_STRUCTURE_PART_GUID ||
+                        descName.IndexOf("SDTStructure", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        className.IndexOf("SDTStructure", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        structure = p;
+                        break;
+                    }
+                }
+                catch { }
+            }
+            if (structure == null) return null;
+
+            dynamic ds = structure;
+            dynamic root = null;
+            try { root = ds.Root; } catch { try { root = ds.StructureRoot; } catch { } }
+            if (root == null) return null;
+
+            var items = new JArray();
+            try
+            {
+                foreach (dynamic child in root.Items)
+                {
+                    var node = BuildSdtItemNode(child);
+                    if (node != null) items.Add(node);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("[Analyze] SDT item walk failed: " + ex.Message);
+            }
+
+            int leafCount = 0, levelCount = 0;
+            CountSdtItems(items, ref leafCount, ref levelCount);
+
+            return new JObject
+            {
+                ["itemCount"] = leafCount,
+                ["levelCount"] = levelCount,
+                ["items"] = items
+            };
+        }
+
+        private static void CountSdtItems(JArray items, ref int leafCount, ref int levelCount)
+        {
+            if (items == null) return;
+            foreach (var it in items)
+            {
+                var children = it["children"] as JArray;
+                if (children != null && children.Count > 0)
+                {
+                    levelCount++;
+                    CountSdtItems(children, ref leafCount, ref levelCount);
+                }
+                else
+                {
+                    leafCount++;
+                }
+            }
+        }
+
+        private static JObject BuildSdtItemNode(dynamic item)
+        {
+            if (item == null) return null;
+            var node = new JObject();
+            try { node["name"] = (string)item.Name; } catch { node["name"] = ""; }
+
+            // Detect compound (level) vs leaf. SDK exposes IsLeafItem on most builds; some
+            // older surfaces hide it, so fall back to a child probe.
+            bool isLeaf;
+            try { isLeaf = (bool)item.IsLeafItem; }
+            catch
+            {
+                bool hasChild = false;
+                try { foreach (var _ in item.Items) { hasChild = true; break; } } catch { }
+                isLeaf = !hasChild;
+            }
+
+            try { node["isCollection"] = (bool)item.IsCollection; } catch { node["isCollection"] = false; }
+
+            if (isLeaf)
+            {
+                string typeStr = null;
+                try { typeStr = item.Type != null ? item.Type.ToString() : null; } catch { }
+                if (!string.IsNullOrEmpty(typeStr)) node["type"] = typeStr;
+
+                // Length / Decimals are exposed on most SDTItem surfaces; harvest defensively.
+                try { object len = item.Length; if (len != null) node["length"] = Convert.ToInt32(len); } catch { }
+                try { object dec = item.Decimals; if (dec != null) node["decimals"] = Convert.ToInt32(dec); } catch { }
+                try { object sig = item.Signed; if (sig != null) node["signed"] = Convert.ToBoolean(sig); } catch { }
+                node["isLevel"] = false;
+            }
+            else
+            {
+                node["isLevel"] = true;
+                var children = new JArray();
+                try
+                {
+                    foreach (dynamic c in item.Items)
+                    {
+                        var sub = BuildSdtItemNode(c);
+                        if (sub != null) children.Add(sub);
+                    }
+                }
+                catch { }
+                node["children"] = children;
+            }
+
+            return node;
         }
     }
 }

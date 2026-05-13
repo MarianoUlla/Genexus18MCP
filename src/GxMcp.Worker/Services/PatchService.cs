@@ -595,16 +595,40 @@ namespace GxMcp.Worker.Services
         // `&NewVar\n<original>...`. Line-by-line equality verification then fails even though
         // the persisted state semantically matches. Use a set-based comparison for Variables
         // so patch verification reflects semantic equality, not the SDK's collection order.
-        private static string NormalizeForPartCompare(string partName, string text)
+        //
+        // Friction-report 05-13 #4: the Variables DSL renderer drops `,0` when Decimals==0
+        // (`NUMERIC(4,0)` → `NUMERIC(4)`), so a patch that wrote `&Counter : NUMERIC(4,0)`
+        // round-trips as `&Counter : NUMERIC(4)`. Strings then differ even after set sort,
+        // and verification falsely fails → auto-rollback wipes the new variable. Canonicalize
+        // both sides by stripping trailing `,0)` so the comparison is semantic.
+        internal static string NormalizeForPartCompare(string partName, string text)
         {
             string normalized = NormalizeSourceForComparison(text);
             if (!string.Equals(partName, "Variables", StringComparison.OrdinalIgnoreCase)) return normalized;
             var lines = normalized
                 .Split('\n')
-                .Select(l => l.Trim())
+                .Select(l => CanonicalizeVariablesLine(l))
                 .Where(l => l.Length > 0)
                 .OrderBy(l => l, StringComparer.Ordinal);
             return string.Join("\n", lines);
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex VariableTrailingZeroDecimals =
+            new System.Text.RegularExpressions.Regex(
+                @"\(\s*(\d+)\s*,\s*0\s*\)",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static string CanonicalizeVariablesLine(string line)
+        {
+            if (line == null) return string.Empty;
+            string trimmed = line.Trim();
+            if (trimmed.Length == 0) return string.Empty;
+            // Collapse intra-line whitespace runs so "&X  :  NUMERIC ( 4 , 0 )" and
+            // "&X : NUMERIC(4,0)" canonicalize identically.
+            trimmed = System.Text.RegularExpressions.Regex.Replace(trimmed, @"\s+", " ");
+            // Normalize "(N,0)" → "(N)" since the SDK renderer drops trailing zero decimals.
+            trimmed = VariableTrailingZeroDecimals.Replace(trimmed, "($1)");
+            return trimmed;
         }
 
         private static JObject ParseWriteResult(string writeResult)

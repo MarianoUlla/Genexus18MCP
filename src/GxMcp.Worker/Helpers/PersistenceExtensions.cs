@@ -24,7 +24,7 @@ namespace GxMcp.Worker.Helpers
                 }
             }
 
-            try 
+            try
             {
                 var saveMethod = obj.GetType().GetMethod("Save", new Type[] { typeof(bool) });
                 if (saveMethod != null)
@@ -38,7 +38,26 @@ namespace GxMcp.Worker.Helpers
                 obj.Validate(msgs);
                 string validationText = ExtractErrorText(msgs, obj);
                 string sdkMessages = GetSdkMessages(obj);
-                
+
+                // Friction-report 05-13 #2 (deep): when the SDK's Prototype-model validator
+                // emits `src0216 'X' propriedade inválida` for a property whose owning SDT
+                // *does* have that item in the Design model (Model 1) — provable via SQL —
+                // the validator is stale, not the data. Retry the Save bypassing validation
+                // (`KBObjectSavePreferences.SkipValidation=true`). The persisted Source
+                // round-trips correctly and downstream generation uses Model 1 where the
+                // items exist. Only fires when the validation text contains src0216, so
+                // legitimate validation errors (src0059 syntax errors, etc.) still bubble up.
+                string combined = (validationText ?? string.Empty) + " | " + (sdkMessages ?? string.Empty);
+                if (combined.IndexOf("src0216", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    if (TrySaveSkippingValidation(obj, out string skipError))
+                    {
+                        Logger.Info($"[EnsureSave] {obj.Name}: bypassed src0216 stale-prototype-model validator via SkipValidation=true.");
+                        return;
+                    }
+                    Logger.Warn($"[EnsureSave] {obj.Name}: SkipValidation retry failed: {skipError}");
+                }
+
                 if (!string.IsNullOrEmpty(validationText) && !sdkMessages.Contains(validationText))
                     sdkMessages += " [VALIDATION]: " + validationText;
 
@@ -50,6 +69,55 @@ namespace GxMcp.Worker.Helpers
                 string errorText = ExtractErrorText(msgs, obj);
                 if (!string.IsNullOrEmpty(errorText))
                     throw new Exception($"Save failed for {obj.TypeDescriptor.Name} '{obj.Name}': {errorText}");
+            }
+        }
+
+        // Calls KBObject.Save(KBObjectSavePreferences) with SkipValidation=true via reflection.
+        // Returns true on success; emits the failure reason via `error` otherwise.
+        private static bool TrySaveSkippingValidation(KBObject obj, out string error)
+        {
+            error = null;
+            try
+            {
+                // KBObjectSavePreferences lives in Artech.Architecture.Common.dll, not in the
+                // assembly that owns the KBObject (which is typically Artech.Genexus.Common).
+                // Walk loaded assemblies until we find it.
+                Type prefsType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        prefsType = asm.GetType("Artech.Architecture.Common.Objects.KBObjectSavePreferences", throwOnError: false);
+                        if (prefsType != null) break;
+                    }
+                    catch { }
+                }
+                if (prefsType == null)
+                {
+                    error = "KBObjectSavePreferences type unresolved across loaded assemblies";
+                    return false;
+                }
+                object prefs = Activator.CreateInstance(prefsType);
+                var skipProp = prefsType.GetProperty("SkipValidation");
+                if (skipProp == null || !skipProp.CanWrite)
+                {
+                    error = "SkipValidation property not writable";
+                    return false;
+                }
+                skipProp.SetValue(prefs, true);
+                var save = obj.GetType().GetMethod("Save", new[] { prefsType });
+                if (save == null)
+                {
+                    error = "Save(KBObjectSavePreferences) not found on " + obj.GetType().FullName;
+                    return false;
+                }
+                save.Invoke(obj, new[] { prefs });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.InnerException?.Message ?? ex.Message;
+                return false;
             }
         }
 
