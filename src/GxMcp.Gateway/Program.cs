@@ -1059,6 +1059,90 @@ namespace GxMcp.Gateway
                         };
                     }
 
+                    // Async build intercept (Tasks 4.3 + 4.4):
+                    // build / rebuild actions go through path selection:
+                    //   - estimated_seconds < BuildSyncThresholdSeconds  → sync fast-path (fall through)
+                    //   - estimated_seconds >= BuildSyncThresholdSeconds  → async Task.Run, return job_id immediately
+                    if (string.Equals(tName, "genexus_lifecycle", StringComparison.OrdinalIgnoreCase)
+                        && (string.Equals(lcAction, "build", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(lcAction, "rebuild", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        int estimatedSeconds = tArgs?["estimated_seconds"]?.ToObject<int?>()
+                                               ?? (string.Equals(lcAction, "rebuild", StringComparison.OrdinalIgnoreCase) ? 120 : 60);
+                        int threshold = _activeConfig?.Server?.BuildSyncThresholdSeconds ?? 20;
+
+                        if (!BuildPathSelector.UseSync(estimatedSeconds, threshold))
+                        {
+                            // --- ASYNC PATH (Task 4.3) ---
+                            // Register the job first, then fire-and-forget the actual build.
+                            // The worker call is synchronous over the JSON-RPC pipe, so we wrap
+                            // it in Task.Run so the gateway thread returns to the caller immediately.
+                            var job = JobRegistry.Start(sessionId, $"lifecycle/{lcAction}", estimatedSeconds);
+                            Log($"[AsyncBuild] Dispatching job={job.Id} action={lcAction} target={tArgs?["target"]?.ToString() ?? "(all)"} estimated={estimatedSeconds}s");
+
+                            _ = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    var buildCmd = new JObject
+                                    {
+                                        ["module"] = "Build",
+                                        ["action"] = string.Equals(lcAction, "rebuild", StringComparison.OrdinalIgnoreCase)
+                                            ? "RebuildAll"
+                                            : "Build",
+                                        ["target"] = tArgs?["target"]?.ToString(),
+                                        ["client"] = "mcp"
+                                    };
+
+                                    JObject? workerResult = await SendWorkerCommandAsync(
+                                        buildCmd,
+                                        600000,
+                                        $"Timeout waiting for async build (job={job.Id})",
+                                        resultObj => resultObj,
+                                        (_, correlationId) => new JObject
+                                        {
+                                            ["status"] = "Error",
+                                            ["error"] = "Gateway timeout waiting for build.",
+                                            ["correlationId"] = correlationId
+                                        },
+                                        toolName: tName,
+                                        toolArgs: tArgs,
+                                        trackOperation: false);
+
+                                    bool success = workerResult != null
+                                        && workerResult["error"] == null
+                                        && !string.Equals(workerResult["status"]?.ToString(), "Error", StringComparison.OrdinalIgnoreCase);
+                                    string summary = success
+                                        ? $"Build {lcAction} completed successfully."
+                                        : $"Build {lcAction} failed: {workerResult?["error"]?.ToString() ?? workerResult?["message"]?.ToString() ?? "unknown error"}";
+                                    JobRegistry.Complete(job.Id, success, summary, workerResult);
+                                    Log($"[AsyncBuild] Completed job={job.Id} success={success}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    JobRegistry.Complete(job.Id, false, $"Build exception: {ex.Message}");
+                                    Log($"[AsyncBuild] Exception in job={job.Id}: {ex.Message}");
+                                }
+                            });
+
+                            // Return immediately with job_id
+                            var asyncResponse = new JObject
+                            {
+                                ["job_id"] = job.Id,
+                                ["status"] = "running",
+                                ["estimated_seconds"] = estimatedSeconds,
+                                ["hint"] = "Continue with other tools; build status will appear in _meta.background_jobs on the next response."
+                            };
+                            return new JObject
+                            {
+                                ["isError"] = false,
+                                ["content"] = new JArray { new JObject { ["type"] = "text", ["text"] = asyncResponse.ToString(Newtonsoft.Json.Formatting.None) } }
+                            };
+                        }
+                        // else: UseSync == true → fall through to the normal synchronous dispatch below
+                        Log($"[AsyncBuild] Short build (estimated={estimatedSeconds}s < threshold={threshold}s): using sync fast-path");
+                    }
+
                     object? rawWorkerCmd = null;
                     if (string.Equals(tName, "genexus_open_kb", StringComparison.OrdinalIgnoreCase))
                     {
