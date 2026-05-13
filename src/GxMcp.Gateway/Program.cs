@@ -1002,6 +1002,20 @@ namespace GxMcp.Gateway
                     {
                         return BuildToolTextResponse(idToken, _operationTracker.BuildMetricsPayload(), isError: false, toolName: "genexus_lifecycle", toolArgs: args);
                     }
+
+                    // Long-poll intercept (Task 4.5): action=status + job_id (BackgroundJobRegistry)
+                    // wait_seconds is clamped [0,25]; 0 = immediate poll (default behaviour).
+                    if (string.Equals(lifecycleAction, "status", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string? jobId = args?["job_id"]?.ToString() ?? args?["jobId"]?.ToString();
+                        if (!string.IsNullOrWhiteSpace(jobId))
+                        {
+                            int waitSeconds = Math.Min(Math.Max(args?["wait_seconds"]?.ToObject<int?>() ?? 0, 0), 25);
+                            JObject pollResult = await McpRouter.LongPollJob(JobRegistry, jobId, waitSeconds);
+                            bool isError = pollResult["error"] != null;
+                            return BuildToolTextResponse(idToken, pollResult, isError: isError, toolName: "genexus_lifecycle", toolArgs: args);
+                        }
+                    }
                 }
 
                 // Idempotency middleware wraps the rest of the tool dispatch

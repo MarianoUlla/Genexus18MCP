@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using System.Collections.Generic;
 using System.Linq;
@@ -873,6 +874,55 @@ namespace GxMcp.Gateway
             if (error["code"] != null) trimmed["code"] = error["code"];
             if (error["hint"] != null) trimmed["hint"] = error["hint"];
             return trimmed;
+        }
+
+        /// <summary>
+        /// Long-polls <paramref name="registry"/> for <paramref name="jobId"/> until it reaches a terminal
+        /// state or <paramref name="waitSeconds"/> elapses (clamped 0–25).  Returns a status envelope.
+        /// <list type="bullet">
+        ///   <item><c>wait_seconds=0</c> (or omitted) → immediate single poll, no blocking.</item>
+        ///   <item>Unknown job → envelope with <c>error="unknown_job_id"</c>.</item>
+        ///   <item>Terminal job → returns immediately regardless of <paramref name="waitSeconds"/>.</item>
+        /// </list>
+        /// </summary>
+        internal static async Task<JObject> LongPollJob(
+            BackgroundJobRegistry registry,
+            string jobId,
+            int waitSeconds)
+        {
+            // Clamp wait_seconds to [0, 25]
+            waitSeconds = Math.Min(Math.Max(waitSeconds, 0), 25);
+
+            var deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
+            JobEntry? job;
+
+            do
+            {
+                job = registry.Get(jobId);
+                if (job == null || job.Status != "running" || waitSeconds == 0)
+                    break;
+                await Task.Delay(250).ConfigureAwait(false);
+            }
+            while (DateTime.UtcNow < deadline);
+
+            if (job == null)
+            {
+                return new JObject
+                {
+                    ["error"] = "unknown_job_id",
+                    ["job_id"] = jobId
+                };
+            }
+
+            return new JObject
+            {
+                ["job_id"] = job.Id,
+                ["status"] = job.Status,
+                ["summary"] = job.Summary,
+                ["completed_at"] = job.CompletedAt?.ToString("o"),
+                ["estimated_seconds"] = job.EstimatedSeconds,
+                ["result"] = job.Result
+            };
         }
     }
 }
