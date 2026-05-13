@@ -1001,9 +1001,35 @@ namespace GxMcp.Worker.Services
                     {
                     }
 
-                    obj.EnsureSave(true);
+                    // KBObjectManager.PrepareSave skips persistence silently when kbObject.Mode ==
+                    // Mode.Unchanged. Our XmlNode/Properties mutations don't propagate to obj.Mode
+                    // in the headless worker, so the default obj.Save() path always no-ops. Pass
+                    // KBObjectSavePreferences { ForceSave = true } to bypass that check — same
+                    // mechanism the SDK uses internally for generated objects (Layers.BL line 1025).
+                    try
+                    {
+                        var prefs = new global::Artech.Architecture.Common.Objects.KBObjectSavePreferences
+                        {
+                            ForceSave = true,
+                            ForceSaveDefaultParts = true,
+                            SkipValidation = true
+                        };
+                        obj.Save(prefs);
+                        Logger.Info("[VisualWrite] obj.Save(KBObjectSavePreferences{ForceSave=true}) completed.");
+                    }
+                    catch (Exception fsEx)
+                    {
+                        var inner = fsEx.InnerException ?? fsEx;
+                        Logger.Info("[VisualWrite] obj.Save(ForceSave) threw: " + inner.GetType().Name + ": " + inner.Message + " — falling back to EnsureSave.");
+                        obj.EnsureSave(true);
+                    }
                     transaction.Commit();
-                    ScheduleFlush();
+                    // Force synchronous flush so the data actually lands on disk before we re-read
+                    // for verification. ScheduleFlush() default is timer-based and async — if the
+                    // worker is killed before the timer fires (or before ProcessExit), unflushed
+                    // KB writes are lost.
+                    ScheduleFlush(force: true);
+                    Logger.Info("[VisualWrite] ScheduleFlush(force=true) completed.");
 
                     var refreshedObj = _objectService.FindObject(target);
                     string persistedXml = WebFormXmlHelper.ReadEditableXml(refreshedObj ?? obj);

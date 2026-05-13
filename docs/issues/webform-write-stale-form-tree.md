@@ -19,6 +19,58 @@ The Patch operation now correctly modifies the element. Verify dumps in `last-cu
 `last-patch-output.xml` show the gxTextBlock retains its identity and the attribute changes
 land in `part.Document`.
 
+### 4. SDK save lifecycle decompiled via ILSpy
+
+`Artech.Layers.BL.dll` → `KBObjectManager.InternalSave` (line 473) — the canonical save:
+
+```csharp
+private void InternalSave(KBObject kbObject, KBObjectSavePreferences preferences) {
+    CheckValidSave(kbObject, ...);
+    if (!PrepareSave(kbObject, preferences, out var saveType))  // ← GATE
+        return;                                                 // SILENTLY SKIPPED
+    ...
+    using (KnowledgeBase.Transaction transaction = kbObject.KB.BeginTransaction()) {
+        foreach (KBObjectPart part in kbObject.Parts)
+            part.BeforeSaveKBObject();                          // ← WebFormPart fixup
+        PerformSave(kbObject, saveType, preferences);
+        ...
+        transaction.Commit();
+    }
+    kbObject.Mode = Mode.Unchanged;
+}
+```
+
+**Gate at `PrepareSave`:**
+```csharp
+if (kbObject.Mode == Mode.Unchanged && !preferences.ForceSave && !preferences.ForceSaveDefaultParts)
+    return false;  // SAVE SKIPPED - no exception thrown
+```
+
+So passing `KBObjectSavePreferences { ForceSave = true, ForceSaveDefaultParts = true }` to
+`obj.Save(prefs)` bypasses the Mode==Unchanged check. Confirmed via runtime logs:
+the save call now `[VisualWrite] obj.Save(KBObjectSavePreferences{ForceSave=true}) completed`
+AND the async `Model.Commit()` + `KB.Commit()` both return successful.
+
+But fresh-from-disk read after worker restart STILL shows the original value. The SAVE call
+travels through `PerformSave` → `EntityManager.SaveWithParent(part, kbObject, prefs2)` for
+each non-virtual part. The bytes WebFormPart.SerializeData() would return (= m_Document
+.OuterXml — which has our mutation) should be what gets persisted.
+
+**Two confirmed clobber/revert sites:**
+1. `WebFormPart.OnBeforeSaveEntity` iterates tags and calls `item.SaveProperties()`
+   for `CanHaveEntityReferences(item.Type) == true` types (TextBlock IS in that list).
+   `SaveProperties()` writes typed `Properties` collection → tag.Node.Attributes.
+2. `WebTagNavigator.Create(KBObject, XmlDocument)` calls
+   `MultiFormSerializer.ExpandForms(kbObj, doc, GetXmlOptions.None).DocumentElement`
+   — this CLONES m_Document. So tags from `EnumerateWebTag(part)` live in a clone,
+   not in m_Document. Our XmlNode invalidation hit the wrong instances.
+
+**Remaining unknown:** why `obj.Save(ForceSave=true)` reports success but disk has
+original value. Either (a) SaveWithParent silently drops the part write under some condition
+not yet found, (b) the in-flight transaction is being rolled back by something, or
+(c) the IDE has a private write-path that's not in any of `Artech.Layers.BL.dll`,
+`Artech.Udm.Layers.BL.dll`, or `Artech.Udm.BL.dll` (need to scan more BL DLLs).
+
 ### 3. Dirty-flag mechanism does NOT unblock persistence
 
 Extended the SDK probe to walk all base types of `WebFormPart` and scanned for
