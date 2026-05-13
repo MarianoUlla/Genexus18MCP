@@ -1,6 +1,18 @@
 # WebForm write does not persist: EntityVersionComposition pointer locks parent to old child version
 
-**Status:** ROOT CAUSE IDENTIFIED + verified via direct SQL fix · **Component:** `GxMcp.Worker` / SDK save path · **Severity:** blocks programmatic visual edits — fix path is now clear
+**Status:** ✅ RESOLVED in commit `9242c1d` (2026-05-13). End-to-end empirical proof: after `genexus_layout set_property` on `TextBlockSaldoHoras` with `Saldo TESTE8:`, a brand-new worker process reading from a freshly opened KB returns the new token. SQL state: parent v164 → component v180 (our bytes); v181 (stale regen `Saldo:`) orphaned.
+
+**Fix shipped** (`src/GxMcp.Worker/Helpers/WebFormCompositionRepair.cs` + `WebFormTypedPropertyWriter.cs` + `Services/LayoutService.cs`):
+
+1. After `obj.Save()`, `WebFormCompositionRepair.TryRepair` opens the KB's SQL Server (via `knowledgebase.connection`), scans the `EntityVersion` rows inserted by the just-finished save, decompresses each `EntityVersionData` gzip blob (header `01 02 03 04` + 7 bytes + gzip), finds the row carrying the expected payload token, and `UPDATE EntityVersionComposition SET ComponentEntityVersionId = <that row>` for the parent's latest version. Deterministic.
+2. `WebFormTypedPropertyWriter` now invokes `IWebTag.SetProperties(IDictionary)` so the typed model also carries the mutation, reducing (though not eliminating) the regen-stale-sibling phenomenon. The Composition repair in (1) is what guarantees correctness.
+3. `LayoutService.SetProperty` converts loose `Caption` to canonical `CaptionExpression` Tokens XML for `gxTextBlock`, and triggers the repair with the constant-data token as the matcher.
+
+Verification harness: `scripts/verify_webform_write.ps1` drives Worker as a child process, splits into WRITE worker + fresh READ worker, asserts the token surfaces from disk.
+
+---
+
+## Original investigation log (sessions 1–4, kept for context)
 
 ## Implementation status (2026-05-13, session 4 — solved at the SQL schema level)
 
