@@ -1036,6 +1036,20 @@ namespace GxMcp.Worker.Services
                     // directly via Entity.SaveModelEntityOutput(outputTypeId, version, ts, bytes).
                     Helpers.WebFormSaveDiagnostics.TryDirectSaveModelEntityOutput(webFormPart, obj);
 
+                    // ── BYPASS 2: EntityManager.SaveWithParent direct call ───────────────
+                    // If PerformSave's iteration of kbObject.Parts is skipping our part
+                    // (IsVirtualPart=true, ShouldIgnorePart=true, or wrong instance), this
+                    // sidesteps the loop entirely and forces SaveWithParent with our ref.
+                    Helpers.WebFormSaveDiagnostics.TryDirectSaveWithParent(webFormPart, obj);
+
+                    // ── BYPASS 3: SaveHeader() — bucket scan proved WebForm bytes are NOT
+                    //   in any (typeId, version) output bucket. SaveHeader writes the entity's
+                    //   primary row, which likely contains the data BLOB column.
+                    Helpers.WebFormSaveDiagnostics.TryDirectSaveHeader(webFormPart);
+
+                    // ── DIAGNOSTIC: state after all bypasses, before transaction.Commit ──
+                    Helpers.WebFormSaveDiagnostics.DumpState(webFormPart, obj, "AFTER-BYPASSES");
+
                     transaction.Commit();
                     // Force synchronous flush so the data actually lands on disk before we re-read
                     // for verification. ScheduleFlush() default is timer-based and async — if the

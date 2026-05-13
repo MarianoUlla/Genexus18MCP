@@ -1,6 +1,119 @@
-# WebForm write does not persist: `m_Document` clobbered by stale Form tree on save
+# WebForm write does not persist: stale read path consults legacy snapshot, not SQL
 
-**Status:** blocked on obfuscated SDK layer · **Component:** `GxMcp.Worker` / `WebFormXmlHelper` · **Severity:** blocks programmatic visual edits
+**Status:** root cause partially identified (read path, not write path) · **Component:** `GxMcp.Worker` / `WebFormXmlHelper` · **Severity:** blocks programmatic visual edits
+
+## Implementation status (2026-05-13, session 4 — write path PROVEN to work; problem is in the READ path)
+
+**Major paradigm shift this session: the write path was never broken.** Direct SQL
+inspection of the KB database (`GX_KB_AcademicoHomolog1` on
+`localhost\SQLDEVELOP`) proves the SDK's save lifecycle DOES persist our mutated
+bytes:
+
+- `EntityVersion(EntityTypeId=71, EntityId=3370, EntityVersionId=148)` contains a
+  decompressible blob: `[4-byte DATA_HEADER][7-byte metadata][gzip stream]`. After
+  gzip decompression, the XML contains the literal `<![CDATA[Saldo TESTE7:]]>` —
+  our latest mutation. `Entity.EntityLastVersionId = 148`. `ModelEntityVersion`
+  for `ModelId=1 (Design)` points to `EntityVersionId=148`.
+- Each `obj.Save(KBObjectSavePreferences{ForceSave=true})` call **inserts a new
+  `EntityVersion` row**. Hashing the data column across versions 140..148 shows
+  our mutated bytes alternate with regenerated `Saldo:` bytes — the SDK serializes
+  m_Document on some saves and the typed model on others, but BOTH types of write
+  reach SQL.
+
+Despite this, `genexus_read part=WebForm` AFTER `Stop-Process -Force GxMcp.Worker
++ fresh genexus_open_kb` still returns `<![CDATA[Saldo:]]>` — the original. So the
+write reaches SQL, but the read path consults a different source.
+
+### Storage layout (verified by direct schema introspection)
+
+| Concern | Where it lives |
+|---|---|
+| WebForm XML payload (the bytes) | `EntityVersion.EntityVersionData` varbinary BLOB, gzip-compressed with `01 02 03 04` + 7-byte header prefix |
+| Active version pointer per KB | `Entity.EntityLastVersionId` (one row per entity) + `ModelEntityVersion(ModelId, EntityTypeId, EntityId, EntityVersionId)` (per-model pointer) |
+| Compiled/generated outputs (NOT source) | `ModelEntityOutput` (separate from EntityVersion — earlier `SaveModelEntityOutput(71, 4, …)` calls wrote to an empty bucket here, hence the false dead-end of session 3) |
+| Legacy file-storage snapshot | `kb.data` — a ZIP archive containing `Entity.dat`, `EntityVersion.dat`, `OBJECT.dat`, etc. — full mirror of the SQL tables. Last mtime `2026-05-07` (6 days stale). Contains `Entity.dat` with `EntityLastVersionId=16` for our entity (v16 has the original `Saldo:` bytes). |
+
+### What we eliminated this session (negative results — do NOT redo)
+
+1. **PerformSave gate flags** (`IsVirtualPart`, `ShouldIgnorePart`, `IsDefault`):
+   diagnostic enumerated `kbObject.Parts` and confirmed WebFormPart is index 0,
+   `IsVirtual=False`, `ShouldIgnore=<no method>`, `IsDefault=False`,
+   `sameAsTarget=True` (our mutated ref IS in the iteration). Falsified.
+2. **EntityManager.SaveWithParent skipping our part:** found 2-arg
+   `SaveWithParent(Entity, Entity)` on `Artech.Udm.Framework.EntityManager`,
+   invoked directly via reflection in `WebFormSaveDiagnostics.TryDirectSaveWithParent`.
+   Runs without exception. No persistence change — because the existing
+   PerformSave loop already invokes it correctly.
+3. **SaveHeader / Save(SavePreferences):** all three (`SaveHeader()`,
+   `SaveHeader(SavePreferences)`, `Save(SavePreferences)`) reflected and invoked
+   on the part. No-op for persistence (the underlying writes already happened
+   via obj.Save).
+4. **Output-bucket scan:** scanned `LoadModelEntityOutput` and
+   `LoadVersionIndependentOutput` across (typeId 0..200, version 0..10) — ZERO
+   hits. WebForm bytes are NOT stored in any output bucket. They are in
+   `EntityVersion.EntityVersionData`.
+5. **kb.data Entity.dat LastVer patch:** patched the kb.data ZIP, set
+   `Entity.dat` byte-offset for `(EntityTypeId=71, EntityId=3370)` from
+   `EntityLastVersionId=16` to `=148`, re-zipped. Fresh worker read STILL
+   returned `Saldo:`. So kb.data Entity.dat is not the unique read source.
+6. **kb.data renamed (forcing SQL-only):** renamed kb.data to .disabled, fresh
+   open + read STILL returned `Saldo:`. So either there's another stale source
+   not yet found, or the SDK has an in-memory cache from a prior open that
+   survives worker restart.
+
+### Files added this session
+
+- `src/GxMcp.Worker/Helpers/WebFormSaveDiagnostics.cs` extended:
+  - `DumpState` now logs parts iteration, IsVirtualPart/ShouldIgnorePart,
+    Model.IsReadOnly, KB mdf/ldf/kb.data mtime + size, `LoadModelEntityOutput`
+    round-trip.
+  - `TryDirectSaveWithParent(part, kbObject)` reflects `EntityManager.SaveWithParent`.
+  - `TryDirectSaveHeader(part)` reflects `SaveHeader()` / `SaveHeader(prefs)` / `Save(prefs)`.
+  - `TryScanBuckets(part, tag)` enumerates (typeId 0..200, ver 0..10) for both
+    output APIs.
+- `src/GxMcp.Worker/Services/WriteService.cs:1037-1042` wires in `TryDirectSaveWithParent`
+  and `TryDirectSaveHeader` bypasses + an `AFTER-BYPASSES` diagnostic dump.
+
+### What still needs to be discovered (open question)
+
+**Where does the SDK load the WebFormPart bytes from on fresh open?** The current
+hypothesis chain is:
+
+- Not from `EntityVersion` keyed by `Entity.EntityLastVersionId` directly — that
+  row (v148) has `Saldo TESTE7:`, but the SDK returns `Saldo:`.
+- Not from `ModelEntityOutput` — that table has no row for this entity at any
+  (typeId, ver) scanned.
+- Not from kb.data Entity.dat — patched LastVer 16→148, still `Saldo:`.
+- Not from kb.data alone — renamed kb.data, fresh open succeeded, still `Saldo:`.
+- Possibly from a different SQL table or join we haven't queried, OR from a
+  worker-level in-memory cache that survives worker restart somehow (maybe via
+  the gateway process which is not killed when the worker is killed).
+
+### Recommended follow-ups (in order of expected payoff)
+
+1. **Trace the load path with reflection / instrumentation.** When
+   `genexus_open_kb` runs, what method on `WebFormPart` populates `m_Document`?
+   Probably `Entity.Load(entity, key)` or `EntityManager.Load(entity)` →
+   `WebFormPart.DeserializeData(bytes)`. Hook `DeserializeData` and log the
+   `bytes` it receives. If those bytes contain `Saldo:`, the SQL `EntityVersion`
+   row being read is NOT v148 — find which version the SDK actually queries.
+2. **Test the Gateway-process angle.** GxMcp.Gateway stays alive across
+   `Stop-Process -Force GxMcp.Worker`. If the gateway caches WebForm content in
+   memory and serves reads from there even after worker restart, the user's
+   "kill + reopen" never really invalidates the cache. Restart the gateway too
+   and re-test.
+3. **Query the SDK on which connection/database it actually connected to.**
+   `kbObject.Model.KB` should expose a connection or model-path. Compare against
+   the `GX_KB_AcademicoHomolog1.mdf` we instrumented to confirm same DB.
+
+### Files touched (carry-over from session 3, kept)
+
+- `src/GxMcp.Worker/Helpers/WebFormTypedPropertyWriter.cs` — typed-property
+  writer with EditableToStored / Document setter / m_EditableContent sync.
+- `src/GxMcp.Worker/Services/WriteService.cs:996-1037` — BEFORE-SAVE and
+  AFTER-SAVE diagnostic hooks.
+
+---
 
 ## Implementation status (2026-05-12, session 3 — wall hit at byte-persistence layer)
 

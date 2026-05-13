@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -108,6 +109,80 @@ namespace GxMcp.Worker.Helpers
                     }
                 }
                 catch { }
+
+                // 7. PerformSave gate flags on THIS part — these silently skip SaveWithParent
+                //    if true (Layers.BL.KBObjectManager.PerformSave line 684-692).
+                LogGateFlag(webFormPart, "IsVirtualPart", $"[Diag/{tag}] part");
+                LogGateFlag(webFormPart, "ShouldIgnorePart", $"[Diag/{tag}] part");
+                LogReadProp(webFormPart, "IsDefault", $"[Diag/{tag}] part");
+
+                // 8. Iterate kbObject.Parts — is the part we mutated actually IN this iteration,
+                //    by reference? If not, our mutation is invisible to PerformSave.
+                try
+                {
+                    var partsProp = kbObject.GetType().GetProperty("Parts");
+                    var parts = partsProp?.GetValue(kbObject, null) as IEnumerable;
+                    if (parts != null)
+                    {
+                        int idx = 0;
+                        foreach (var p in parts)
+                        {
+                            if (p == null) { idx++; continue; }
+                            bool same = ReferenceEquals(p, webFormPart);
+                            string t = p.GetType().Name;
+                            string mode = SafeReadString(p, "Mode");
+                            string mods = SafeReadString(p, "Modifications");
+                            bool isVirt = SafeInvokeBool(p, "IsVirtualPart");
+                            bool isIgn = SafeInvokeBool(p, "ShouldIgnorePart");
+                            bool isDef = SafeReadBool(p, "IsDefault");
+                            int? typeId = TryReadInt(p, "TypeId");
+                            int? verId = TryReadInt(p, "TypeVersionId");
+                            Logger.Info($"[Diag/{tag}] Parts[{idx}] {t} sameAsTarget={same} IsVirtual={isVirt} ShouldIgnore={isIgn} IsDefault={isDef} Mode={mode} Mods={mods} TypeId={typeId} Ver={verId}");
+                            idx++;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Info($"[Diag/{tag}] Parts iteration threw: {ex.Message}");
+                }
+
+                // 9. Model / KB read-only state
+                try
+                {
+                    var modelProp = kbObject.GetType().GetProperty("Model");
+                    var model = modelProp?.GetValue(kbObject, null);
+                    if (model != null)
+                    {
+                        Logger.Info($"[Diag/{tag}] obj.Model.IsReadOnly={SafeReadString(model, "IsReadOnly")} IsImporting={SafeReadString(model, "IsImporting")}");
+                    }
+                    var kbProp = kbObject.GetType().GetProperty("KB");
+                    var kb = kbProp?.GetValue(kbObject, null);
+                    if (kb != null)
+                    {
+                        Logger.Info($"[Diag/{tag}] obj.KB.IsReadOnly={SafeReadString(kb, "IsReadOnly")}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Info($"[Diag/{tag}] Model/KB state check threw: {ex.Message}");
+                }
+
+                // 10. KB storage file mtime + size — definitive evidence whether a SQL write
+                //     actually touched disk between BEFORE and AFTER. If unchanged, no write.
+                TryLogKbFile(tag);
+
+                // 11. ROUND-TRIP: read back what's currently in the output cache via
+                //     Entity.LoadModelEntityOutput(71, 4). If after our Save the loaded bytes
+                //     match our mutation, the in-memory cache holds them (DB-flush is the gate).
+                //     If they match the original, even the in-memory output write didn't land.
+                TryLogLoadedOutput(webFormPart, tag);
+
+                // 12. BUCKET SCAN: WebForm bytes are NOT at TypeId=71/Version=4. Scan
+                //     LoadModelEntityOutput and LoadVersionIndependentOutput across a range
+                //     of (typeId, version) and log any bucket that returns data — this reveals
+                //     where the real WebForm bytes live.
+                if (tag == "BEFORE-SAVE") TryScanBuckets(webFormPart, tag);
             }
             catch (Exception ex)
             {
@@ -306,6 +381,381 @@ namespace GxMcp.Worker.Helpers
                 if (m != null) return m;
             }
             return null;
+        }
+
+        private static void LogGateFlag(object o, string methodName, string prefix)
+        {
+            try
+            {
+                var mi = FindNonPublicMethod(o.GetType(), methodName, Type.EmptyTypes)
+                        ?? FindMethod(o.GetType(), methodName, Type.EmptyTypes);
+                if (mi == null) { Logger.Info($"{prefix}.{methodName}=<no method>"); return; }
+                var v = mi.Invoke(o, null);
+                Logger.Info($"{prefix}.{methodName}()={v}");
+            }
+            catch (Exception ex) { Logger.Info($"{prefix}.{methodName}() threw: {(ex.InnerException ?? ex).Message}"); }
+        }
+
+        private static void LogReadProp(object o, string propName, string prefix)
+        {
+            try
+            {
+                var p = o.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p == null || !p.CanRead) { Logger.Info($"{prefix}.{propName}=<no prop>"); return; }
+                Logger.Info($"{prefix}.{propName}={p.GetValue(o, null)}");
+            }
+            catch (Exception ex) { Logger.Info($"{prefix}.{propName} threw: {(ex.InnerException ?? ex).Message}"); }
+        }
+
+        private static string SafeReadString(object o, string propName)
+        {
+            try
+            {
+                var p = o.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p == null || !p.CanRead) return "<no prop>";
+                var v = p.GetValue(o, null);
+                return v?.ToString() ?? "null";
+            }
+            catch (Exception ex) { return "threw:" + ex.Message; }
+        }
+
+        private static bool SafeReadBool(object o, string propName)
+        {
+            try
+            {
+                var p = o.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p == null || !p.CanRead) return false;
+                return (bool)p.GetValue(o, null);
+            }
+            catch { return false; }
+        }
+
+        private static bool SafeInvokeBool(object o, string methodName)
+        {
+            try
+            {
+                var mi = FindNonPublicMethod(o.GetType(), methodName, Type.EmptyTypes)
+                        ?? FindMethod(o.GetType(), methodName, Type.EmptyTypes);
+                if (mi == null) return false;
+                var v = mi.Invoke(o, null);
+                return v is bool b && b;
+            }
+            catch { return false; }
+        }
+
+        private static void TryLogKbFile(string tag)
+        {
+            try
+            {
+                var path = @"C:\KBs\AcademicoHomolog1\GX_KB_AcademicoHomolog1.mdf";
+                var fi = new System.IO.FileInfo(path);
+                if (!fi.Exists) { Logger.Info($"[Diag/{tag}] KB mdf NOT FOUND at {path}"); return; }
+                Logger.Info($"[Diag/{tag}] KB mdf size={fi.Length} mtime={fi.LastWriteTimeUtc:O}");
+                var ldfPath = @"C:\KBs\AcademicoHomolog1\GX_KB_AcademicoHomolog1_log.ldf";
+                var li = new System.IO.FileInfo(ldfPath);
+                if (li.Exists)
+                    Logger.Info($"[Diag/{tag}] KB ldf size={li.Length} mtime={li.LastWriteTimeUtc:O}");
+                var kbDataPath = @"C:\KBs\AcademicoHomolog1\kb.data";
+                var kd = new System.IO.FileInfo(kbDataPath);
+                if (kd.Exists)
+                    Logger.Info($"[Diag/{tag}] KB kb.data size={kd.Length} mtime={kd.LastWriteTimeUtc:O}");
+            }
+            catch (Exception ex) { Logger.Info($"[Diag/{tag}] KB file probe threw: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Bypass: reflect EntityManager and call SaveWithParent(part, kbObject, prefs) directly
+        /// with our mutated part instance. This sidesteps the kbObject.Parts iteration and the
+        /// PerformSave IsVirtualPart/ShouldIgnorePart gates. Used after obj.Save returned cleanly
+        /// but bytes did not reach disk.
+        /// </summary>
+        public static void TryDirectSaveWithParent(object webFormPart, object kbObject)
+        {
+            try
+            {
+                Type emType = FindType("Artech.Layers.BL.EntityManager")
+                            ?? FindType("Artech.Udm.Framework.EntityManager")
+                            ?? FindFirstType("EntityManager");
+                if (emType == null) { Logger.Info("[DirectSWP] EntityManager type not found"); return; }
+                Logger.Info("[DirectSWP] EntityManager type = " + emType.AssemblyQualifiedName);
+
+                // Find SaveWithParent overload (static or instance). Prefer 3-arg
+                // (part, kbObject, prefs) where prefs is some KBObjectSavePreferences-like type.
+                MethodInfo target = null;
+                object emInstance = null;
+                foreach (var mi in emType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                {
+                    if (mi.Name != "SaveWithParent") continue;
+                    var ps = mi.GetParameters();
+                    if (ps.Length < 2 || ps.Length > 4) continue;
+                    if (!ps[0].ParameterType.IsInstanceOfType(webFormPart)) continue;
+                    if (!ps[1].ParameterType.IsInstanceOfType(kbObject)) continue;
+                    target = mi;
+                    break;
+                }
+                if (target == null)
+                {
+                    Logger.Info("[DirectSWP] no SaveWithParent overload matched (part, kbObject, ...). Dumping candidates:");
+                    foreach (var mi in emType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance))
+                        if (mi.Name.Contains("Save"))
+                            Logger.Info("[DirectSWP]   " + mi);
+                    return;
+                }
+                Logger.Info("[DirectSWP] target = " + target);
+
+                if (!target.IsStatic)
+                {
+                    // Try resolve a singleton: EntityManager.Instance or static field.
+                    var instProp = emType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instProp != null) emInstance = instProp.GetValue(null, null);
+                    if (emInstance == null)
+                    {
+                        var instField = emType.GetField("Instance", BindingFlags.Public | BindingFlags.Static)
+                                      ?? emType.GetField("_instance", BindingFlags.NonPublic | BindingFlags.Static)
+                                      ?? emType.GetField("m_Instance", BindingFlags.NonPublic | BindingFlags.Static);
+                        if (instField != null) emInstance = instField.GetValue(null);
+                    }
+                    if (emInstance == null) { Logger.Info("[DirectSWP] could not resolve EntityManager instance"); return; }
+                    Logger.Info("[DirectSWP] resolved EntityManager instance");
+                }
+
+                // Build args. Third param (if present) is typically KBObjectSavePreferences;
+                // fourth (if present) is rare. We'll fabricate a ForceSave-true prefs.
+                var ps2 = target.GetParameters();
+                var args = new object[ps2.Length];
+                args[0] = webFormPart;
+                args[1] = kbObject;
+                for (int i = 2; i < ps2.Length; i++)
+                {
+                    var pt = ps2[i].ParameterType;
+                    if (pt.Name.Contains("Preferences"))
+                    {
+                        try
+                        {
+                            var prefs = Activator.CreateInstance(pt);
+                            TrySetBool(prefs, "ForceSave", true);
+                            TrySetBool(prefs, "ForceSaveDefaultParts", true);
+                            TrySetBool(prefs, "SkipValidation", true);
+                            args[i] = prefs;
+                        }
+                        catch (Exception ex) { Logger.Info("[DirectSWP] prefs ctor threw: " + ex.Message); args[i] = null; }
+                    }
+                    else
+                    {
+                        args[i] = pt.IsValueType ? Activator.CreateInstance(pt) : null;
+                    }
+                }
+
+                target.Invoke(emInstance, args);
+                Logger.Info("[DirectSWP] SaveWithParent invoked successfully.");
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException ?? ex;
+                Logger.Info($"[DirectSWP] threw: {inner.GetType().Name}: {inner.Message}");
+                if (inner.StackTrace != null)
+                    Logger.Info("[DirectSWP]   at " + inner.StackTrace.Split('\n')[0].Trim());
+            }
+        }
+
+        /// <summary>
+        /// Try calling SaveHeader() / SaveHeader(SavePreferences) on the entity directly.
+        /// Per SdkProbe, these exist on Entity and likely write the entity's PRIMARY row —
+        /// possibly with a BLOB data column. SaveModelEntityOutput only writes outputs;
+        /// SaveHeader may be the actual byte-→disk path for the part data.
+        /// </summary>
+        public static void TryDirectSaveHeader(object webFormPart)
+        {
+            try
+            {
+                // 0-arg SaveHeader
+                var miNoArg = webFormPart.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                    .FirstOrDefault(m => m.Name == "SaveHeader" && m.GetParameters().Length == 0);
+                if (miNoArg != null)
+                {
+                    miNoArg.Invoke(webFormPart, null);
+                    Logger.Info("[DirectHeader] SaveHeader() invoked.");
+                }
+                else
+                {
+                    Logger.Info("[DirectHeader] SaveHeader() not found.");
+                }
+
+                // 1-arg SaveHeader(SavePreferences)
+                var miArg = webFormPart.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                    .FirstOrDefault(m => m.Name == "SaveHeader" && m.GetParameters().Length == 1);
+                if (miArg != null)
+                {
+                    var prefsType = miArg.GetParameters()[0].ParameterType;
+                    object prefs = null;
+                    try
+                    {
+                        prefs = Activator.CreateInstance(prefsType);
+                        TrySetBool(prefs, "ForceSave", true);
+                        TrySetBool(prefs, "SkipValidation", true);
+                    }
+                    catch { }
+                    miArg.Invoke(webFormPart, new[] { prefs });
+                    Logger.Info("[DirectHeader] SaveHeader(SavePreferences) invoked.");
+                }
+
+                // Also try Save(SavePreferences) on the part — the 1-arg overload (not Save()).
+                var miSavePrefs = webFormPart.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                    .FirstOrDefault(m => m.Name == "Save" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType.Name.Contains("Preferences"));
+                if (miSavePrefs != null)
+                {
+                    var prefsType = miSavePrefs.GetParameters()[0].ParameterType;
+                    object prefs = null;
+                    try
+                    {
+                        prefs = Activator.CreateInstance(prefsType);
+                        TrySetBool(prefs, "ForceSave", true);
+                        TrySetBool(prefs, "SkipValidation", true);
+                    }
+                    catch { }
+                    miSavePrefs.Invoke(webFormPart, new[] { prefs });
+                    Logger.Info("[DirectHeader] Save(SavePreferences) invoked on part.");
+                }
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException ?? ex;
+                Logger.Info($"[DirectHeader] threw: {inner.GetType().Name}: {inner.Message}");
+            }
+        }
+
+        private static Type FindFirstType(string simpleName)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types = null;
+                try { types = asm.GetTypes(); } catch (ReflectionTypeLoadException rtle) { types = rtle.Types; }
+                if (types == null) continue;
+                foreach (var t in types)
+                    if (t != null && t.Name == simpleName) return t;
+            }
+            return null;
+        }
+
+        private static void TryLogLoadedOutput(object webFormPart, string tag)
+        {
+            try
+            {
+                int? typeId = TryReadInt(webFormPart, "TypeId");
+                int? versionId = TryReadInt(webFormPart, "TypeVersionId");
+                if (typeId == null || versionId == null) { Logger.Info($"[Diag/{tag}] LoadOutput: no TypeId/VersionId"); return; }
+
+                // LoadModelEntityOutput(int, int, ref/out byte[]) — 3-arg overload.
+                var miByteOut = webFormPart.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                    .FirstOrDefault(m =>
+                    {
+                        if (m.Name != "LoadModelEntityOutput") return false;
+                        var ps = m.GetParameters();
+                        return ps.Length == 3
+                            && ps[0].ParameterType == typeof(int)
+                            && ps[1].ParameterType == typeof(int)
+                            && ps[2].ParameterType == typeof(byte[]).MakeByRefType();
+                    });
+                if (miByteOut != null)
+                {
+                    var args = new object[] { typeId.Value, versionId.Value, null };
+                    var ret = miByteOut.Invoke(webFormPart, args);
+                    var bytes = args[2] as byte[];
+                    string probe = bytes == null ? "(null)" : ExtractProbeAttrFromXml(SafeBytesToXmlString(bytes));
+                    Logger.Info($"[Diag/{tag}] LoadModelEntityOutput(71,4) returned {ret} bytes={(bytes?.Length ?? -1)} hash={(bytes == null ? "n/a" : Sha1Bytes(bytes))} probe={probe}");
+                }
+                else
+                {
+                    Logger.Info($"[Diag/{tag}] LoadModelEntityOutput(int,int,out byte[]) not found");
+                }
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException ?? ex;
+                Logger.Info($"[Diag/{tag}] LoadOutput threw: {inner.GetType().Name}: {inner.Message}");
+            }
+        }
+
+        private static void TryScanBuckets(object webFormPart, string tag)
+        {
+            try
+            {
+                var miByteOut = webFormPart.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                    .FirstOrDefault(m =>
+                    {
+                        if (m.Name != "LoadModelEntityOutput") return false;
+                        var ps = m.GetParameters();
+                        return ps.Length == 3
+                            && ps[0].ParameterType == typeof(int)
+                            && ps[1].ParameterType == typeof(int)
+                            && ps[2].ParameterType == typeof(byte[]).MakeByRefType();
+                    });
+
+                var miVerIndep = webFormPart.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy)
+                    .FirstOrDefault(m =>
+                    {
+                        if (m.Name != "LoadVersionIndependentOutput") return false;
+                        var ps = m.GetParameters();
+                        return ps.Length == 4
+                            && ps[0].ParameterType == typeof(int)
+                            && ps[1].ParameterType == typeof(int)
+                            && ps[2].ParameterType == typeof(DateTime).MakeByRefType()
+                            && ps[3].ParameterType == typeof(byte[]).MakeByRefType();
+                    });
+
+                int hitsModel = 0, hitsIndep = 0;
+                for (int tid = 0; tid <= 200; tid++)
+                {
+                    for (int ver = 0; ver <= 10; ver++)
+                    {
+                        if (miByteOut != null)
+                        {
+                            var args = new object[] { tid, ver, null };
+                            try
+                            {
+                                var ret = (bool)miByteOut.Invoke(webFormPart, args);
+                                if (ret && args[2] is byte[] bytes && bytes.Length > 0)
+                                {
+                                    string probe = ExtractProbeAttrFromXml(SafeBytesToXmlString(bytes));
+                                    Logger.Info($"[Diag/{tag}] BUCKET-HIT LoadModelEntityOutput({tid},{ver}) bytes={bytes.Length} hash={Sha1Bytes(bytes)} probe={probe}");
+                                    hitsModel++;
+                                }
+                            }
+                            catch { }
+                        }
+                        if (miVerIndep != null)
+                        {
+                            var args = new object[] { tid, ver, default(DateTime), null };
+                            try
+                            {
+                                var ret = (bool)miVerIndep.Invoke(webFormPart, args);
+                                if (ret && args[3] is byte[] bytes && bytes.Length > 0)
+                                {
+                                    string probe = ExtractProbeAttrFromXml(SafeBytesToXmlString(bytes));
+                                    Logger.Info($"[Diag/{tag}] BUCKET-HIT LoadVersionIndependentOutput({tid},{ver}) bytes={bytes.Length} hash={Sha1Bytes(bytes)} probe={probe}");
+                                    hitsIndep++;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                Logger.Info($"[Diag/{tag}] Bucket scan done. ModelEntity hits={hitsModel}, VersionIndep hits={hitsIndep}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Info($"[Diag/{tag}] Bucket scan threw: {ex.Message}");
+            }
+        }
+
+        private static void TrySetBool(object o, string propName, bool value)
+        {
+            try
+            {
+                var p = o.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (p != null && p.CanWrite && p.PropertyType == typeof(bool)) p.SetValue(o, value, null);
+            }
+            catch { }
         }
     }
 }
