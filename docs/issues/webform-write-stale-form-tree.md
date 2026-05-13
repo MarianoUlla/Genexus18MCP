@@ -19,6 +19,28 @@ The Patch operation now correctly modifies the element. Verify dumps in `last-cu
 `last-patch-output.xml` show the gxTextBlock retains its identity and the attribute changes
 land in `part.Document`.
 
+### 3. Dirty-flag mechanism does NOT unblock persistence
+
+Extended the SDK probe to walk all base types of `WebFormPart` and scanned for
+modification/dirty hooks. Found canonical Entity-level surface:
+- `Entity.Dirty` (R/W bool)
+- `Entity.SetModeModified(Modification, Object)`
+- `Entity.InternalSetModeModified(Modification, Object)`
+- `Entity.Mode` (R/W), `Entity.Modifications` (R), `Modification` enum (`None|Data|Property|Category|Unknown|Any`)
+- `KBObjectPart.InternalSetModeModified(Modification, Object)` override
+
+Tried every combination after the m_Document mutation:
+- `webFormPart.SetModeModified(Data, null)` + `webFormPart.Dirty = true` (the part)
+- `obj.SetModeModified(Any, null)` + `obj.Dirty = true` (the parent KBObject)
+- `webFormPart.Save()` returns cleanly (no exception)
+- `obj.EnsureSave(true)` + `transaction.Commit()` + `ScheduleFlush()`
+- After worker restart + fresh disk read: ORIGINAL value still on disk.
+
+So whatever the IDE uses to make WebFormPart persistence work is NOT reachable via:
+(a) marking the entity dirty, (b) calling Save on the part, (c) EnsureSave on the
+parent, or (d) any combination of those. The persistence path appears to require
+either an IDE-only API surface or a state precondition we haven't discovered.
+
 ### 2. Persistence blocked at the SDK level (BLOCKED on dirty-flag / KBModel cache)
 
 Empirically confirmed in this session (with the gateway bug fixed so the patch actually

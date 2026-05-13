@@ -66,6 +66,10 @@ namespace GxMcp.Worker.Helpers
             Log("partAssembly=" + partType.Assembly.GetName().Name + " loc=" + SafeLoc(partType.Assembly));
 
             DumpType(partType, "WebFormPart");
+            for (var bt = partType.BaseType; bt != null && bt != typeof(object); bt = bt.BaseType)
+            {
+                DumpType(bt, "BASE-PART");
+            }
 
             Type[] siblings;
             try { siblings = partType.Assembly.GetTypes(); }
@@ -81,6 +85,27 @@ namespace GxMcp.Worker.Helpers
             }
 
             string[] needles = new[] { "WebTag", "WebFormHelper", "WebFormEditable", "IPropertyDefinition", "PropertyValueConverter", "WebFormControl", "AttributeVariableConverter" };
+
+            // Also scan all loaded assemblies for KBObject / KBObjectPart / dirty-flag candidates.
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] all;
+                try { all = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException rtle) { all = rtle.Types.Where(x => x != null).ToArray(); }
+                catch { continue; }
+
+                foreach (var ty in all)
+                {
+                    string n = ty.FullName ?? "";
+                    bool isInteresting =
+                        n.EndsWith(".KBObject", StringComparison.OrdinalIgnoreCase) ||
+                        n.EndsWith(".KBObjectPart", StringComparison.OrdinalIgnoreCase) ||
+                        n.EndsWith(".Entity", StringComparison.OrdinalIgnoreCase) && n.Contains("Architecture") ||
+                        n.IndexOf("Entity+", StringComparison.OrdinalIgnoreCase) > 0;
+                    if (!isInteresting) continue;
+                    DumpType(ty, "SDK-BASE");
+                }
+            }
             foreach (var ty in siblings)
             {
                 string n = ty.FullName ?? "";

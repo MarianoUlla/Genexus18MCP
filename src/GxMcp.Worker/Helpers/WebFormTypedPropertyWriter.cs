@@ -185,6 +185,41 @@ namespace GxMcp.Worker.Helpers
             }
             catch { }
 
+            // THE KEY: signal the Udm Entity that we modified data so EnsureSave actually persists.
+            // Without this, the SDK considers the part clean (no Property setter fired) and skips it.
+            // SetModeModified(Modification.Data, null) is the canonical "data changed" notification.
+            try
+            {
+                Type modEnum = FindType("Artech.Udm.Framework.Entity+Modification");
+                object dataMod = modEnum != null ? Enum.Parse(modEnum, "Data") : null;
+                if (dataMod != null)
+                {
+                    var setMode = FindInstanceMethod(webFormPart.GetType(), "SetModeModified", new[] { modEnum, typeof(object) });
+                    if (setMode != null)
+                    {
+                        setMode.Invoke(webFormPart, new[] { dataMod, (object)null });
+                        Logger.Info("[TypedWriter] SetModeModified(Modification.Data, null) — part marked dirty.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("[TypedWriter] SetModeModified threw: " + (ex.InnerException ?? ex).Message);
+            }
+
+            // Belt-and-suspenders: also set Entity.Dirty = true via property.
+            try
+            {
+                var dirtyProp = webFormPart.GetType().GetProperty("Dirty",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (dirtyProp != null && dirtyProp.CanWrite && dirtyProp.PropertyType == typeof(bool))
+                {
+                    dirtyProp.SetValue(webFormPart, true, null);
+                    Logger.Info("[TypedWriter] Entity.Dirty = true.");
+                }
+            }
+            catch { }
+
             // Call EditableToStored to sync typed model from XML through the SDK's canonical converter.
             // For pure attribute changes (no new att:NNNN references), this should not throw.
             try
@@ -277,6 +312,17 @@ namespace GxMcp.Worker.Helpers
                 }
             }
             Logger.Info("[TypedWriter] invalidated " + invalidated + " cache field(s) on tag '" + controlName + "'.");
+        }
+
+        private static MethodInfo FindInstanceMethod(Type type, string name, Type[] paramTypes)
+        {
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            for (var t = type; t != null && t != typeof(object); t = t.BaseType)
+            {
+                var m = t.GetMethod(name, flags, null, paramTypes, null);
+                if (m != null) return m;
+            }
+            return null;
         }
 
         private static Type FindType(string fullName)
