@@ -293,7 +293,9 @@ namespace GxMcp.Worker.Services
                             args?["expectedCount"]?.ToObject<int?>() ?? 1,
                             args?["type"]?.ToString(),
                             args?["dryRun"]?.ToObject<bool?>() ?? false,
-                            args?["verifyRollback"]?.ToObject<bool?>() ?? false);
+                            args?["verifyRollback"]?.ToObject<bool?>() ?? false,
+                            args?["return_post_state"]?.ToObject<bool?>() ?? true,
+                            args?["verbose"]?.ToObject<bool?>() ?? false);
                         break;
                     case "analyze":
                         var analyzeType = args?["type"]?.ToString();
