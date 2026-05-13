@@ -733,6 +733,19 @@ namespace GxMcp.Worker.Services
             error = null;
             try
             {
+                // Friction-report #6: post-write verification must read from a forced cache miss.
+                // Without this, the ObjectService _readCache or the patch-local _sourceCache can
+                // hold pre-write content and falsely report persistedVerified=true even though the
+                // next user-facing read shows stale source. Drop both caches before the verify read.
+                string verifyKey = BuildCacheKey(target, partName, typeFilter);
+                _sourceCache.TryRemove(verifyKey, out _);
+                try
+                {
+                    var verifyObj = _objectService.FindObject(target, typeFilter);
+                    if (verifyObj != null) _objectService.MarkReadCacheDirty(verifyObj, partName);
+                }
+                catch { /* find failure is fine — verify read will surface a real error */ }
+
                 string verifyReadResponse = ReadSourceFast(target, partName, typeFilter);
                 string verifyReadError = TryExtractError(verifyReadResponse);
                 if (!string.IsNullOrWhiteSpace(verifyReadError))
