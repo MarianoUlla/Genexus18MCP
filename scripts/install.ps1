@@ -31,12 +31,21 @@ param(
 
     [switch]$NoClient,
 
+    # Comma-separated client ids: claude-desktop-win, claude-desktop-mac,
+    # antigravity, claude-code, gemini-cli, cursor, opencode, codex-cli.
+    # Default: all detected installed agents.
+    [string]$Clients,
+
+    # Show interactive y/N prompt per detected agent (overrides -Clients).
+    [switch]$InteractiveClients,
+
     [switch]$Force
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$script:initFailed = $false
 $Repo = 'lennix1337/Genexus18MCP'
 $ApiBase = 'https://api.github.com'
 
@@ -129,6 +138,14 @@ if (-not $NoClient) {
         $initArgs = @('-y', 'genexus-mcp@latest', 'init', '--write-clients', '--no-smoke')
         if ($Kb) { $initArgs += @('--kb', $Kb) }
         if ($Gx) { $initArgs += @('--gx', $Gx) }
+        if ($InteractiveClients) {
+            # Full interactive flow: prompts per detected agent (plus KB/GX prompts if not provided).
+            $initArgs = @('-y', 'genexus-mcp@latest', 'init', '--interactive')
+            if ($Kb) { $initArgs += @('--kb', $Kb) }
+            if ($Gx) { $initArgs += @('--gx', $Gx) }
+        } elseif ($Clients) {
+            $initArgs += @('--clients', $Clients)
+        }
 
         Write-Step "Registering with AI clients (gateway = $gatewayExe)"
         # GENEXUS_MCP_GATEWAY_EXE is the contract that tells patchClientConfig
@@ -138,6 +155,9 @@ if (-not $NoClient) {
         $env:GENEXUS_MCP_GATEWAY_EXE = $gatewayExe
         try {
             & $npx.Source @initArgs
+            if ($LASTEXITCODE -ne 0) {
+                $script:initFailed = $true
+            }
         } finally {
             if ($null -ne $prev) { $env:GENEXUS_MCP_GATEWAY_EXE = $prev }
             else { Remove-Item env:GENEXUS_MCP_GATEWAY_EXE -ErrorAction SilentlyContinue }
@@ -146,6 +166,24 @@ if (-not $NoClient) {
 }
 
 Write-Host ''
+if ($script:initFailed) {
+    Write-Warn "genexus-mcp $Version files installed to:"
+    Write-Host "     $InstallDir"
+    Write-Host ''
+    Write-Warn 'Client registration (init) FAILED — see error output above.'
+    Write-Warn 'Files are extracted, but no AI client config was written and no config.json was created.'
+    Write-Host ''
+    Write-Host 'Common causes:' -ForegroundColor Yellow
+    Write-Host '  - GeneXus installed in a non-standard path (auto-discovery missed it)'
+    Write-Host '  - Not running from inside a KB folder'
+    Write-Host ''
+    Write-Host 'Fix by re-running with explicit paths:' -ForegroundColor Cyan
+    Write-Host '  $s = irm https://raw.githubusercontent.com/lennix1337/Genexus18MCP/main/scripts/install.ps1'
+    Write-Host '  & ([scriptblock]::Create($s)) -Kb "C:\KBs\YourKB" -Gx "C:\Path\To\GeneXus18" -Force'
+    Write-Host ''
+    exit 1
+}
+
 Write-Ok "genexus-mcp $Version installed to:"
 Write-Host "     $InstallDir"
 Write-Host ''

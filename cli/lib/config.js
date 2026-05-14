@@ -58,23 +58,73 @@ function discoverGeneXusFromRegistry() {
 }
 
 function discoverGeneXusInstallation() {
-    const possible = [
-        'C:\\Program Files (x86)\\GeneXus\\GeneXus18',
-        'C:\\Program Files (x86)\\GeneXus\\GeneXus17',
-        'C:\\Program Files (x86)\\GeneXus\\GeneXus16',
-        'C:\\Program Files\\GeneXus\\GeneXus18',
-        'C:\\Program Files\\GeneXus\\GeneXus17'
-    ];
-
-    for (const candidate of possible) {
-        if (fs.existsSync(path.join(candidate, 'genexus.exe'))) {
-            return candidate;
-        }
+    if (process.env.GENEXUS_HOME) {
+        const candidate = process.env.GENEXUS_HOME.replace(/[\\/]+$/, '');
+        if (fs.existsSync(path.join(candidate, 'genexus.exe'))) return candidate;
     }
 
     const fromRegistry = discoverGeneXusFromRegistry();
     if (fromRegistry) return fromRegistry;
 
+    const programDirs = [];
+    if (process.env['ProgramFiles(x86)']) programDirs.push(process.env['ProgramFiles(x86)']);
+    if (process.env.ProgramFiles) programDirs.push(process.env.ProgramFiles);
+    // Cover non-default drives where IT often installs SDKs.
+    for (const drive of ['C', 'D', 'E']) {
+        programDirs.push(`${drive}:\\Program Files (x86)`);
+        programDirs.push(`${drive}:\\Program Files`);
+    }
+
+    const versions = ['GeneXus18', 'GeneXus17', 'GeneXus16'];
+    const seen = new Set();
+    for (const base of programDirs) {
+        const root = path.join(base, 'GeneXus');
+        const key = root.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        for (const ver of versions) {
+            const candidate = path.join(root, ver);
+            if (fs.existsSync(path.join(candidate, 'genexus.exe'))) {
+                return candidate;
+            }
+        }
+        // Also scan any GeneXus* sibling (e.g. custom-named "GeneXus18 U10").
+        try {
+            if (fs.existsSync(root)) {
+                for (const entry of fs.readdirSync(root)) {
+                    if (!/^GeneXus/i.test(entry)) continue;
+                    const candidate = path.join(root, entry);
+                    if (fs.existsSync(path.join(candidate, 'genexus.exe'))) {
+                        return candidate;
+                    }
+                }
+            }
+        } catch {
+        }
+    }
+
+    const fromPath = discoverGeneXusFromPath();
+    if (fromPath) return fromPath;
+
+    return null;
+}
+
+function discoverGeneXusFromPath() {
+    if (process.platform !== 'win32') return null;
+    try {
+        const { execFileSync } = require('child_process');
+        const out = execFileSync('where.exe', ['genexus.exe'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true,
+            timeout: 3000
+        });
+        const first = out.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+        if (first && fs.existsSync(first)) {
+            return path.dirname(first);
+        }
+    } catch {
+    }
     return null;
 }
 
@@ -145,83 +195,265 @@ function createConfigFile(kbPath, gxPath) {
     };
 }
 
-function patchClientConfig(targetConfigPath) {
-    const clients = getClientConfigTargets();
-
+function getLauncher() {
     // Set by scripts/install.ps1 for fixed-path corporate installs — clients
     // launch the gateway exe directly instead of resolving via the npx cache.
     const directExe = process.env.GENEXUS_MCP_GATEWAY_EXE;
-    const launcher = directExe
+    return directExe
         ? { command: directExe, args: [] }
         : { command: process.platform === 'win32' ? 'npx.cmd' : 'npx', args: ['-y', 'genexus-mcp@latest'] };
+}
+
+function getClientConfigTargets() {
+    const home = os.homedir();
+    const xdgConfig = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+    return [
+        {
+            id: 'claude-desktop-win',
+            name: 'Claude Desktop (Windows)',
+            format: 'mcpServers',
+            path: path.join(home, 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json'),
+            platforms: ['win32']
+        },
+        {
+            id: 'claude-desktop-mac',
+            name: 'Claude Desktop (macOS)',
+            format: 'mcpServers',
+            path: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'),
+            platforms: ['darwin']
+        },
+        {
+            id: 'antigravity',
+            name: 'Antigravity',
+            format: 'mcpServers',
+            path: path.join(home, '.gemini', 'antigravity', 'mcp_config.json')
+        },
+        {
+            id: 'claude-code',
+            name: 'Claude Code',
+            format: 'mcpServers',
+            path: path.join(home, '.claude.json')
+        },
+        {
+            id: 'gemini-cli',
+            name: 'Gemini CLI',
+            format: 'mcpServers',
+            path: path.join(home, '.gemini', 'settings.json')
+        },
+        {
+            id: 'cursor',
+            name: 'Cursor',
+            format: 'mcpServers',
+            path: path.join(home, '.cursor', 'mcp.json')
+        },
+        {
+            id: 'opencode',
+            name: 'OpenCode',
+            format: 'opencode',
+            path: path.join(xdgConfig, 'opencode', 'opencode.json')
+        },
+        {
+            id: 'codex-cli',
+            name: 'Codex CLI',
+            format: 'codex-toml',
+            path: path.join(home, '.codex', 'config.toml')
+        }
+    ];
+}
+
+function listSupportedClientIds() {
+    return getClientConfigTargets().map((c) => c.id);
+}
+
+function filterClientTargets(targets, opts = {}) {
+    const { ids, onlyExisting, platform } = opts;
+    let out = targets;
+    if (platform) out = out.filter((c) => !c.platforms || c.platforms.includes(platform));
+    if (ids && ids.length) {
+        const set = new Set(ids);
+        out = out.filter((c) => set.has(c.id));
+    }
+    if (onlyExisting) out = out.filter((c) => fs.existsSync(c.path));
+    return out;
+}
+
+function patchClientConfig(targetConfigPath, opts = {}) {
+    const launcher = getLauncher();
+    const onlyExisting = opts.onlyExisting !== false;
+    const candidates = filterClientTargets(getClientConfigTargets(), {
+        ids: opts.ids,
+        platform: process.platform
+    });
 
     const patched = [];
     const failed = [];
+    const skipped = [];
 
-    for (const client of clients) {
-        if (!fs.existsSync(client.path)) continue;
-
+    for (const client of candidates) {
+        if (onlyExisting && !fs.existsSync(client.path)) {
+            skipped.push({ client: client.name, reason: 'not installed' });
+            continue;
+        }
         try {
-            const parsed = readJsonFileSafe(client.path);
-            if (parsed === null) {
-                failed.push({ client: client.name, reason: 'Invalid JSON' });
-                continue;
-            }
-
-            const cfgObj = parsed || {};
-            cfgObj.mcpServers = cfgObj.mcpServers || {};
-            cfgObj.mcpServers.genexus = { ...launcher, env: { GX_CONFIG_PATH: targetConfigPath } };
-
-            fs.writeFileSync(client.path, JSON.stringify(cfgObj, null, 2));
+            fs.mkdirSync(path.dirname(client.path), { recursive: true });
+            applyClientEntry(client, launcher, targetConfigPath);
             patched.push(client.name);
         } catch (err) {
             failed.push({ client: client.name, reason: err && err.message ? err.message : 'Unknown error' });
         }
     }
 
-    return { patched, failed };
+    return { patched, failed, skipped };
 }
 
-function getClientConfigTargets() {
-    return [
-        { path: path.join(os.homedir(), 'AppData', 'Roaming', 'Claude', 'claude_desktop_config.json'), name: 'Claude Desktop (Windows)' },
-        { path: path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'), name: 'Claude Desktop (macOS)' },
-        { path: path.join(os.homedir(), '.gemini', 'antigravity', 'mcp_config.json'), name: 'Antigravity' },
-        { path: path.join(os.homedir(), '.claude.json'), name: 'Claude Code' }
-    ];
-}
-
-function unpatchClientConfig() {
-    const clients = getClientConfigTargets();
+function unpatchClientConfig(opts = {}) {
+    const targets = filterClientTargets(getClientConfigTargets(), {
+        ids: opts.ids,
+        onlyExisting: true,
+        platform: process.platform
+    });
     const removed = [];
     const skipped = [];
     const failed = [];
 
-    for (const client of clients) {
-        if (!fs.existsSync(client.path)) continue;
-
+    for (const client of targets) {
         try {
-            const parsed = readJsonFileSafe(client.path);
-            if (parsed === null) {
-                failed.push({ client: client.name, reason: 'Invalid JSON' });
-                continue;
-            }
-
-            const cfgObj = parsed || {};
-            if (!cfgObj.mcpServers || !cfgObj.mcpServers.genexus) {
-                skipped.push({ client: client.name, reason: 'no genexus entry' });
-                continue;
-            }
-
-            delete cfgObj.mcpServers.genexus;
-            fs.writeFileSync(client.path, JSON.stringify(cfgObj, null, 2));
-            removed.push(client.name);
+            const wasRemoved = removeClientEntry(client);
+            if (wasRemoved) removed.push(client.name);
+            else skipped.push({ client: client.name, reason: 'no genexus entry' });
         } catch (err) {
             failed.push({ client: client.name, reason: err && err.message ? err.message : 'Unknown error' });
         }
     }
 
     return { removed, skipped, failed };
+}
+
+function applyClientEntry(client, launcher, targetConfigPath) {
+    switch (client.format) {
+        case 'mcpServers':
+            return applyMcpServersJson(client.path, launcher, targetConfigPath);
+        case 'opencode':
+            return applyOpenCodeJson(client.path, launcher, targetConfigPath);
+        case 'codex-toml':
+            return applyCodexToml(client.path, launcher, targetConfigPath);
+        default:
+            throw new Error(`Unknown client format: ${client.format}`);
+    }
+}
+
+function removeClientEntry(client) {
+    switch (client.format) {
+        case 'mcpServers':
+            return removeMcpServersJson(client.path);
+        case 'opencode':
+            return removeOpenCodeJson(client.path);
+        case 'codex-toml':
+            return removeCodexToml(client.path);
+        default:
+            throw new Error(`Unknown client format: ${client.format}`);
+    }
+}
+
+function applyMcpServersJson(filePath, launcher, targetConfigPath) {
+    const parsed = fs.existsSync(filePath) ? readJsonFileSafe(filePath) : {};
+    if (parsed === null) throw new Error('Invalid JSON');
+    const cfgObj = parsed || {};
+    cfgObj.mcpServers = cfgObj.mcpServers || {};
+    cfgObj.mcpServers.genexus = { ...launcher, env: { GX_CONFIG_PATH: targetConfigPath } };
+    fs.writeFileSync(filePath, JSON.stringify(cfgObj, null, 2));
+}
+
+function removeMcpServersJson(filePath) {
+    const parsed = readJsonFileSafe(filePath);
+    if (parsed === null) throw new Error('Invalid JSON');
+    const cfgObj = parsed || {};
+    if (!cfgObj.mcpServers || !cfgObj.mcpServers.genexus) return false;
+    delete cfgObj.mcpServers.genexus;
+    fs.writeFileSync(filePath, JSON.stringify(cfgObj, null, 2));
+    return true;
+}
+
+// OpenCode (sst/opencode) uses `mcp.<name>` with `type: 'local'` and `command: string[]`.
+function applyOpenCodeJson(filePath, launcher, targetConfigPath) {
+    const parsed = fs.existsSync(filePath) ? readJsonFileSafe(filePath) : {};
+    if (parsed === null) throw new Error('Invalid JSON');
+    const cfgObj = parsed || {};
+    cfgObj.mcp = cfgObj.mcp || {};
+    cfgObj.mcp.genexus = {
+        type: 'local',
+        command: [launcher.command, ...(launcher.args || [])],
+        environment: { GX_CONFIG_PATH: targetConfigPath },
+        enabled: true
+    };
+    fs.writeFileSync(filePath, JSON.stringify(cfgObj, null, 2));
+}
+
+function removeOpenCodeJson(filePath) {
+    const parsed = readJsonFileSafe(filePath);
+    if (parsed === null) throw new Error('Invalid JSON');
+    const cfgObj = parsed || {};
+    if (!cfgObj.mcp || !cfgObj.mcp.genexus) return false;
+    delete cfgObj.mcp.genexus;
+    fs.writeFileSync(filePath, JSON.stringify(cfgObj, null, 2));
+    return true;
+}
+
+// Codex CLI uses TOML. We do a minimal text-merge: strip any existing
+// [mcp_servers.genexus*] blocks and append fresh ones. Brittle on hand-edited
+// files that put other keys after our blocks without a blank line, but
+// adequate for the typical machine-managed config.
+function applyCodexToml(filePath, launcher, targetConfigPath) {
+    let existing = '';
+    if (fs.existsSync(filePath)) existing = fs.readFileSync(filePath, 'utf8');
+    const stripped = stripCodexGenexusBlocks(existing);
+    const args = launcher.args || [];
+    const lines = [];
+    if (stripped.length && !stripped.endsWith('\n')) lines.push('');
+    if (stripped.length) lines.push('');
+    lines.push('[mcp_servers.genexus]');
+    lines.push(`command = ${tomlString(launcher.command)}`);
+    lines.push(`args = [${args.map(tomlString).join(', ')}]`);
+    lines.push('');
+    lines.push('[mcp_servers.genexus.env]');
+    lines.push(`GX_CONFIG_PATH = ${tomlString(targetConfigPath)}`);
+    lines.push('');
+    fs.writeFileSync(filePath, stripped + lines.join('\n'));
+}
+
+function removeCodexToml(filePath) {
+    if (!fs.existsSync(filePath)) return false;
+    const existing = fs.readFileSync(filePath, 'utf8');
+    const stripped = stripCodexGenexusBlocks(existing);
+    if (stripped === existing) return false;
+    fs.writeFileSync(filePath, stripped);
+    return true;
+}
+
+function stripCodexGenexusBlocks(content) {
+    // Walk line-by-line so values like `args = []` don't confuse the parser.
+    // A section ends at the next line that starts a [section] header (top-level
+    // tables and arrays of tables only — must begin at column 0).
+    const lines = content.split('\n');
+    const out = [];
+    const headerRe = /^\[\[?[A-Za-z0-9_."'-]+/;
+    const ourRe = /^\[\[?mcp_servers\.genexus(\.[A-Za-z0-9_."'-]+)?\]\]?\s*$/;
+    let inOurs = false;
+    for (const line of lines) {
+        if (headerRe.test(line)) {
+            inOurs = ourRe.test(line);
+            if (inOurs) continue;
+        }
+        if (inOurs) continue;
+        out.push(line);
+    }
+    // Collapse 3+ trailing blank lines we may have left behind.
+    return out.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function tomlString(value) {
+    const s = String(value);
+    return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 function getLocalAppDataCacheDir() {
@@ -388,6 +620,8 @@ module.exports = {
     patchClientConfig,
     unpatchClientConfig,
     getClientConfigTargets,
+    listSupportedClientIds,
+    filterClientTargets,
     getLocalAppDataCacheDir,
     readGeneXusVersionFromInstall,
     readKbCatalog,

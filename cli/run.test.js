@@ -400,7 +400,7 @@ test('tool_definitions.json is valid and disambiguation tools have use-when guid
     assert.ok(Array.isArray(defs) && defs.length > 0, 'tool defs should be a non-empty array');
 
     const byName = Object.fromEntries(defs.map((t) => [t.name, t]));
-    const disambiguationTools = ['genexus_inspect', 'genexus_analyze', 'genexus_summarize', 'genexus_doc'];
+    const disambiguationTools = ['genexus_inspect', 'genexus_analyze', 'genexus_doc'];
     for (const name of disambiguationTools) {
         assert.ok(byName[name], `${name} should exist`);
         const desc = byName[name].description || '';

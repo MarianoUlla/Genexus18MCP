@@ -11,6 +11,9 @@ const {
     createConfigFile,
     patchClientConfig,
     unpatchClientConfig,
+    getClientConfigTargets,
+    filterClientTargets,
+    listSupportedClientIds,
     getLocalAppDataCacheDir,
     readGeneXusVersionFromInstall,
     discoverGeneXusInstallation,
@@ -20,6 +23,25 @@ const {
     removeKbFromConfig,
     switchActiveKb
 } = require('../lib/config');
+
+function resolveClientIds(options) {
+    if (!options || !options.clients) return null;
+    return String(options.clients)
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+function validateClientIds(ids) {
+    if (!ids) return { ok: true };
+    const supported = new Set(listSupportedClientIds());
+    const invalid = ids.filter((id) => !supported.has(id));
+    if (invalid.length === 0) return { ok: true };
+    return {
+        ok: false,
+        message: `Unknown client id(s): ${invalid.join(', ')}. Supported: ${[...supported].join(', ')}.`
+    };
+}
 
 function parseFieldSelection(raw) {
     if (!raw) return null;
@@ -769,8 +791,24 @@ async function runInteractiveInit(ctx) {
         const gxAnswer = await question(`\n2) GeneXus installation path (default: ${defaultGx}):\n> `);
         const finalGx = String(gxAnswer || '').trim() || defaultGx;
 
+        const allTargets = getClientConfigTargets();
+        const platformTargets = filterClientTargets(allTargets, { platform: process.platform });
+        ctx.stderr.write('\n3) Select AI agents to register (y/N per agent; Enter accepts default):\n');
+        const selectedIds = [];
+        for (const target of platformTargets) {
+            const installed = fs.existsSync(target.path);
+            const defaultYes = installed;
+            const tag = installed ? 'detected' : 'not detected';
+            const prompt = `   - ${target.name} [${tag}] (${defaultYes ? 'Y/n' : 'y/N'}): `;
+            const ans = (await question(prompt)).trim().toLowerCase();
+            const yes = ans === '' ? defaultYes : (ans === 'y' || ans === 'yes');
+            if (yes) selectedIds.push(target.id);
+        }
+
         const created = createConfigFile(finalKb, finalGx);
-        const patchResult = patchClientConfig(created.targetConfigPath);
+        const patchResult = selectedIds.length
+            ? patchClientConfig(created.targetConfigPath, { ids: selectedIds, onlyExisting: false })
+            : { patched: [], failed: [], skipped: [] };
 
         return {
             exitCode: ctx.EXIT_CODES.OK,
@@ -785,7 +823,8 @@ async function runInteractiveInit(ctx) {
                 help: patchResult.patched.length === 0 ? ['Set `GX_CONFIG_PATH` in your MCP client env to the generated config path.'] : [],
                 meta: {
                     patchedClients: patchResult.patched,
-                    failedClients: patchResult.failed
+                    failedClients: patchResult.failed,
+                    skippedClients: patchResult.skipped || []
                 }
             }
         };
@@ -843,9 +882,20 @@ async function handleInit(options, ctx) {
         const kbName = path.basename(resolution.kb.value);
         addKbToConfig(created.targetConfigPath, kbName, resolution.kb.value);
 
-        let patchResult = { patched: [], failed: [] };
+        let patchResult = { patched: [], failed: [], skipped: [] };
         if (options.writeClients) {
-            patchResult = patchClientConfig(created.targetConfigPath);
+            const ids = resolveClientIds(options);
+            const validation = validateClientIds(ids);
+            if (!validation.ok) {
+                return {
+                    exitCode: ctx.EXIT_CODES.USAGE,
+                    envelope: usageEnvelope(validation.message, ctx.EXIT_CODES.USAGE)
+                };
+            }
+            patchResult = patchClientConfig(created.targetConfigPath, {
+                ids,
+                onlyExisting: !options.allClients
+            });
         }
 
         const verification = await runPostInitVerification({
@@ -894,6 +944,7 @@ async function handleInit(options, ctx) {
                 meta: {
                     patchedClients: patchResult.patched,
                     failedClients: patchResult.failed,
+                    skippedClients: patchResult.skipped || [],
                     smokeSkipped: !!options.noSmoke,
                     warmed: !!warm && warm.status === 'pass'
                 }
@@ -1229,11 +1280,12 @@ function commandHelpMap() {
             examples: ['genexus-mcp config show', 'genexus-mcp config show --full --format json']
         },
         init: {
-            usage: 'genexus-mcp init [--kb <path>] [--gx <path>] [--write-clients] [--no-smoke] [--warm] [--format ...] OR genexus-mcp init --interactive',
+            usage: 'genexus-mcp init [--kb <path>] [--gx <path>] [--write-clients] [--clients <csv>] [--all-clients] [--no-smoke] [--warm] [--format ...] OR genexus-mcp init --interactive',
             examples: [
                 'genexus-mcp init   # zero-config: auto-discovers GX from registry/Program Files and KB from cwd',
                 'genexus-mcp init --kb "C:\\KBs\\MyKB" --gx "C:\\Program Files (x86)\\GeneXus\\GeneXus18"',
-                'genexus-mcp init --interactive',
+                'genexus-mcp init --interactive   # prompts per detected agent (Claude Desktop/Code, Gemini CLI, Cursor, Codex CLI, OpenCode, ...)',
+                'genexus-mcp init --kb <path> --gx <path> --write-clients --clients claude-code,gemini-cli,cursor',
                 'genexus-mcp init --kb <path> --gx <path> --no-smoke'
             ]
         },

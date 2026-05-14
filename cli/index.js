@@ -39,6 +39,8 @@ const GLOBAL_DEFAULTS = {
     fields: null,
     interactive: false,
     writeClients: false,
+    clients: null,
+    allClients: false,
     mcpSmoke: false,
     noSmoke: false,
     warm: false,
@@ -186,6 +188,15 @@ function parseArgs(argv) {
                 else result.unknownFlags.push('--query requires a value');
                 break;
             }
+            case 'clients': {
+                const val = takeValue();
+                if (val) result.options.clients = val;
+                else result.unknownFlags.push('--clients requires a value');
+                break;
+            }
+            case 'all-clients':
+                result.options.allClients = true;
+                break;
             case 'action': {
                 const val = takeValue();
                 if (val) result.options.action = val;
