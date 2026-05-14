@@ -146,10 +146,13 @@ try {
     if (Test-Path $changelogPath) {
         $lines = Get-Content $changelogPath
         # Match the header for this version (## v2.3.0 ... or ## [2.3.0] ...). Tolerant of
-        # leading whitespace and various date suffixes; first line that mentions $newVersion.
+        # leading whitespace and various date suffixes; first line that ends the version token
+        # at a non-version char (space, dash, em-dash, bracket, end-of-line).
+        $escaped = [regex]::Escape($newVersion)
+        $versionPattern = "^##\s+\[?v?$escaped(?![0-9.])"
         $startIdx = -1
         for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match "^##\s+.*\b$([regex]::Escape($newVersion))\b") { $startIdx = $i; break }
+            if ($lines[$i] -match $versionPattern) { $startIdx = $i; break }
         }
         if ($startIdx -ge 0) {
             # Find next top-level version header (## ...) or end of file.
