@@ -989,6 +989,7 @@ namespace GxMcp.Gateway
                 if (string.Equals(method, "initialize", StringComparison.OrdinalIgnoreCase))
                 {
                     TriggerWorkerWarmupOnce();
+                    UpdateNotifier.TriggerOnce();
                 }
                 return new JObject { ["jsonrpc"] = "2.0", ["id"] = idToken?.DeepClone(), ["result"] = JToken.FromObject(mcpResponse) };
             }
