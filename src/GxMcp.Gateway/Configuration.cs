@@ -78,7 +78,14 @@ namespace GxMcp.Gateway
                     string json = File.ReadAllText(path);
                     var config = JsonConvert.DeserializeObject<Configuration>(json);
                     if (config == null) throw new Exception("Failed to parse config.json");
-                    
+
+                    if (config.Environment != null &&
+                        string.IsNullOrWhiteSpace(config.Environment.DefaultKb) &&
+                        !string.IsNullOrWhiteSpace(config.Environment.ActiveKb))
+                    {
+                        config.Environment.DefaultKb = config.Environment.ActiveKb;
+                    }
+
                     if (string.IsNullOrEmpty(config.Environment?.KBPath))
                         Program.Log("[Gateway] WARNING: Environment.KBPath is missing in config.json!");
                     else 
@@ -195,6 +202,10 @@ namespace GxMcp.Gateway
         public string? KBPath { get; set; }
         public string? GX_SHADOW_PATH { get; set; }
         public string? DefaultKb { get; set; }
+        // Alias written by the Node CLI (cli/lib/config.js writeKbCatalog) —
+        // ParseConfig promotes it to DefaultKb after deserialize if DefaultKb is empty.
+        public string? ActiveKb { get; set; }
+        [JsonConverter(typeof(KbCatalogConverter))]
         public List<KbEntry> KBs { get; set; } = new List<KbEntry>();
     }
 
@@ -202,5 +213,42 @@ namespace GxMcp.Gateway
     {
         public string Alias { get; set; } = string.Empty;
         public string Path { get; set; } = string.Empty;
+    }
+
+    // Accepts both schemas the codebase writes for Environment.KBs:
+    //   - List shape (Gateway-native):   [ { "Alias": "x", "Path": "..." }, ... ]
+    //   - Dict shape (Node CLI writes):  { "x": "...", "y": "..." }
+    // Without this, the CLI's multi-KB output crashes the Gateway on load.
+    internal class KbCatalogConverter : JsonConverter<List<KbEntry>>
+    {
+        public override List<KbEntry> ReadJson(JsonReader reader, Type objectType, List<KbEntry>? existingValue, bool hasExistingValue, JsonSerializer serializer)
+        {
+            if (reader.TokenType == JsonToken.Null) return new List<KbEntry>();
+
+            if (reader.TokenType == JsonToken.StartArray)
+            {
+                var list = new List<KbEntry>();
+                serializer.Populate(reader, list);
+                return list;
+            }
+
+            if (reader.TokenType == JsonToken.StartObject)
+            {
+                var dict = serializer.Deserialize<Dictionary<string, string>>(reader) ?? new Dictionary<string, string>();
+                var list = new List<KbEntry>(dict.Count);
+                foreach (var kv in dict)
+                {
+                    list.Add(new KbEntry { Alias = kv.Key, Path = kv.Value });
+                }
+                return list;
+            }
+
+            throw new JsonSerializationException($"Environment.KBs must be an array or object, got {reader.TokenType}.");
+        }
+
+        public override void WriteJson(JsonWriter writer, List<KbEntry>? value, JsonSerializer serializer)
+        {
+            serializer.Serialize(writer, value);
+        }
     }
 }
