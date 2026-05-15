@@ -1267,6 +1267,44 @@ namespace GxMcp.Worker.Services
         {
             try
             {
+                // Task 4.2 — validate typeName via VariableTypeResolver before any SDK work,
+                // so unknown types never silently default to NUMERIC.
+                GxMcp.Worker.Helpers.TypeResolution resolution = null;
+                string resolvedTypeForSdk = typeName;
+                int? resolvedLength = null;
+                int? resolvedDecimals = null;
+                if (!string.IsNullOrEmpty(typeName))
+                {
+                    resolution = GxMcp.Worker.Helpers.VariableTypeResolver.Resolve(typeName);
+                    if (!resolution.Recognized)
+                    {
+                        var accepted = new JArray();
+                        if (resolution.AcceptedList != null)
+                            foreach (var a in resolution.AcceptedList) accepted.Add(a);
+                        return new JObject
+                        {
+                            ["status"] = "Error",
+                            ["code"] = "UnknownType",
+                            ["message"] = $"Unknown typeName '{typeName}'. Did you mean '{resolution.Suggestion}'?",
+                            ["suggestion"] = resolution.Suggestion,
+                            ["accepted"] = accepted
+                        }.ToString(Newtonsoft.Json.Formatting.None);
+                    }
+                    if (resolution.CanonicalType == "DomainReference" && !string.IsNullOrEmpty(resolution.DomainName))
+                    {
+                        // Pass the raw domain name to the existing ResolveTypeObject path.
+                        resolvedTypeForSdk = resolution.DomainName;
+                    }
+                    else
+                    {
+                        // Canonicalise — e.g. VarChar(120) → Character(120) — so TryParseDbType picks
+                        // up the canonical eDBType instead of an alias that may not round-trip.
+                        resolvedLength = resolution.Length;
+                        resolvedDecimals = resolution.Decimals;
+                        resolvedTypeForSdk = resolution.CanonicalType;
+                    }
+                }
+
                 var err = ResolveVariableTarget(target, ref varName, out var obj, out var varPart, out var existing);
                 if (err != null) return err;
 
@@ -1278,13 +1316,20 @@ namespace GxMcp.Worker.Services
                     global::Artech.Genexus.Common.Variable newVar = new global::Artech.Genexus.Common.Variable(varPart);
                     newVar.Name = varName;
 
-                    if (VariableInjector.TryParseDbType(typeName, out var dbType))
+                    if (resolution != null && resolution.CanonicalType != "DomainReference"
+                        && VariableInjector.TryParseDbType(resolvedTypeForSdk, out var dbType))
                     {
                         newVar.Type = dbType;
+                        try
+                        {
+                            if (resolvedLength.HasValue) newVar.Length = resolvedLength.Value;
+                            if (resolvedDecimals.HasValue) newVar.Decimals = resolvedDecimals.Value;
+                        }
+                        catch { /* best-effort — SDK may reject for some types */ }
                     }
                     else
                     {
-                        var targetObj = VariableInjector.ResolveTypeObject(varPart.Model, typeName);
+                        var targetObj = VariableInjector.ResolveTypeObject(varPart.Model, resolvedTypeForSdk);
                         if (targetObj != null)
                         {
                             if (targetObj is global::Artech.Genexus.Common.Objects.Domain dom)

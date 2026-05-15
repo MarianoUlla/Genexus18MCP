@@ -161,6 +161,72 @@ namespace GxMcp.Worker.Tests
             Assert.Equal(expected, WritePolicy.ShouldRetryWithoutPartSave(partName, exceptionMessage, diagnosticText));
         }
 
+        // ── Task 4.2 (v2.3.8) — AddVariable resolver gate ──────────────────────────────
+        // The resolver gate executes BEFORE any SDK / KB call, so the unknown-type
+        // path is observable without a real KB. The synonym (success) path needs the
+        // SDK, so we guard it with the same TypeLoadException / FileNotFoundException
+        // pattern used elsewhere (see CallerGraphServiceTests).
+
+        [Fact]
+        public void AddVariable_UnknownType_ReturnsUnknownTypeError()
+        {
+            var ws = BuildIsolatedWriteService();
+            string json;
+            try
+            {
+                json = ws.AddVariable("TestProc", "X", "Bogus(99)");
+            }
+            catch (System.IO.FileNotFoundException) { return; }
+            catch (System.TypeLoadException) { return; }
+
+            var obj = JObject.Parse(json);
+            Assert.Equal("Error", obj["status"]?.ToString());
+            Assert.Equal("UnknownType", obj["code"]?.ToString());
+            Assert.False(string.IsNullOrEmpty(obj["suggestion"]?.ToString()));
+            Assert.NotNull(obj["accepted"]);
+            Assert.True(obj["accepted"] is JArray arr && arr.Count > 0);
+            // Message mentions the offending input and the suggestion.
+            Assert.Contains("Bogus", obj["message"]?.ToString() ?? "");
+        }
+
+        [Fact]
+        public void AddVariable_EmptyType_ReturnsUnknownTypeError()
+        {
+            // Empty/whitespace typeName should also short-circuit to the error envelope
+            // rather than falling through to the SDK default (which silently produced
+            // a NUMERIC variable in v2.3.7 and earlier).
+            var ws = BuildIsolatedWriteService();
+            // null typeName is the legacy "no type — use injector default" path; we keep
+            // it backward-compatible. So test the explicit-but-bogus case via whitespace.
+            string json;
+            try
+            {
+                json = ws.AddVariable("TestProc", "X", "   ");
+            }
+            catch (System.IO.FileNotFoundException) { return; }
+            catch (System.TypeLoadException) { return; }
+
+            // With whitespace, resolver returns Recognized=false because of empty check.
+            // But our gate only runs `if (!string.IsNullOrEmpty(typeName))` — whitespace
+            // is technically non-empty, so it enters the resolver and trips the gate.
+            var obj = JObject.Parse(json);
+            Assert.Equal("Error", obj["status"]?.ToString());
+            Assert.Equal("UnknownType", obj["code"]?.ToString());
+        }
+
+        [Fact]
+        public void AddVariable_VarCharSynonym_ResolvesToCharacterCanonical()
+        {
+            // Drives the resolver directly to lock in the synonym mapping that the
+            // gate relies on: VarChar(120) → Character(120). The end-to-end SDK path
+            // would require a fixture KB; the helper unit tests in
+            // VariableTypeResolverTests already cover the wider matrix.
+            var resolution = GxMcp.Worker.Helpers.VariableTypeResolver.Resolve("VarChar(120)");
+            Assert.True(resolution.Recognized);
+            Assert.Equal("Character", resolution.CanonicalType);
+            Assert.Equal(120, resolution.Length);
+        }
+
         [Fact]
         public void BuildFailureDetails_ShouldDeduplicatePrimaryAndIssueDescriptions()
         {
