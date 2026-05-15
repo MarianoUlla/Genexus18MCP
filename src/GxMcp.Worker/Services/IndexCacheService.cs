@@ -472,6 +472,16 @@ namespace GxMcp.Worker.Services
                         NormalizeLegacyHierarchy(_index);
                         BuildParentIndex(_index);
                         Logger.Info(string.Format("Index loaded. Objects: {0}", _index.Objects.Count));
+                        // v2.3.8 (post-Task 1.2 fix): when we hydrate the in-memory index
+                        // from the on-disk cache (warm start), publish Ready to IndexState
+                        // so whoami doesn't keep reporting Cold while list/search hit a
+                        // fully-populated index. Without this the state machine only
+                        // transitioned via BulkIndex's MarkIndexComplete, which is skipped
+                        // on warm starts (AlreadyIndexed path in KbService.BulkIndex).
+                        if (_index.Objects.Count > 0)
+                        {
+                            MarkIndexComplete(_index.Objects.Count);
+                        }
                     }
                 }
                 catch (Exception ex) { Logger.Error("Load Index Error: " + ex.Message); }

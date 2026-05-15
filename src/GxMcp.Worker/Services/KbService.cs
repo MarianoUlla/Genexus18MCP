@@ -132,6 +132,12 @@ namespace GxMcp.Worker.Services
                     var loaded = _indexCacheService.GetIndex();
                     if (loaded != null && loaded.Objects.Count > 0)
                     {
+                        // v2.3.8 (post-Task 1.2 fix): warm-start path — publish Ready to
+                        // IndexState so whoami stops reporting Cold while the in-memory
+                        // index is in fact populated. GetIndex() also calls MarkIndexComplete
+                        // on first hydration; this is the second safety net for the case
+                        // where the index was already in memory before the BulkIndex call.
+                        try { _indexCacheService.MarkIndexComplete(loaded.Objects.Count); } catch { }
                         Logger.Info($"BulkIndex skipped — cache already populated ({loaded.Objects.Count} objects).");
                         return "{\"status\":\"AlreadyIndexed\",\"objects\":" + loaded.Objects.Count + "}";
                     }

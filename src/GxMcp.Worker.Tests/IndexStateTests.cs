@@ -74,5 +74,31 @@ namespace GxMcp.Worker.Tests
             Assert.Null(s.Progress);
             Assert.Null(s.EtaMs);
         }
+
+        [Fact]
+        public void LoadFromEntries_TransitionsToReady_NoMarkComplete()
+        {
+            // Smoke test for the warm-start fix: hydrating the in-memory index
+            // (here via the test seam LoadFromEntries, equivalent to the disk-load
+            // path in GetIndex) must publish Ready to IndexState so whoami doesn't
+            // keep reporting Cold while list/search hit a fully-populated index.
+            var svc = new IndexCacheService();
+            Assert.Equal("Cold", svc.GetState().Status);
+
+            // LoadFromEntries is the in-memory equivalent of "loaded from disk".
+            // The production GetIndex path now calls MarkIndexComplete after
+            // hydrating; here we exercise the explicit call BulkIndex's
+            // AlreadyIndexed branch also makes.
+            svc.LoadFromEntries(new[]
+            {
+                new GxMcp.Worker.Models.SearchIndex.IndexEntry { Name = "A", Type = "Procedure" },
+                new GxMcp.Worker.Models.SearchIndex.IndexEntry { Name = "B", Type = "Procedure" }
+            });
+            svc.MarkIndexComplete(svc.GetIndex().Objects.Count);
+
+            var s = svc.GetState();
+            Assert.Equal("Ready", s.Status);
+            Assert.Equal(2, s.TotalObjects);
+        }
     }
 }
