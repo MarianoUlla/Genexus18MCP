@@ -4130,5 +4130,73 @@ namespace GxMcp.Worker.Services
 
             return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".tmp");
         }
+
+        // ----------------------------------------------------------------------
+        // v2.3.8 Task 3.1 — EOL-normalized matching helpers (friction-report #4)
+        // ----------------------------------------------------------------------
+        // Source bytes are preserved on disk; only the comparison is normalized.
+        // CRLF/LF are unified and per-line trailing whitespace is trimmed before
+        // matching. TryMatch returns indices into the ORIGINAL (non-normalized)
+        // source so callers can splice in replacements without corrupting EOLs.
+
+        internal static string NormalizeForCompare(string s)
+        {
+            if (s == null) return null;
+            var lines = s.Replace("\r\n", "\n").Split('\n');
+            for (int i = 0; i < lines.Length; i++) lines[i] = lines[i].TrimEnd();
+            return string.Join("\n", lines);
+        }
+
+        internal static bool TryMatch(string source, string context, out int startIdx, out int endIdx)
+        {
+            startIdx = endIdx = -1;
+            if (source == null || context == null) return false;
+            var normSource = NormalizeForCompare(source);
+            var normCtx = NormalizeForCompare(context);
+            if (normCtx.Length == 0) return false;
+            int normIdx = normSource.IndexOf(normCtx, StringComparison.Ordinal);
+            if (normIdx < 0) return false;
+
+            int targetLineStart = CountLinesBefore(normSource, normIdx);
+            // Walk to the start of the target line in the original source.
+            int origPos = 0;
+            for (int line = 0; line < targetLineStart && origPos < source.Length; line++)
+            {
+                int nl = source.IndexOfAny(new[] { '\r', '\n' }, origPos);
+                if (nl < 0) { origPos = source.Length; break; }
+                origPos = nl + ((source[nl] == '\r' && nl + 1 < source.Length && source[nl + 1] == '\n') ? 2 : 1);
+            }
+
+            // Compute column within the normalized line where match starts.
+            int prevNL = normSource.LastIndexOf('\n', Math.Max(0, normIdx - 1));
+            int normLineStart = prevNL < 0 ? 0 : prevNL + 1;
+            int colOffset = normIdx - normLineStart;
+            startIdx = Math.Min(source.Length, origPos + colOffset);
+
+            // Walk forward over (ctxLineCount) lines to find the end position in the original source.
+            int ctxLineCount = CountLinesBefore(normCtx, normCtx.Length);
+            int walker = startIdx;
+            for (int i = 0; i < ctxLineCount && walker < source.Length; i++)
+            {
+                int nl = source.IndexOfAny(new[] { '\r', '\n' }, walker);
+                if (nl < 0) { walker = source.Length; break; }
+                walker = nl + ((source[nl] == '\r' && nl + 1 < source.Length && source[nl + 1] == '\n') ? 2 : 1);
+            }
+
+            // Add the residual column length on the last context line.
+            int lastNL = normCtx.LastIndexOf('\n');
+            int lastLineLen = lastNL < 0 ? normCtx.Length : (normCtx.Length - lastNL - 1);
+            endIdx = Math.Min(source.Length, walker + lastLineLen);
+            if (endIdx < startIdx) endIdx = startIdx;
+            return true;
+        }
+
+        private static int CountLinesBefore(string s, int idx)
+        {
+            int c = 0;
+            int limit = Math.Min(idx, s.Length);
+            for (int i = 0; i < limit; i++) if (s[i] == '\n') c++;
+            return c;
+        }
     }
 }

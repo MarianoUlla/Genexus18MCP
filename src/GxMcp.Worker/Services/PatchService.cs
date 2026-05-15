@@ -478,6 +478,24 @@ namespace GxMcp.Worker.Services
                 }
             }
 
+            // v2.3.8 Task 3.1 (friction-report #4): final EOL-normalized fallback.
+            // Both the exact match and the prior fuzzy/whitespace-normalized passes
+            // already collapse CRLF→LF up-front (workContext is normalized at entry),
+            // but they do NOT tolerate per-line trailing whitespace differences. The
+            // helper below normalizes both axes (EOL + trailing whitespace) and maps
+            // the normalized hit back to original-source indices so the splice
+            // preserves the on-disk bytes outside the matched window.
+            if (expectedCount == 1 && contextLines != null && contextLines.Length > 0)
+            {
+                if (WriteService.TryMatch(source, context, out int splStart, out int splEnd) && splEnd > splStart)
+                {
+                    Logger.Info("[PATCH] EOL/trailing-whitespace normalized match applied.");
+                    matchCount = 1;
+                    string replacement = (newContent ?? string.Empty).Replace("\r\n", "\n").Replace("\r", "\n");
+                    return source.Substring(0, splStart) + replacement + source.Substring(splEnd);
+                }
+            }
+
             status = "NoMatch";
             details = "Context block not found.";
             return string.Empty;
