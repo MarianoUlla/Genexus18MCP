@@ -1148,45 +1148,33 @@ namespace GxMcp.Worker.Services
 
         private void ProcessSourceContent(KBObject obj, string content, int? offset, int? limit, JObject result, string client = "ide")
         {
-            using (var reader = new StringReader(content))
+            // v2.3.8 (Task 6.2) — delegate to ReadPagination so byte-budget + line-budget
+            // are applied uniformly and suggestedNextOffset/Limit surface for chained reads.
+            var page = GxMcp.Worker.Helpers.ReadPagination.ApplyDefault(content, offset, limit, client);
+            bool mcpDefault = !offset.HasValue && !limit.HasValue && client == "mcp";
+            bool includeDerivedMetadata = client != "mcp";
+
+            result["isTruncatedByWorker"] = page.Truncated;
+            result["truncated"] = page.Truncated;
+            if (page.Truncated && mcpDefault)
+                result["message"] = "MCP read defaulted to ~200 lines / 16 KB to control context size. Use offset/limit to paginate, or limit=0 to read in full.";
+
+            string paginatedContent = page.Content;
+            if (page.Truncated)
+                paginatedContent += "\n\n// ... [CONTENT TRUNCATED. USE PAGINATION (offset/limit) TO READ FURTHER] ... //\n";
+
+            ProcessTextResponse(paginatedContent, result, client);
+            result["offset"] = page.Offset;
+            result["limit"] = page.LinesReturned;
+            result["totalLines"] = page.TotalLines;
+            result["totalBytes"] = page.TotalBytes;
+            if (page.SuggestedNextOffset.HasValue) result["suggestedNextOffset"] = page.SuggestedNextOffset.Value;
+            if (page.SuggestedNextLimit.HasValue) result["suggestedNextLimit"] = page.SuggestedNextLimit.Value;
+
+            if (includeDerivedMetadata)
             {
-                bool mcpDefault = !offset.HasValue && !limit.HasValue && client == "mcp";
-                int start = offset ?? 0;
-                int count = limit ?? (mcpDefault ? 200 : int.MaxValue);
-                bool includeDerivedMetadata = client != "mcp";
-
-                var paginatedLines = new List<string>();
-                int currentLine = 0;
-                string line;
-                int totalLinesInFile = 0;
-
-                while ((line = reader.ReadLine()) != null)
-                {
-                    if (currentLine >= start && paginatedLines.Count < count) paginatedLines.Add(line);
-                    currentLine++;
-                    totalLinesInFile = currentLine;
-                    if (paginatedLines.Count >= count && totalLinesInFile > 10000) break;
-                }
-
-                bool actuallyTruncated = (start + paginatedLines.Count) < totalLinesInFile;
-                result["isTruncatedByWorker"] = actuallyTruncated;
-                if (actuallyTruncated && mcpDefault)
-                    result["message"] = "MCP read defaulted to the first 200 lines to control context size. Use genexus_read with offset/limit to paginate.";
-
-                string paginatedContent = string.Join(Environment.NewLine, paginatedLines);
-                if (actuallyTruncated)
-                    paginatedContent += "\n\n// ... [CONTENT TRUNCATED. USE PAGINATION (offset/limit) TO READ FURTHER] ... //\n";
-
-                ProcessTextResponse(paginatedContent, result, client);
-                result["offset"] = start;
-                result["limit"] = paginatedLines.Count;
-                result["totalLines"] = totalLinesInFile;
-
-                if (includeDerivedMetadata)
-                {
-                    AddVariableMetadata(obj, paginatedContent, result);
-                    AddCallSignatures(obj, paginatedContent, result);
-                }
+                AddVariableMetadata(obj, paginatedContent, result);
+                AddCallSignatures(obj, paginatedContent, result);
             }
         }
 
