@@ -1156,7 +1156,10 @@ namespace GxMcp.Worker.Services
             obj = _objectService.FindObject(target);
             if (obj == null) return CreateWriteError("Object not found", target, "Variables", "The requested object is not available in the active Knowledge Base.");
 
-            varPart = obj.Parts.Get<global::Artech.Genexus.Common.Parts.VariablesPart>();
+            // v2.3.8 Task 4.4 — kind-aware accessor. Falls back through typed Get<>,
+            // name-based candidates, and reflective Variables-property discovery so that
+            // WebPanel / Transaction / WorkPanel / DataProvider resolve symmetrically.
+            varPart = GxMcp.Worker.Structure.PartAccessor.GetVariablesPart(obj);
             if (varPart == null) return CreateWriteError("Variables part not found", target, "Variables", "The object does not expose a Variables part.", obj);
 
             string searchName = varName;

@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Collections.Generic;
+using System.Reflection;
 using Artech.Architecture.Common.Objects;
 using Artech.Genexus.Common.Objects;
 using Artech.Genexus.Common.Parts;
@@ -9,6 +10,75 @@ namespace GxMcp.Worker.Structure
 {
     public static class PartAccessor
     {
+        // v2.3.8 Task 4.4 — Known part-type-names that wrap variable collections across
+        // GeneXus object kinds. The typed `obj.Parts.Get<VariablesPart>()` lookup covers
+        // Procedure / DataProvider cleanly, but some kinds (WebPanel, Transaction,
+        // WorkPanel) historically returned null from that call, triggering the friction
+        // "Part 'DeleteVariable' not found in WebPanel" failure mode. This name list
+        // is consulted as the second-pass fallback before reflection.
+        private static readonly string[] VariablesPartTypeNameCandidates = new[]
+        {
+            "VariablesPart",
+            "Variables",
+            "ProcedureVariables",
+            "WebFormVariables",
+            "TransactionVariables",
+            "WorkPanelVariables",
+        };
+
+        /// <summary>
+        /// v2.3.8 Task 4.4 — Kind-aware <see cref="VariablesPart"/> accessor.
+        ///
+        /// Resolution order:
+        ///   1. <c>obj.Parts.Get&lt;VariablesPart&gt;()</c>           — typed SDK lookup.
+        ///   2. Match by concrete type name (e.g. "VariablesPart", "ProcedureVariables").
+        ///   3. Reflective fallback — first part exposing a public <c>Variables</c> property.
+        ///
+        /// Returns <c>null</c> only when the object truly has no variables-bearing part.
+        /// </summary>
+        public static VariablesPart GetVariablesPart(KBObject obj)
+        {
+            if (obj == null) return null;
+
+            // 1. Typed SDK accessor — fast path; covers Procedure, DataProvider and any
+            // kind whose variables part is the canonical VariablesPart concrete type.
+            try
+            {
+                var typed = obj.Parts.Get<VariablesPart>();
+                if (typed != null) return typed;
+            }
+            catch { /* SDK may throw for kinds that don't expose VariablesPart — try next */ }
+
+            // 2. Name-based dispatch across known kind-specific part type names.
+            foreach (KBObjectPart p in obj.Parts)
+            {
+                if (p == null) continue;
+                var typeName = p.GetType().Name;
+                var descriptorName = p.TypeDescriptor?.Name;
+                foreach (var candidate in VariablesPartTypeNameCandidates)
+                {
+                    if (string.Equals(typeName, candidate, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(descriptorName, candidate, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (p is VariablesPart vp) return vp;
+                    }
+                }
+            }
+
+            // 3. Reflective fallback — any part exposing a `Variables` collection property
+            // is considered variables-bearing. Returned as VariablesPart only when it
+            // actually inherits from that concrete type (preserves type safety for callers).
+            foreach (KBObjectPart p in obj.Parts)
+            {
+                if (p == null) continue;
+                if (p.GetType().GetProperty("Variables", BindingFlags.Public | BindingFlags.Instance) != null)
+                {
+                    if (p is VariablesPart vp) return vp;
+                }
+            }
+
+            return null;
+        }
         public static bool MatchesSourcePart(string requestedPartName, string sourcePartName)
         {
             if (string.IsNullOrWhiteSpace(requestedPartName))
