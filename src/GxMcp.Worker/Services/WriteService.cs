@@ -35,6 +35,14 @@ namespace GxMcp.Worker.Services
 
         public string ApplySemanticOps(JObject req)
         {
+            string target = req?["target"]?.ToString();
+            string partName = req?["part"]?.ToString();
+            if (string.IsNullOrEmpty(partName)) partName = "Structure";
+            return WrapWithPersistedState(ApplySemanticOpsImpl(req), target, partName);
+        }
+
+        private string ApplySemanticOpsImpl(JObject req)
+        {
             // Validation runs here — no GeneXus types referenced in this method body.
             // GeneXus SDK types are isolated in ApplySemanticOpsCore so JIT can load
             // this method even when GeneXus assemblies are absent (unit-test environment).
@@ -135,6 +143,13 @@ namespace GxMcp.Worker.Services
         }
 
         public string ApplyJsonPatch(JObject req)
+        {
+            string target = req?["target"]?.ToString();
+            string partName = req?["part"]?.ToString();
+            return WrapWithPersistedState(ApplyJsonPatchImpl(req), target, partName);
+        }
+
+        private string ApplyJsonPatchImpl(JObject req)
         {
             // Validation runs here — no GeneXus types referenced in this method body.
             // GeneXus SDK types are isolated in ApplyJsonPatchCore so JIT can load
@@ -508,6 +523,14 @@ namespace GxMcp.Worker.Services
         }
 
         public string WriteObject(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)
+        {
+            string raw = WriteObjectInternal(target, partName, code, typeFilter, autoValidate, preferFastSourceSave, autoInjectVariables, dryRun);
+            // v2.3.8 Task 3.4: every edit response carries persistedHash + persistedSnippet
+            // (success, no-change, dry-run, rollback, or error).
+            return WrapWithPersistedState(raw, target, string.IsNullOrWhiteSpace(partName) ? "Source" : partName);
+        }
+
+        private string WriteObjectInternal(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)
         {
             try
             {
@@ -1145,6 +1168,11 @@ namespace GxMcp.Worker.Services
         /// Skips framework-managed names. Returns per-name outcomes plus aggregate counts.
         public string DeleteVariables(string target, System.Collections.Generic.IEnumerable<string> varNames)
         {
+            return WrapWithPersistedState(DeleteVariablesInternal(target, varNames), target, "Variables");
+        }
+
+        private string DeleteVariablesInternal(string target, System.Collections.Generic.IEnumerable<string> varNames)
+        {
             try
             {
                 if (varNames == null) return "{\"status\":\"NoChange\"}";
@@ -1196,6 +1224,11 @@ namespace GxMcp.Worker.Services
 
         public string DeleteVariable(string target, string varName)
         {
+            return WrapWithPersistedState(DeleteVariableInternal(target, varName), target, "Variables");
+        }
+
+        private string DeleteVariableInternal(string target, string varName)
+        {
             try
             {
                 var err = ResolveVariableTarget(target, ref varName, out var obj, out var varPart, out var existing);
@@ -1226,6 +1259,11 @@ namespace GxMcp.Worker.Services
         }
 
         public string AddVariable(string target, string varName, string typeName = null)
+        {
+            return WrapWithPersistedState(AddVariableInternal(target, varName, typeName), target, "Variables");
+        }
+
+        private string AddVariableInternal(string target, string varName, string typeName = null)
         {
             try
             {
@@ -1271,7 +1309,7 @@ namespace GxMcp.Worker.Services
 
                 obj.EnsureSave();
                 ScheduleFlush();
-                
+
                 return "{\"status\": \"Success\"}";
             }
             catch (Exception ex)
@@ -4197,6 +4235,85 @@ namespace GxMcp.Worker.Services
             int limit = Math.Min(idx, s.Length);
             for (int i = 0; i < limit; i++) if (s[i] == '\n') c++;
             return c;
+        }
+
+        // ----------------------------------------------------------------------
+        // v2.3.8 Task 3.4 — persistedHash + persistedSnippet on every response
+        // ----------------------------------------------------------------------
+        // Every write/edit response is wrapped with the SHA256 of the final
+        // on-disk source plus a ~10-line snippet, so callers can confirm
+        // post-write state without a follow-up read. Applies uniformly to
+        // success, no-change, dry-run, rollback, and error responses.
+
+        internal static string ComputeSha256(string content)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(content ?? ""));
+                return "sha256:" + BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+            }
+        }
+
+        internal static string ExtractSnippet(string source, int lineHint, int contextLines = 10)
+        {
+            if (string.IsNullOrEmpty(source)) return "";
+            var lines = source.Replace("\r\n", "\n").Split('\n');
+            var start = Math.Max(0, lineHint - contextLines);
+            var end = Math.Min(lines.Length, lineHint + contextLines + 1);
+            if (end <= start) return "";
+            return string.Join("\n", lines.Skip(start).Take(end - start));
+        }
+
+        internal static JObject AppendPersistedState(JObject response, string finalSource, int? editLine)
+        {
+            if (response == null) response = new JObject();
+            response["persistedHash"] = ComputeSha256(finalSource ?? "");
+            response["persistedSnippet"] = ExtractSnippet(finalSource ?? "", editLine ?? 0, 10);
+            return response;
+        }
+
+        /// <summary>
+        /// Wraps a write-response JSON string with persistedHash + persistedSnippet derived
+        /// from the on-disk source after the write attempt (success, partial, or rollback).
+        /// Failures to re-read are swallowed — the original envelope is still augmented with
+        /// an empty hash/snippet so downstream parsers always find the keys.
+        /// </summary>
+        private string WrapWithPersistedState(string responseJson, string target, string partName)
+        {
+            JObject parsed = null;
+            try { parsed = JObject.Parse(responseJson); }
+            catch
+            {
+                parsed = new JObject { ["raw"] = responseJson ?? "" };
+            }
+
+            // Skip if the response is already decorated (e.g. nested call).
+            if (parsed["persistedHash"] != null && parsed["persistedSnippet"] != null)
+                return parsed.ToString();
+
+            string finalSource = "";
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(target) && _objectService != null)
+                {
+                    string readJson = _objectService.ReadObjectSource(target, partName, null, null, "mcp", true, null);
+                    if (!string.IsNullOrWhiteSpace(readJson))
+                    {
+                        var readObj = JObject.Parse(readJson);
+                        finalSource = readObj["source"]?.ToString()
+                            ?? readObj["content"]?.ToString()
+                            ?? readObj["parts"]?[partName ?? "Source"]?.ToString()
+                            ?? "";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("[PERSISTED-STATE] Re-read failed for " + target + " (" + partName + "): " + ex.Message);
+            }
+
+            AppendPersistedState(parsed, finalSource, null);
+            return parsed.ToString(Newtonsoft.Json.Formatting.None);
         }
     }
 }
