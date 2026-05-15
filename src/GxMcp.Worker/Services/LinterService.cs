@@ -14,11 +14,42 @@ namespace GxMcp.Worker.Services
     {
         private readonly ObjectService _objectService;
         private readonly NavigationService _navigationService;
+        private WriteService _writeService;
 
         public LinterService(ObjectService objectService, NavigationService navigationService)
         {
             _objectService = objectService;
             _navigationService = navigationService;
+        }
+
+        public void SetWriteService(WriteService ws) => _writeService = ws;
+
+        /// Run Lint, then auto-fix the safe issues (GX008 unused vars that aren't framework-managed)
+        /// via the existing DeleteVariable path. Returns the lint report plus a fixed[] array.
+        public string LintAndFix(string target)
+        {
+            var raw = Lint(target);
+            JObject report;
+            try { report = JObject.Parse(raw); } catch { return raw; }
+            var issues = report["issues"] as JArray;
+            if (issues == null || _writeService == null) return raw;
+
+            var toRemove = new List<string>();
+            var skipped = new JArray();
+            foreach (var issue in issues)
+            {
+                string code = issue["code"]?.ToString();
+                string symbol = issue["symbol"]?.ToString();
+                if (code == "GX008" && !string.IsNullOrEmpty(symbol) && symbol.StartsWith("&"))
+                    toRemove.Add(symbol.TrimStart('&'));
+                else
+                    skipped.Add(new JObject { ["code"] = code, ["symbol"] = symbol, ["reason"] = "no auto-fix for this rule" });
+            }
+            // Single open-save-flush for all unused vars instead of N round-trips.
+            var batchResult = _writeService.DeleteVariables(target, toRemove);
+            report["fixed"] = JsonUtil.SafeParse(batchResult);
+            report["skipped"] = skipped;
+            return report.ToString();
         }
 
         public string Lint(string target, string specificPart = null)
@@ -30,6 +61,8 @@ namespace GxMcp.Worker.Services
 
                 var issues = new JArray();
                 var parts = obj.Parts.Cast<KBObjectPart>().ToList();
+                // WWP+ patterns prescribe direct table access in Event Start; suppress GX012 when present.
+                bool hasPatternInstance = parts.Any(p => string.Equals(p.TypeDescriptor?.Name, "PatternInstance", StringComparison.OrdinalIgnoreCase));
 
                 foreach (var part in parts)
                 {
@@ -56,6 +89,8 @@ namespace GxMcp.Worker.Services
                                 continue;
 
                             CheckLogicPart(cleanContent, content, issues, uiPartName);
+                            if (!hasPatternInstance)
+                                CheckDirectTableAccess(cleanContent, issues, content, uiPartName);
                             if (rawPartName == "Procedure" || rawPartName == "Source")
                                 CheckSubroutines(cleanContent, issues, content, uiPartName);
                         }
@@ -138,7 +173,6 @@ namespace GxMcp.Worker.Services
             CheckSleepWait(cleanCode, issues, originalCode, partName);
             CheckDynamicCall(cleanCode, issues, originalCode, partName);
             CheckNewWhenDuplicate(cleanCode, issues, originalCode, partName);
-            CheckDirectTableAccess(cleanCode, issues, originalCode, partName);
         }
 
         private void CheckDirectTableAccess(string cleanCode, JArray issues, string originalCode, string partName)
@@ -246,7 +280,7 @@ namespace GxMcp.Worker.Services
             string variablesText = VariableInjector.GetVariablesAsText(varPart);
             foreach (var v in varPart.Variables)
             {
-                if (new[] { "Pgmname", "Pgmdesc", "Mode", "Today", "UserId" }.Contains(v.Name, StringComparer.OrdinalIgnoreCase)) continue;
+                if (GxMcp.Worker.Helpers.FrameworkManagedVariables.ShouldSkipUnusedCheck(v.Name)) continue;
                 int declarationLine = FindVariableDeclarationLine(variablesText, v.Name);
                 if (!usedVariables.Contains(v.Name))
                     issues.Add(CreateIssue("GX008", "Unused variable", "Warning", $"Variable '&{v.Name}' is never used.", "&" + v.Name, declarationLine, "Variables"));

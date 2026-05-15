@@ -132,13 +132,32 @@ namespace GxMcp.Worker.Structure
                 return new string[0];
             }
 
-            return obj.Parts
+            var names = obj.Parts
                 .Cast<KBObjectPart>()
                 .Select(GetDisplayPartName)
                 .Where(name => !string.IsNullOrWhiteSpace(name))
+                // PatternVirtual has no readable SDK path through the MCP — hide until one exists.
+                .Where(name => !string.Equals(name, "PatternVirtual", StringComparison.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
+                .ToList();
+
+            // "Source" and "Events" both resolve to the same ISource part on WebPanels/Transactions —
+            // keep only the canonical "Events" name; FindPart still accepts "Source" as alias.
+            bool hasEvents = names.Any(n => string.Equals(n, "Events", StringComparison.OrdinalIgnoreCase));
+            if (hasEvents)
+                names.RemoveAll(n => string.Equals(n, "Source", StringComparison.OrdinalIgnoreCase));
+
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names.ToArray();
+        }
+
+        /// First ISource part's text, or empty when the object exposes none.
+        public static string GetFirstSourceText(KBObject obj)
+        {
+            if (obj == null) return string.Empty;
+            foreach (var p in obj.Parts)
+                if (p is ISource s) return s.Source ?? string.Empty;
+            return string.Empty;
         }
 
         private static string GetDisplayPartName(KBObjectPart part)

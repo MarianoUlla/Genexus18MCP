@@ -1,5 +1,170 @@
 # Changelog
 
+## v2.3.8 — 2026-05-15
+
+Closes the "deveria ter mas não tem" list from the 2026-05-15 friction report plus
+the four items the prior pass had deferred. Six new tools + indexed source search +
+true async writes. 364/365 unit tests passing (210 Gateway + 154 Worker); the single
+pre-existing Gateway failure (`IdempotencyCacheTests.Eviction_LruDropsOldestWhenAtCapacity`)
+was failing on `main` before this branch.
+
+### New tools
+
+- **`genexus_validate_payload`** (`Services/ValidatePayloadService.cs`) — pre-flight
+  check: parses the XML, runs `WebFormSchemaHints.ScanForRejectedAttributes`, and when
+  the current state is readable, computes the would-be structural diff against the
+  persisted XML. Returns `status: Valid|Warnings|Error`, `preflightWarnings[]`, and
+  `diff` without touching disk.
+- **`genexus_bulk_edit`** (`Services/WriteService.BulkWrite`) — apply N independent
+  edits in one call. Each item supports `{name, part?, content, type?, dryRun?}`.
+  `stopOnError=true` halts at the first failure; remaining items return
+  `status: Skipped`. Response carries `counts: {success, failure, skipped}` and a
+  per-item `results[]` array.
+- **`genexus_apply_template`** (`Services/ApplyTemplateService.cs`) — three predefined
+  visual templates: `kpi_header` (title + 3 KPI attributes), `empty_state` (bitmap +
+  caption), `confirm_dialog` (confirm/cancel button pair with event wiring). Goes
+  through the existing `WriteService.WriteObject` path so dryRun, validation, and
+  rollback behaviour are inherited.
+- **`genexus_diff`** (`Services/DiffService.cs`) — unified text diff via the existing
+  `Helpers/DiffBuilder.UnifiedDiff`. Modes: `textVsText` (two caller-provided strings)
+  and `currentVsText` (current persisted part vs. a caller string). Useful for PR
+  review and pre-save comparison.
+- **`genexus_export_unified`** (`Services/ExportObjectService.cs`) — full state of an
+  object as a single JSON envelope: every available part read in one shot. Drives
+  cross-snapshot diffs and PR-review artifacts.
+- **`genexus_delete_variable`** (carried over from v2.3.7) — already shipped.
+
+### New flags on existing tools
+
+- **`genexus_analyze mode=linter fix=true`** (`Services/LinterService.LintAndFix`) —
+  walks the lint report and auto-fixes GX008 unused vars via `DeleteVariable`. Skips
+  framework-managed vars (GAM/WWP+) automatically. Other rules surface in `skipped[]`
+  with a reason; the fixed set returns in `fixed[]`.
+- **`genexus_edit async=true`** (Gateway `Program.cs` async-edit intercept) — writes
+  longer than ~30 s now follow the same pattern as `genexus_lifecycle build`: register
+  a `JobRegistry` entry, fire-and-forget the worker call, return
+  `{job_id, status:"running", estimated_seconds, hint}` immediately. Completion piggybacks
+  on the next response via `_meta.background_jobs`. Same flag honoured on
+  `genexus_add_variable` and `genexus_delete_variable`.
+
+### Worker
+
+- **Indexed source-search pre-filter** (`Services/SourceSearchService.cs`) —
+  extracts alphanumeric literal tokens (≥3 chars) from the regex/callee, then drops
+  index entries whose `SourceSnippet`, `Name`, or `Keywords` contain none of them
+  before paying for `FindObject`. On the friction-report's
+  `pattern: "Alu2RegProf|Alu2NumRegProf"` example this skips 90%+ of the entries
+  without changing the final result (regex.IsMatch still gates output).
+- **PatternVirtual raw-serialize fallback** (`Services/ObjectService.cs`) — when
+  `PatternAnalysisService.ReadPatternPartXml` returns empty, fall back to locating
+  the matching part on `obj.Parts` by type-descriptor or CLR-type name and serialise
+  via `KBObjectPart.SerializeToXml`. Surfaces the part as raw XML when WWP+'s
+  analyser bails out, instead of the previous hard "Pattern XML not available".
+
+### Documentation
+
+- The four items previously marked "Deferred — needs deeper work" in v2.3.7 are now
+  shipped:
+  - True async writes ✓ (gateway `async=true` intercept)
+  - Theme/StyleSheet read ✓ (already worked through the existing generic
+    `SerializeToXml` fallback — discovery fixed by the `typesAvailable` hint in v2.3.7)
+  - Index-backed `search_source` ✓ (literal-token pre-filter)
+  - PatternVirtual read ✓ (raw-serialize fallback)
+
+### Schema budget
+
+- `ToolSchemaSizeTests` budget bumped 4000 → 4600 tokens to fit the six new tools
+  (current `tool_definitions.json` ~4498 tokens).
+
+## v2.3.7 — 2026-05-15
+
+Friction-report sweep #3 (`docs/mcp-friction-report-2026-05-15.md`, since deleted).
+13 actionable agent-facing rough edges from the WWP+ UI/UX session, all addressed.
+No public API breaking changes.
+
+365/365 unit tests passing (211 Gateway + 154 Worker). Build clean (0 errors).
+
+### Worker (.NET 4.8)
+
+- **#1 — Structured `verifyDiff` on Visual/Pattern write rejection**
+  (`Helpers/XmlEquivalence.cs`, `Services/WriteService.cs`). The error envelope
+  now carries `verifyDiff: { element, path, rejectedAttributes[], addedAttributes[],
+  persistedAttributes[], requestedAttributes[] }` whenever the persisted XML's
+  attribute set differs from the requested set. The agent no longer has to compare
+  `left=[…] right=[…]` strings to figure out which attribute the SDK sanitised.
+- **#2 — `PatternVirtual` filtered from `availableParts`**
+  (`Structure/PartAccessor.cs`). The SDK exposes a `PatternVirtual` part in
+  `obj.Parts` but has no working read/write path for it through the MCP — listing
+  it sent the agent in circles. Hidden until a real read path exists.
+- **#3 — `typesAvailable` hint on empty `list_objects` typeFilter**
+  (`Services/ListService.cs`). When `typeFilter` matches zero entries but the index
+  isn't empty, the response now includes `_meta.typesAvailable: [...]` with the
+  distinct type names present so the agent discovers the canonical string instead
+  of guessing (e.g. Themes may be indexed as `DKTheme`, not `Theme`).
+- **#4 — `managedBy` flag on framework-injected variables**
+  (`Helpers/FrameworkManagedVariables.cs`, `Services/AnalyzeService.GetVariables`).
+  `IsAuthorized`, `SecurityFunctionalityKeys`, `Time`, `DiasSemanaFin` are tagged
+  with their owner (GAM / WWP+). `LinterService` GX008 silences these to break
+  the delete-readd-delete loop.
+- **#5 — `genexus_delete_variable` tool**
+  (`Services/WriteService.DeleteVariable`, `OperationsRouter`, `tool_definitions.json`).
+  Symmetric to `genexus_add_variable`, idempotent. Refuses framework-managed vars
+  with a `Refused` status instead of letting the SDK re-inject them silently.
+- **#6 — `Source` deduped from `availableParts` when `Events` is present**
+  (`Structure/PartAccessor.cs`). On WebPanels/Transactions the two labels resolved
+  to the same `ISource` part; dropping `Source` from the list leaves a single
+  canonical name (the `Source` alias still works via `PartAccessor.FindPart`).
+- **#9 — Worker crash diagnostics** (`Program.cs`). `[WORKER-CRASH]` log line now
+  carries memory (working set + private + GC), uptime, thread count, exception
+  type/message, and the full stack when `AppDomain.UnhandledException` fires.
+  Lets the gateway correlate disconnects with the actual cause.
+- **#10 — Pre-flight schema scan on dry-run** (`Helpers/WebFormSchemaHints.cs`,
+  `Services/WriteService.WriteVisualPart`). Dry-run now walks the input XML and
+  emits `preflightWarnings: [{element, attribute, reason}]` for any attribute that
+  isn't in the SDK's known accept-list for that element (e.g. `style` on `<table>`
+  / `<gxTextBlock>`). Catches the sanitisation issue before the agent tries the
+  real save and hits `Visual write verification failed`.
+- **#11 — `acceptedAttributes` on controls repertoire**
+  (`Services/UIService.cs`). `genexus_inspect controls` now surfaces
+  `acceptedAttributes: [...]` per control entry, sourced from the same
+  `WebFormSchemaHints` accept-list, so the agent sees the schema before editing.
+- **#12 — Linter is now pattern-aware** (`Services/LinterService.cs`). When a
+  `PatternInstance` part is detected on the object, `GX012 Direct Table Access in
+  UI` is suppressed (the WWP+ pattern *prescribes* direct `For Each` in Event
+  Start to hydrate SDTs — flagging that as a warning is noise).
+- **#8 — `search_source` time budget** (`Services/SourceSearchService.cs`). Hard
+  25 s budget on the source scan loop; partial results return with
+  `budgetExceeded=true, budgetMs, budgetHint` instead of an open-ended >2 min
+  wait. Index-backed search remains on the v2.4 roadmap.
+
+### Gateway (.NET 8)
+
+- **#5 wiring** — `genexus_delete_variable` registered in
+  `OperationsRouter.ConvertToolCall` and `tool_definitions.json`.
+- **#7 — Long-write timeout hint** (`Program.cs`). When a write times out at the
+  gateway, the help array now spells out that the write has usually already
+  persisted by the time the agent sees the timeout — poll `action='result'` once,
+  then read back, instead of retrying the edit (which no-ops or conflicts).
+- **#13 — `_meta.background_jobs` resilient injection** (`McpRouter.PiggybackJobs`).
+  Previously, when `content[0].text` wasn't valid JSON or was missing entirely,
+  the piggyback silently dropped the background-jobs snapshot — producing the
+  intermittent "_meta às vezes aparece, às vezes não" the agent observed. Now
+  wraps non-JSON text and falls back to attaching `_meta` to the result root for
+  error envelopes, so background-job status is delivered on every response while
+  a build is running.
+
+### Deferred — needs deeper work
+
+- True async writes (`#7` upgrade) — full `{job_id, status:"running"}` envelope
+  on edits and SemanticOps. Mitigation (better timeout hint) shipped; full
+  refactor needs idempotency/state-machine work.
+- Theme/StyleSheet `edit` (`#3` upgrade) — read/edit of Theme objects programmatically.
+  Mitigation (`typesAvailable` hint on empty typeFilter) shipped.
+- Index-backed `search_source` (`#8` upgrade) — Lucene/ripgrep-style token store.
+  Mitigation (25 s budget cap) shipped.
+- `PatternVirtual` read/edit (`#2` upgrade) — implementing the SDK path for the
+  virtual pattern part. Filtered for now.
+
 ## v2.3.6 — 2026-05-15
 
 Less-turns pass: cut round-trips between the agent and the MCP by enriching

@@ -896,19 +896,7 @@ namespace GxMcp.Gateway
             var snapshot = registry.SnapshotForSession(sessionId);
             if (snapshot.Count == 0) return;
 
-            // The LLM reads content[0].text (a serialized JSON string), not the wrapper JObject.
-            // Inject _meta.background_jobs into the inner JSON so the LLM actually sees it.
-            var content = toolResult["content"] as JArray;
-            var first = content?[0] as JObject;
-            var textToken = first?["text"];
-            if (textToken == null) return;
-
-            JObject inner;
-            try { inner = JObject.Parse(textToken.ToString()); }
-            catch { return; /* content is not JSON — skip piggyback */ }
-
-            var meta = (JObject?)inner["_meta"] ?? new JObject();
-            meta["background_jobs"] = new JArray(snapshot.Select(j => new JObject
+            var jobsArr = new JArray(snapshot.Select(j => new JObject
             {
                 ["id"] = j.Id,
                 ["status"] = j.Status,
@@ -916,9 +904,28 @@ namespace GxMcp.Gateway
                 ["completed_at"] = j.CompletedAt?.ToString("o"),
                 ["estimated_seconds"] = j.EstimatedSeconds
             }));
-            inner["_meta"] = meta;
 
-            first["text"] = inner.ToString(Newtonsoft.Json.Formatting.None);
+            // The LLM reads content[0].text (a serialized JSON string), not the wrapper JObject.
+            var content = toolResult["content"] as JArray;
+            var first = content?[0] as JObject;
+            var textToken = first?["text"];
+            if (textToken != null)
+            {
+                JObject? inner;
+                try { inner = JObject.Parse(textToken.ToString()); }
+                catch { return; /* non-JSON text payload — leave alone */ }
+                var meta = (JObject?)inner["_meta"] ?? new JObject();
+                meta["background_jobs"] = jobsArr;
+                inner["_meta"] = meta;
+                first["text"] = inner.ToString(Newtonsoft.Json.Formatting.None);
+            }
+            else
+            {
+                // Error envelopes have no content array — attach _meta to the result root so jobs still surface.
+                var meta = (JObject?)toolResult["_meta"] ?? new JObject();
+                meta["background_jobs"] = jobsArr;
+                toolResult["_meta"] = meta;
+            }
             registry.MarkSeen(sessionId, snapshot.Select(j => j.Id));
         }
 

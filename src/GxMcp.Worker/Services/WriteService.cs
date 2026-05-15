@@ -1002,13 +1002,28 @@ namespace GxMcp.Worker.Services
             string target,
             string partName,
             string details,
-            global::Artech.Architecture.Common.Objects.KBObject obj = null)
+            global::Artech.Architecture.Common.Objects.KBObject obj = null,
+            GxMcp.Worker.Helpers.XmlEquivalenceDiff structuredDiff = null)
         {
             var response = new JObject
             {
                 ["status"] = "Error",
                 ["error"] = error
             };
+
+            if (structuredDiff != null)
+            {
+                var d = new JObject();
+                if (!string.IsNullOrEmpty(structuredDiff.ElementName)) d["element"] = structuredDiff.ElementName;
+                if (!string.IsNullOrEmpty(structuredDiff.Path)) d["path"] = structuredDiff.Path;
+                if (structuredDiff.RejectedAttributes != null && structuredDiff.RejectedAttributes.Length > 0)
+                    d["rejectedAttributes"] = new JArray(structuredDiff.RejectedAttributes);
+                if (structuredDiff.AddedAttributes != null && structuredDiff.AddedAttributes.Length > 0)
+                    d["addedAttributes"] = new JArray(structuredDiff.AddedAttributes);
+                if (structuredDiff.LeftAttributes != null) d["persistedAttributes"] = new JArray(structuredDiff.LeftAttributes);
+                if (structuredDiff.RightAttributes != null) d["requestedAttributes"] = new JArray(structuredDiff.RightAttributes);
+                response["verifyDiff"] = d;
+            }
 
             if (!string.IsNullOrWhiteSpace(target))
             {
@@ -1051,7 +1066,7 @@ namespace GxMcp.Worker.Services
             if (error.IndexOf("does not expose text source", StringComparison.OrdinalIgnoreCase) >= 0)
                 return "Resolve via parent Transaction (e.g., type='Transaction') or use mode='full'.";
             if (error.IndexOf("verification failed", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Compare requested XML with persisted via genexus_read; see 'details' diff for the divergent path.";
+                return "See 'verifyDiff' for rejected/added attrs. SDK sanitises attrs outside its element schema (e.g. 'style' on classref-bound elements). Drop those attrs or move them to a Theme class.";
             if (error.IndexOf("Invalid", StringComparison.OrdinalIgnoreCase) >= 0)
                 return "Check XML well-formedness; verify single root element and quoted attribute values.";
             if (error.IndexOf("Object not found", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -1059,31 +1074,165 @@ namespace GxMcp.Worker.Services
             return null;
         }
 
+        // Item shape: { name, part?, content, type?, dryRun? }. stopOnError halts at first failure.
+        public string BulkWrite(JObject args)
+        {
+            var items = args?["targets"] as JArray;
+            if (items == null || items.Count == 0)
+                return new JObject { ["status"] = "Error", ["error"] = "targets[] required" }.ToString();
+
+            bool stopOnError = args?["stopOnError"]?.ToObject<bool?>() ?? true;
+            bool dryRun = args?["dryRun"]?.ToObject<bool?>() ?? false;
+            var results = new JArray();
+            int success = 0, failure = 0, skipped = 0;
+
+            foreach (var it in items)
+            {
+                if (failure > 0 && stopOnError)
+                {
+                    results.Add(new JObject { ["status"] = "Skipped", ["target"] = it?["name"]?.ToString() });
+                    skipped++;
+                    continue;
+                }
+                var name = it?["name"]?.ToString();
+                var part = it?["part"]?.ToString() ?? "";
+                var content = it?["content"]?.ToString();
+                var itemDryRun = it?["dryRun"]?.ToObject<bool?>() ?? dryRun;
+                if (string.IsNullOrEmpty(name) || content == null)
+                {
+                    results.Add(new JObject { ["status"] = "Error", ["error"] = "missing name or content", ["target"] = name });
+                    failure++;
+                    continue;
+                }
+                string raw = WriteObject(name, part, content, it?["type"]?.ToString(), true, false, true, itemDryRun);
+                var parsed = GxMcp.Worker.Helpers.JsonUtil.SafeParse(raw);
+                results.Add(parsed);
+
+                var status = (parsed as JObject)?["status"]?.ToString();
+                if (string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase)) failure++;
+                else success++;
+            }
+
+            return new JObject
+            {
+                ["status"] = failure == 0 ? "Success" : "PartialFailure",
+                ["counts"] = new JObject { ["success"] = success, ["failure"] = failure, ["skipped"] = skipped },
+                ["results"] = results,
+            }.ToString();
+        }
+
+        private string ResolveVariableTarget(string target, ref string varName,
+            out global::Artech.Architecture.Common.Objects.KBObject obj,
+            out global::Artech.Genexus.Common.Parts.VariablesPart varPart,
+            out global::Artech.Genexus.Common.Variable existing)
+        {
+            obj = null; varPart = null; existing = null;
+            if (string.IsNullOrEmpty(varName)) return "{\"error\": \"Variable name is required.\"}";
+            varName = varName.TrimStart('&');
+
+            obj = _objectService.FindObject(target);
+            if (obj == null) return CreateWriteError("Object not found", target, "Variables", "The requested object is not available in the active Knowledge Base.");
+
+            varPart = obj.Parts.Get<global::Artech.Genexus.Common.Parts.VariablesPart>();
+            if (varPart == null) return CreateWriteError("Variables part not found", target, "Variables", "The object does not expose a Variables part.", obj);
+
+            string searchName = varName;
+            existing = varPart.Variables.FirstOrDefault(v => string.Equals(v.Name, searchName, StringComparison.OrdinalIgnoreCase));
+            return null;
+        }
+
+        /// Batch variant: removes all `varNames` from `target`, calling EnsureSave / ScheduleFlush once.
+        /// Skips framework-managed names. Returns per-name outcomes plus aggregate counts.
+        public string DeleteVariables(string target, System.Collections.Generic.IEnumerable<string> varNames)
+        {
+            try
+            {
+                if (varNames == null) return "{\"status\":\"NoChange\"}";
+                string firstName = null;
+                foreach (var n in varNames) { firstName = n; break; }
+                if (firstName == null) return "{\"status\":\"NoChange\"}";
+
+                string scratch = firstName;
+                var err = ResolveVariableTarget(target, ref scratch, out var obj, out var varPart, out _);
+                if (err != null) return err;
+
+                var outcomes = new JArray();
+                int removed = 0, refused = 0, missing = 0;
+                foreach (var raw in varNames)
+                {
+                    if (string.IsNullOrEmpty(raw)) continue;
+                    var name = raw.TrimStart('&');
+                    if (GxMcp.Worker.Helpers.FrameworkManagedVariables.IsManaged(name))
+                    {
+                        outcomes.Add(new JObject { ["name"] = name, ["status"] = "Refused", ["reason"] = "framework-managed" });
+                        refused++;
+                        continue;
+                    }
+                    var hit = varPart.Variables.FirstOrDefault(v => string.Equals(v.Name, name, StringComparison.OrdinalIgnoreCase));
+                    if (hit == null) { outcomes.Add(new JObject { ["name"] = name, ["status"] = "NoChange" }); missing++; continue; }
+                    varPart.Variables.Remove(hit);
+                    outcomes.Add(new JObject { ["name"] = name, ["status"] = "Removed" });
+                    removed++;
+                }
+
+                if (removed > 0)
+                {
+                    obj.EnsureSave();
+                    ScheduleFlush();
+                }
+
+                return new JObject
+                {
+                    ["status"] = removed > 0 ? "Success" : "NoChange",
+                    ["counts"] = new JObject { ["removed"] = removed, ["refused"] = refused, ["missing"] = missing },
+                    ["outcomes"] = outcomes,
+                }.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"error\": \"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
+            }
+        }
+
+        public string DeleteVariable(string target, string varName)
+        {
+            try
+            {
+                var err = ResolveVariableTarget(target, ref varName, out var obj, out var varPart, out var existing);
+                if (err != null) return err;
+
+                if (existing == null)
+                    return "{\"status\": \"NoChange\", \"details\": \"Variable not present; nothing to delete.\"}";
+
+                if (GxMcp.Worker.Helpers.FrameworkManagedVariables.IsManaged(varName))
+                {
+                    return new JObject
+                    {
+                        ["status"] = "Refused",
+                        ["error"] = "Framework-managed variable",
+                        ["details"] = "Variable '&" + varName + "' is managed by " + GxMcp.Worker.Helpers.FrameworkManagedVariables.GetManagedBy(varName) + " and will be re-injected on save."
+                    }.ToString();
+                }
+
+                varPart.Variables.Remove(existing);
+                obj.EnsureSave();
+                ScheduleFlush();
+                return "{\"status\": \"Success\"}";
+            }
+            catch (Exception ex)
+            {
+                return "{\"error\": \"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
+            }
+        }
+
         public string AddVariable(string target, string varName, string typeName = null)
         {
             try
             {
-                if (string.IsNullOrEmpty(varName)) return "{\"error\": \"Variable name is required.\"}";
-                varName = varName.TrimStart('&');
+                var err = ResolveVariableTarget(target, ref varName, out var obj, out var varPart, out var existing);
+                if (err != null) return err;
 
-                var obj = _objectService.FindObject(target);
-                if (obj == null) return CreateWriteError(
-                    "Object not found",
-                    target,
-                    "Variables",
-                    "The requested object is not available in the active Knowledge Base."
-                );
-
-                var varPart = obj.Parts.Get<global::Artech.Genexus.Common.Parts.VariablesPart>();
-                if (varPart == null) return CreateWriteError(
-                    "Variables part not found",
-                    target,
-                    "Variables",
-                    "The object does not expose a Variables part.",
-                    obj
-                );
-
-                if (varPart.Variables.Any(v => string.Equals(v.Name, varName, StringComparison.OrdinalIgnoreCase)))
+                if (existing != null)
                     return "{\"status\": \"Variable already exists\"}";
 
                 if (!string.IsNullOrEmpty(typeName))
@@ -1168,12 +1317,22 @@ namespace GxMcp.Worker.Services
                 }
                 if (dryRun)
                 {
-                    return Models.McpResponse.Success("Write", target, new JObject
+                    var dryResp = new JObject
                     {
                         ["status"] = "DryRun",
                         ["part"] = partName,
                         ["details"] = "Dry-run: input parsed and would update visual XML. Save skipped."
-                    });
+                    };
+                    var suspects = GxMcp.Worker.Helpers.WebFormSchemaHints.ScanForRejectedAttributes(normalizedInput);
+                    if (suspects.Count > 0)
+                    {
+                        var arr = new JArray();
+                        foreach (var s in suspects)
+                            arr.Add(new JObject { ["element"] = s.Element, ["attribute"] = s.Attribute, ["reason"] = s.Reason });
+                        dryResp["preflightWarnings"] = arr;
+                        dryResp["warning"] = "Dry-run detected " + suspects.Count + " attribute(s) likely to be sanitised by the SDK on save. See preflightWarnings.";
+                    }
+                    return Models.McpResponse.Success("Write", target, dryResp);
                 }
             }
             catch (Exception ex)
@@ -1269,14 +1428,15 @@ namespace GxMcp.Worker.Services
 
                     var refreshedObj = _objectService.FindObject(target);
                     string persistedXml = WebFormXmlHelper.ReadEditableXml(refreshedObj ?? obj);
-                    if (!XmlEquivalence.AreEquivalent(persistedXml, normalizedInput, out var visualDiff))
+                    if (!XmlEquivalence.AreEquivalent(persistedXml, normalizedInput, out var visualDiff, out var visualStructured))
                     {
                         return CreateWriteError(
                             "Visual write verification failed",
                             target,
                             partName,
                             "The SDK save path completed, but the persisted WebForm XML does not match the requested content. Diff: " + (visualDiff ?? "n/a"),
-                            obj);
+                            obj,
+                            visualStructured);
                     }
 
                     return Models.McpResponse.Success("Write", target, new JObject
@@ -1400,14 +1560,15 @@ namespace GxMcp.Worker.Services
 
                     string persistedXml = _patternAnalysisService.ReadPatternPartXml(obj, partName, out var refreshedObject, out _);
 
-                    if (!XmlEquivalence.AreEquivalent(persistedXml, normalizedInput, out var patternDiff))
+                    if (!XmlEquivalence.AreEquivalent(persistedXml, normalizedInput, out var patternDiff, out var patternStructured))
                     {
                         return CreateWriteError(
                             "Pattern write verification failed",
                             target,
                             partName,
                             "The SDK save path completed, but the persisted WorkWithPlus pattern XML does not match the requested content. Diff: " + (patternDiff ?? "n/a"),
-                            refreshedObject ?? resolvedObject);
+                            refreshedObject ?? resolvedObject,
+                            patternStructured);
                     }
 
                     var success = new JObject

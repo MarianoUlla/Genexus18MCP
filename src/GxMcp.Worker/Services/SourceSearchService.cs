@@ -49,15 +49,27 @@ namespace GxMcp.Worker.Services
 
                 var hits = new JArray();
                 var index = _index.GetIndex();
+
+                // Pre-filter by literal tokens against the index so we skip FindObject for
+                // entries that demonstrably reference none of them.
+                var literals = ExtractLiteralTokens(c.Pattern, c.Callee);
+
                 var entries = index.Objects.Values
                     .Where(e => e.Type == "Procedure" || e.Type == "DataProvider" || e.Type == "WebPanel" || e.Type == "Transaction")
                     .Where(e => string.IsNullOrEmpty(c.TypeFilter) || string.Equals(e.Type, c.TypeFilter, StringComparison.OrdinalIgnoreCase))
+                    .Where(e => MatchesAnyLiteral(e, literals))
                     .ToList();
+
+                // Cap total scan time; partial results return with budgetExceeded=true.
+                int budgetMs = 25000;
+                var swBudget = System.Diagnostics.Stopwatch.StartNew();
+                bool budgetExceeded = false;
 
                 int produced = 0;
                 foreach (var e in entries)
                 {
                     if (produced >= c.MaxResults) break;
+                    if (swBudget.ElapsedMilliseconds > budgetMs) { budgetExceeded = true; break; }
                     KBObject obj;
                     try { obj = _objectService.FindObject(e.Name); } catch { continue; }
                     if (obj == null) continue;
@@ -105,6 +117,12 @@ namespace GxMcp.Worker.Services
                     ["truncated"] = produced >= c.MaxResults,
                     ["hits"] = hits
                 };
+                if (budgetExceeded)
+                {
+                    response["budgetExceeded"] = true;
+                    response["budgetMs"] = budgetMs;
+                    response["budgetHint"] = "search_source aborted at " + budgetMs + "ms with " + produced + " hits. Narrow with typeFilter or a more specific pattern. Indexed search is on the v2.4 roadmap.";
+                }
                 if (hits.Count > 0 && hits[0] is JObject topHit)
                 {
                     response["_meta"] = new JObject
@@ -126,6 +144,36 @@ namespace GxMcp.Worker.Services
             {
                 return "{\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
             }
+        }
+
+        // Alphanumeric runs >=3 chars; final regex.IsMatch still gates output so a
+        // permissive pre-filter is safe.
+        private static System.Collections.Generic.List<string> ExtractLiteralTokens(string pattern, string callee)
+        {
+            var toks = new System.Collections.Generic.List<string>();
+            if (!string.IsNullOrEmpty(callee))
+                foreach (Match m in Regex.Matches(callee, @"[A-Za-z0-9_]{3,}")) toks.Add(m.Value);
+            if (!string.IsNullOrEmpty(pattern))
+                foreach (Match m in Regex.Matches(pattern, @"[A-Za-z0-9_]{3,}")) toks.Add(m.Value);
+            return toks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static bool MatchesAnyLiteral(Models.SearchIndex.IndexEntry e, System.Collections.Generic.List<string> literals)
+        {
+            if (literals == null || literals.Count == 0) return true;
+            string snip = e.SourceSnippet ?? "";
+            string nm = e.Name ?? "";
+            foreach (var t in literals)
+            {
+                if (snip.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (nm.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (e.Keywords != null)
+                {
+                    for (int i = 0; i < e.Keywords.Count; i++)
+                        if (e.Keywords[i] != null && e.Keywords[i].IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                }
+            }
+            return false;
         }
 
         private static bool CalleeMatches(string actual, string wanted)

@@ -1623,6 +1623,51 @@ namespace GxMcp.Gateway
                     workerCmd["client"] = "mcp";
                     int timeoutMs = GetToolTimeoutMs(tName, tArgs);
 
+                    // async=true on edit/variable tools → fire-and-forget; result piggybacks via _meta.background_jobs.
+                    bool editAsync = (tArgs?["async"]?.ToObject<bool?>() ?? false) &&
+                                     (string.Equals(tName, "genexus_edit", StringComparison.OrdinalIgnoreCase)
+                                      || string.Equals(tName, "genexus_add_variable", StringComparison.OrdinalIgnoreCase)
+                                      || string.Equals(tName, "genexus_delete_variable", StringComparison.OrdinalIgnoreCase));
+                    if (editAsync)
+                    {
+                        int estEdit = tArgs?["estimated_seconds"]?.ToObject<int?>() ?? 30;
+                        var editJob = JobRegistry.Start(sessionId, $"edit/{tName}", estEdit);
+                        Log($"[AsyncEdit] Dispatching job={editJob.Id} tool={tName} estimated={estEdit}s");
+                        var capturedCmd = workerCmd;
+                        var capturedTimeout = timeoutMs;
+                        var capturedName = tName;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                var inner = await SendWorkerCommandAsync(
+                                    capturedCmd, capturedTimeout,
+                                    $"Timeout waiting for async edit: {capturedName}",
+                                    r => r, (_, __) => new JObject { ["status"] = "Running" });
+                                bool ok = inner?["error"] == null &&
+                                          !string.Equals(inner?["status"]?.ToString(), "Error", StringComparison.OrdinalIgnoreCase);
+                                JobRegistry.Complete(editJob.Id, ok, ok ? "Edit succeeded" : "Edit failed", inner);
+                            }
+                            catch (Exception ex)
+                            {
+                                JobRegistry.Complete(editJob.Id, false, $"Edit exception: {ex.Message}");
+                                Log($"[AsyncEdit] Exception in job={editJob.Id}: {ex.Message}");
+                            }
+                        });
+                        var asyncEditResponse = new JObject
+                        {
+                            ["job_id"] = editJob.Id,
+                            ["status"] = "running",
+                            ["estimated_seconds"] = estEdit,
+                            ["hint"] = "Edit accepted; poll genexus_lifecycle(action='result', target='op:" + editJob.Id + "') or watch _meta.background_jobs."
+                        };
+                        return new JObject
+                        {
+                            ["isError"] = false,
+                            ["content"] = new JArray { new JObject { ["type"] = "text", ["text"] = asyncEditResponse.ToString(Formatting.None) } }
+                        };
+                    }
+
                     JObject? innerResult = null;
                     innerResult = await SendWorkerCommandAsync(
                         workerCmd,
@@ -1702,6 +1747,13 @@ namespace GxMcp.Gateway
                             {
                                 timeoutPayload["operationId"] = operationId;
                                 help.Add($"Operation is still running. Query genexus_lifecycle(action='status', target='op:{operationId}') or action='result'.");
+                                if (tName != null && (tName.IndexOf("edit", StringComparison.OrdinalIgnoreCase) >= 0
+                                                     || tName.IndexOf("write", StringComparison.OrdinalIgnoreCase) >= 0
+                                                     || tName.IndexOf("variable", StringComparison.OrdinalIgnoreCase) >= 0))
+                                {
+                                    // Writes have usually persisted by the time the gateway times out; poll result, then read — don't retry the edit.
+                                    help.Add("For long writes the change is usually already persisted; check action='result' once, then read back instead of retrying.");
+                                }
                             }
                             else
                             {

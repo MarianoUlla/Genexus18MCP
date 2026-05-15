@@ -35,8 +35,10 @@ namespace GxMcp.Gateway.Tests
             var content = File.ReadAllText(path);
             var approxTokens = content.Length / 4;
             // Budget bumped from 3500 → 4000 in v2.3.0 to accommodate the `kb`
-            // parameter added to 28 tools for multi-KB parallel support.
-            Assert.True(approxTokens < 4000, $"tool_definitions.json is ~{approxTokens} tokens; budget 4000.");
+            // parameter added to 28 tools for multi-KB parallel support. Bumped to 4600
+            // in v2.3.7 to fit 6 new tools (validate_payload, bulk_edit, apply_template,
+            // diff, export_unified, delete_variable).
+            Assert.True(approxTokens < 4600, $"tool_definitions.json is ~{approxTokens} tokens; budget 4600.");
         }
     }
 }

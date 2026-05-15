@@ -135,7 +135,23 @@ namespace GxMcp.Worker.Services
                         ));
                     }
 
-                    return Finalize(BuildPagedResponseInternal(array, totalIndex, startIndex, pageSize).ToString());
+                    var paged = BuildPagedResponseInternal(array, totalIndex, startIndex, pageSize);
+                    // Empty typeFilter result: hand back the distinct types present so the agent finds the canonical name.
+                    if (array.Count == 0 && filterTypes.Count > 0 && index.Objects.Count > 0)
+                    {
+                        var distinctTypes = index.Objects.Values
+                            .Select(e => e.Type ?? string.Empty)
+                            .Where(t => !string.IsNullOrEmpty(t))
+                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                            .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+                            .Take(60)
+                            .ToArray();
+                        var meta = paged["_meta"] as JObject ?? new JObject();
+                        meta["typesAvailable"] = new JArray(distinctTypes);
+                        meta["filterHint"] = "typeFilter='" + string.Join(",", filterTypes) + "' matched nothing. See typesAvailable for canonical type names actually present in this KB.";
+                        paged["_meta"] = meta;
+                    }
+                    return Finalize(paged.ToString());
                 }
 
                 source = "runtime-sdk";

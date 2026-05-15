@@ -24,7 +24,8 @@ namespace GxMcp.Gateway.Routers
                     switch (mode)
                     {
                         case "linter":
-                            return new { module = "Linter", action = "Analyze", target = target, type = type };
+                            bool linterFix = args?["fix"]?.ToObject<bool?>() ?? false;
+                            return new { module = "Linter", action = "Analyze", target = target, type = type, @params = new JObject { ["fix"] = linterFix } };
                         case "navigation":
                             return new { module = "Analyze", action = "GetNavigation", target = target, type = type };
                         case "hierarchy":

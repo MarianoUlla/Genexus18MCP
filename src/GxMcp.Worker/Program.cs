@@ -57,11 +57,28 @@ namespace GxMcp.Worker
                 } catch { }
 
                 AppDomain.CurrentDomain.UnhandledException += (s, e) => {
-                    Logger.Error("FATAL UNHANDLED EXCEPTION: " + (e.ExceptionObject as Exception)?.ToString());
+                    try
+                    {
+                        var ex = e.ExceptionObject as Exception;
+                        var proc = System.Diagnostics.Process.GetCurrentProcess();
+                        long memMb = proc.WorkingSet64 / (1024 * 1024);
+                        long privMb = proc.PrivateMemorySize64 / (1024 * 1024);
+                        var uptime = DateTime.UtcNow - proc.StartTime.ToUniversalTime();
+                        Logger.Error(
+                            "[WORKER-CRASH] terminating=" + e.IsTerminating
+                            + " memMB=" + memMb + " privMB=" + privMb
+                            + " uptimeSec=" + (int)uptime.TotalSeconds
+                            + " gcMemMB=" + (GC.GetTotalMemory(false) / (1024 * 1024))
+                            + " threadCount=" + proc.Threads.Count
+                            + " exType=" + (ex?.GetType().FullName ?? "<null>")
+                            + " exMsg=" + (ex?.Message ?? "<null>")
+                            + Environment.NewLine + "Stack: " + (ex?.ToString() ?? "<null>"));
+                    }
+                    catch { Logger.Error("FATAL UNHANDLED EXCEPTION: " + (e.ExceptionObject as Exception)?.ToString()); }
                 };
 
                 System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (s, e) => {
-                    Logger.Error("UNOBSERVED TASK EXCEPTION: " + e.Exception?.ToString());
+                    Logger.Error("[WORKER-CRASH] UNOBSERVED TASK EXCEPTION: " + e.Exception?.ToString());
                     e.SetObserved();
                 };
 

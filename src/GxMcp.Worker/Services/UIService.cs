@@ -124,7 +124,7 @@ namespace GxMcp.Worker.Services
 
                                 if (string.IsNullOrEmpty(ctrlName) && string.IsNullOrEmpty(binding)) continue;
 
-                                arr.Add(new JObject
+                                var entryFb = new JObject
                                 {
                                     ["name"] = ctrlName,
                                     ["type"] = elName,
@@ -132,7 +132,10 @@ namespace GxMcp.Worker.Services
                                     ["dataBinding"] = binding,
                                     ["event"] = evName,
                                     ["_fallback"] = true // signals this came from the XML-scan path
-                                });
+                                };
+                                var acceptedFb = GxMcp.Worker.Helpers.WebFormSchemaHints.GetAcceptedAttributes(elName);
+                                if (acceptedFb != null) entryFb["acceptedAttributes"] = new JArray(acceptedFb);
+                                arr.Add(entryFb);
                             }
                         }
                     }
@@ -169,6 +172,8 @@ namespace GxMcp.Worker.Services
                         ["dataBinding"] = binding,
                         ["validEvents"] = events
                     };
+                    var accepted = GxMcp.Worker.Helpers.WebFormSchemaHints.GetAcceptedAttributes(typeName);
+                    if (accepted != null) entry["acceptedAttributes"] = new JArray(accepted);
                     arr.Add(entry);
                 }
             }

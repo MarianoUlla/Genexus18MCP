@@ -51,6 +51,10 @@ namespace GxMcp.Worker.Services
         private readonly ListService _listService;
         private readonly LayoutService _layoutService;
         private readonly KbValidationService _kbValidationService;
+        private readonly ValidatePayloadService _validatePayloadService;
+        private readonly ExportObjectService _exportObjectService;
+        private readonly DiffService _diffService;
+        private readonly ApplyTemplateService _applyTemplateService;
 
         private CommandDispatcher()
         {
@@ -93,6 +97,10 @@ namespace GxMcp.Worker.Services
             _conversionService = new ConversionService(_objectService);
             _selfTestService = new SelfTestService(_kbService, _searchService, _linterService);
             _kbValidationService = new KbValidationService(_indexCacheService, _objectService, _patternAnalysisService);
+            _validatePayloadService = new ValidatePayloadService(_objectService);
+            _exportObjectService = new ExportObjectService(_objectService);
+            _diffService = new DiffService(_objectService);
+            _applyTemplateService = new ApplyTemplateService(_writeService);
 
             // Phase 2: Late Linking
             _kbService.SetBuildService(_buildService);
@@ -105,6 +113,7 @@ namespace GxMcp.Worker.Services
             _objectService.SetDataInsightService(_dataInsightService);
             _objectService.SetUIService(_uiService);
             _objectService.SetPatternAnalysisService(_patternAnalysisService);
+            _linterService.SetWriteService(_writeService);
         }
 
         public static CommandDispatcher Instance
@@ -291,6 +300,35 @@ namespace GxMcp.Worker.Services
                                 args?["varName"]?.ToString(),
                                 args?["typeName"]?.ToString());
                         }
+                        if (action == "DeleteVariable")
+                        {
+                            return _writeService.DeleteVariable(
+                                target,
+                                args?["varName"]?.ToString());
+                        }
+                        if (action == "ValidatePayload")
+                        {
+                            return _validatePayloadService.Validate(
+                                target,
+                                args?["part"]?.ToString(),
+                                payload);
+                        }
+                        if (action == "Bulk")
+                        {
+                            return _writeService.BulkWrite(args ?? request);
+                        }
+                        if (action == "ApplyTemplate")
+                        {
+                            return _applyTemplateService.Apply(
+                                args?["template"]?.ToString(),
+                                target,
+                                args,
+                                args?["dryRun"]?.ToObject<bool?>() ?? false);
+                        }
+                        if (action == "ListTemplates")
+                        {
+                            return _applyTemplateService.ListTemplates();
+                        }
                         return _writeService.WriteObject(
                             target,
                             action,
@@ -347,7 +385,21 @@ namespace GxMcp.Worker.Services
                         }
                         return _analyzeService.Analyze(target, analyzeType);
                     case "linter":
+                        bool linterFix = args?["fix"]?.ToObject<bool?>() ?? false;
+                        if (linterFix) return _linterService.LintAndFix(target);
                         return _linterService.Lint(target);
+                    case "diff":
+                        return _diffService.Diff(
+                            args?["mode"]?.ToString() ?? action,
+                            target,
+                            args?["part"]?.ToString(),
+                            args?["left"]?.ToString(),
+                            args?["right"]?.ToString(),
+                            args?["context"]?.ToObject<int?>() ?? 3);
+                    case "export":
+                        if (action == "Unified" || action == "Full")
+                            return _exportObjectService.Export(target, args?["type"]?.ToString());
+                        break;
                     case "forge":
                         if (action == "Scaffold")
                         {

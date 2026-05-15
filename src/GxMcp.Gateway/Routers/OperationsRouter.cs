@@ -62,6 +62,60 @@ namespace GxMcp.Gateway.Routers
                         typeName = args?["typeName"]?.ToString()
                     };
 
+                case "genexus_delete_variable":
+                    return new
+                    {
+                        module = "Write",
+                        action = "DeleteVariable",
+                        target = args?["name"]?.ToString(),
+                        varName = args?["varName"]?.ToString()
+                    };
+
+                case "genexus_validate_payload":
+                    return new
+                    {
+                        module = "Write",
+                        action = "ValidatePayload",
+                        target = args?["name"]?.ToString(),
+                        payload = args?["content"]?.ToString(),
+                        @params = new JObject { ["part"] = args?["part"]?.ToString() }
+                    };
+
+                case "genexus_bulk_edit":
+                    return new
+                    {
+                        module = "Write",
+                        action = "Bulk",
+                        @params = args
+                    };
+
+                case "genexus_apply_template":
+                    return new
+                    {
+                        module = "Write",
+                        action = "ApplyTemplate",
+                        target = args?["name"]?.ToString(),
+                        @params = args
+                    };
+
+                case "genexus_diff":
+                    return new
+                    {
+                        module = "Diff",
+                        action = args?["mode"]?.ToString() ?? "textVsText",
+                        target = args?["name"]?.ToString(),
+                        @params = args
+                    };
+
+                case "genexus_export_unified":
+                    return new
+                    {
+                        module = "Export",
+                        action = "Unified",
+                        target = args?["name"]?.ToString(),
+                        @params = new JObject { ["type"] = args?["type"]?.ToString() }
+                    };
+
                 case "genexus_format":
                     return new
                     {

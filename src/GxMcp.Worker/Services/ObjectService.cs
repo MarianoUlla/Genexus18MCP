@@ -937,14 +937,30 @@ namespace GxMcp.Worker.Services
                     string patternXml = _patternAnalysisService?.ReadPatternPartXml(obj, partName, out resolvedObject, out resolvedPartName);
                     if (string.IsNullOrEmpty(patternXml))
                     {
-                        return Models.McpResponse.Error(
-                            "Pattern XML not available",
-                            targetName,
-                            partName,
-                            "The requested WorkWithPlus pattern part could not be resolved through the current SDK path.",
-                            obj.Name,
-                            obj.TypeDescriptor?.Name,
-                            new JArray(GxMcp.Worker.Structure.PartAccessor.GetAvailableParts(obj)));
+                        // PatternVirtual fallback: serialise the matching part directly when the WWP+ analyser bails.
+                        try
+                        {
+                            var rawPart = obj.Parts.Cast<global::Artech.Architecture.Common.Objects.KBObjectPart>()
+                                .FirstOrDefault(p =>
+                                    string.Equals(p.TypeDescriptor?.Name, partName, StringComparison.OrdinalIgnoreCase) ||
+                                    p.GetType().Name.IndexOf(partName, StringComparison.OrdinalIgnoreCase) >= 0);
+                            if (rawPart != null)
+                            {
+                                patternXml = rawPart.SerializeToXml();
+                                resolvedPartName = rawPart.TypeDescriptor?.Name ?? rawPart.GetType().Name;
+                            }
+                        }
+                        catch (Exception fbEx) { Logger.Debug("[PatternRead] raw-serialize fallback failed: " + fbEx.Message); }
+
+                        if (string.IsNullOrEmpty(patternXml))
+                            return Models.McpResponse.Error(
+                                "Pattern XML not available",
+                                targetName,
+                                partName,
+                                "The requested WorkWithPlus pattern part could not be resolved through the current SDK path.",
+                                obj.Name,
+                                obj.TypeDescriptor?.Name,
+                                new JArray(GxMcp.Worker.Structure.PartAccessor.GetAvailableParts(obj)));
                     }
 
                     var patternResult = new JObject

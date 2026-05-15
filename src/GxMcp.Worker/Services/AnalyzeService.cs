@@ -266,10 +266,11 @@ namespace GxMcp.Worker.Services
                     var item = new JObject();
                     item["name"] = var.Name;
                     item["type"] = var.Type.ToString();
-                    // FR#1 + FR#13: expose the internal var:N id so agents can resolve
-                    // <gxAttribute AttID="var:N"/> in Layout XML without grepping the generated .cs.
+                    // Layout XML uses AttID="var:N" — surface the internal id so agents don't grep the generated .cs.
                     int? internalId = VariableInjector.GetVariableInternalId(var, idx);
                     if (internalId.HasValue) item["internalId"] = internalId.Value;
+                    var managedBy = GxMcp.Worker.Helpers.FrameworkManagedVariables.GetManagedBy(var.Name);
+                    if (managedBy != null) item["managedBy"] = managedBy;
                     variables.Add(item);
                 }
 
