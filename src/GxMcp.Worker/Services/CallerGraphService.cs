@@ -122,6 +122,46 @@ namespace GxMcp.Worker.Services
             return callees.ToList();
         }
 
+        // BFS over callers (reverse edges), capped at maxNodes (exclusive of the root). Cycle-safe.
+        // v2.3.8 (Task 1.4): symmetric to GetCalleesTransitive. AnalyzeService.ImpactAnalysis
+        // previously inlined this BFS over CalledBy; it now delegates here.
+        public TransitiveResult GetCallersTransitive(string root, int maxNodes = 200)
+        {
+            var result = new TransitiveResult();
+            if (string.IsNullOrEmpty(root) || maxNodes <= 0) return result;
+
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<(string Name, int Depth)>();
+            queue.Enqueue((root, 0));
+            visited.Add(root);
+
+            int maxDepth = 0;
+
+            while (queue.Count > 0)
+            {
+                var (name, d) = queue.Dequeue();
+                maxDepth = Math.Max(maxDepth, d);
+
+                foreach (var caller in GetCallers(name))
+                {
+                    if (string.IsNullOrEmpty(caller)) continue;
+                    if (!visited.Add(caller)) continue;
+
+                    result.Nodes.Add(caller);
+                    if (result.Nodes.Count >= maxNodes)
+                    {
+                        result.Truncated = true;
+                        result.Depth = Math.Max(maxDepth, d + 1);
+                        return result;
+                    }
+                    queue.Enqueue((caller, d + 1));
+                }
+            }
+
+            result.Depth = maxDepth;
+            return result;
+        }
+
         // BFS over callees, capped at maxNodes (exclusive of the root). Cycle-safe.
         public TransitiveResult GetCalleesTransitive(string root, int maxNodes = 200)
         {

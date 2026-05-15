@@ -21,13 +21,28 @@ namespace GxMcp.Worker.Services
         private readonly UIService _uiService;
         private readonly NavigationService _navigationService;
 
-        public AnalyzeService(KbService kbService, ObjectService objectService, IndexCacheService indexCacheService, NavigationService navigationService = null, UIService uiService = null)
+        // v2.3.8 (Task 1.4): unified graph navigation. ImpactAnalysis used to
+        // run an inline BFS over CalledBy here; it now delegates to
+        // CallerGraphService.GetCallersTransitive so callers/callees logic
+        // lives in one place.
+        private readonly CallerGraphService _graph;
+
+        public AnalyzeService(KbService kbService, ObjectService objectService, IndexCacheService indexCacheService, NavigationService navigationService = null, UIService uiService = null, CallerGraphService graph = null)
         {
             _kbService = kbService;
             _objectService = objectService;
             _indexCacheService = indexCacheService;
             _navigationService = navigationService;
             _uiService = uiService;
+            _graph = graph ?? new CallerGraphService(indexCacheService);
+        }
+
+        // Test-friendly ctor matching the plan signature.
+        public AnalyzeService(IndexCacheService index, ObjectService objSvc, CallerGraphService graph)
+        {
+            _indexCacheService = index;
+            _objectService = objSvc;
+            _graph = graph ?? new CallerGraphService(index);
         }
 
         public string Analyze(string target, string typeFilter = null)
@@ -84,106 +99,138 @@ namespace GxMcp.Worker.Services
             }
         }
 
+        // Backwards-compatible entry point used by Analyze() and other callers
+        // that don't care about the index-readiness envelope.
         public string GetImpactAnalysis(string targetName)
+        {
+            return ImpactAnalysis(targetName, waitForIndex: true);
+        }
+
+        // v2.3.8 (Task 1.4): index-aware impact analysis. Delegates the BFS to
+        // CallerGraphService and adds a waitForIndex contract so callers can
+        // opt out of blocking on a cold/reindexing index.
+        public string ImpactAnalysis(string targetName, bool waitForIndex = true, int waitTimeoutMs = 30000)
         {
             try
             {
-                var index = _indexCacheService.GetIndex();
+                // 1) Index-readiness envelope.
+                var state = _indexCacheService?.GetState();
+                if (state != null && state.Status != "Ready")
+                {
+                    if (!waitForIndex)
+                    {
+                        var env = new JObject { ["status"] = state.Status };
+                        if (state.EtaMs.HasValue) env["etaMs"] = state.EtaMs.Value;
+                        if (state.Progress.HasValue) env["progress"] = state.Progress.Value;
+                        return env.ToString();
+                    }
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (sw.ElapsedMilliseconds < waitTimeoutMs)
+                    {
+                        var s = _indexCacheService.GetState();
+                        if (s != null && s.Status == "Ready") break;
+                        System.Threading.Thread.Sleep(200);
+                    }
+                    var finalState = _indexCacheService.GetState();
+                    if (finalState == null || finalState.Status != "Ready")
+                    {
+                        return new JObject
+                        {
+                            ["status"] = "Timeout",
+                            ["waitedMs"] = sw.ElapsedMilliseconds
+                        }.ToString();
+                    }
+                }
+
+                var index = _indexCacheService?.GetIndex();
                 if (index == null || index.Objects == null) return Models.McpResponse.Error("Index not found", targetName, null, "Run the KB indexing flow before requesting impact analysis.");
 
-                // PERFORMANCE: Fix key lookup (Index keys are "Type:Name")
+                // 2) Name resolution — preserve the existing priority ordering
+                //    (Procedure > Transaction > Table) so consumers see the
+                //    same canonical name they used to.
                 SearchIndex.IndexEntry targetNode = null;
                 string foundKey = null;
 
-                // 1. Try exact match if targetName already contains ":"
-                if (targetName.Contains(":") && index.Objects.TryGetValue(targetName, out targetNode)) {
+                if (targetName != null && targetName.Contains(":") && index.Objects.TryGetValue(targetName, out targetNode))
+                {
                     foundKey = targetName;
                 }
-                else {
-                    // 2. Search for the name across all types (Procedure:Name, Table:Name, etc)
+                else
+                {
                     var possibleKeys = index.Objects.Keys.Where(k => k.EndsWith(":" + targetName, StringComparison.OrdinalIgnoreCase)).ToList();
-                    
-                    if (possibleKeys.Count == 0) {
-                        // FALLBACK: Try direct KB find and trigger a single-object index update
-                        var obj = _objectService.FindObject(targetName);
-                        if (obj != null) {
+
+                    if (possibleKeys.Count == 0)
+                    {
+                        var obj = _objectService?.FindObject(targetName);
+                        if (obj != null)
+                        {
                             return "{\"target\": \"" + obj.Name + "\", \"status\": \"Indexing in progress for this object. Please retry in a few seconds.\", \"totalAffected\": 0}";
                         }
                         return Models.McpResponse.Error("Object not found in index", targetName, null, "The object was not found in the search index or the active Knowledge Base.");
                     }
-                    
-                    // If multiple types match, prioritize Procedures/Transactions/Tables
+
                     foundKey = possibleKeys.FirstOrDefault(k => k.StartsWith("Procedure:", StringComparison.OrdinalIgnoreCase))
                              ?? possibleKeys.FirstOrDefault(k => k.StartsWith("Transaction:", StringComparison.OrdinalIgnoreCase))
                              ?? possibleKeys.FirstOrDefault(k => k.StartsWith("Table:", StringComparison.OrdinalIgnoreCase))
                              ?? possibleKeys.First();
-                    
+
                     index.Objects.TryGetValue(foundKey, out targetNode);
                 }
 
-                targetName = targetNode.Name; // Use canonical name
-
-                var affected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var queue = new Queue<string>();
-
-                // Direct callers
-                if (targetNode.CalledBy != null)
+                if (targetNode == null)
                 {
-                    foreach (var caller in targetNode.CalledBy)
-                    {
-                        if (!affected.Contains(caller))
-                        {
-                            affected.Add(caller);
-                            queue.Enqueue(caller);
-                        }
-                    }
+                    return Models.McpResponse.Error("Object not found in index", targetName, null, "The object was not found in the search index or the active Knowledge Base.");
                 }
 
-                // BFS Transitive
-                while (queue.Count > 0)
-                {
-                    var current = queue.Dequeue();
-                    if (index.Objects.TryGetValue(current, out var node))
-                    {
-                        if (node.CalledBy != null)
-                        {
-                            foreach (var caller in node.CalledBy)
-                            {
-                                if (!affected.Contains(caller))
-                                {
-                                    affected.Add(caller);
-                                    queue.Enqueue(caller);
-                                }
-                            }
-                        }
-                    }
-                }
+                targetName = targetNode.Name; // canonical name
 
-                // Calculate Score
+                // 3) Delegate the BFS to the unified graph service.
+                var graph = _graph ?? new CallerGraphService(_indexCacheService);
+                var callersResult = graph.GetCallersTransitive(targetName, 200);
+                var calleesResult = graph.GetCalleesTransitive(targetName, 200);
+
+                // De-dupe + index-aware enrichment (score / entry points / etc.).
+                var affected = new HashSet<string>(callersResult.Nodes, StringComparer.OrdinalIgnoreCase);
+
                 int score = 0;
                 var entryPoints = new List<string>();
-
                 foreach (var name in affected)
                 {
-                    if (index.Objects.TryGetValue(name, out var node))
+                    if (index.Objects.TryGetValue(name, out var node) ||
+                        TryFindByBareName(index, name, out node))
                     {
-                        score += GetTypeWeight(node.Type);
-                        if (IsEntryPoint(node)) entryPoints.Add(name);
+                        if (node != null)
+                        {
+                            score += GetTypeWeight(node.Type);
+                            if (IsEntryPoint(node)) entryPoints.Add(name);
+                        }
                     }
                 }
 
                 var json = new JObject();
+                json["status"] = "Ready";
                 json["target"] = targetName;
                 json["totalAffected"] = affected.Count;
                 json["blastRadiusScore"] = score;
                 json["riskLevel"] = score > 100 ? "High" : (score > 20 ? "Medium" : "Low");
-                
+
+                var callersArr = new JArray();
+                foreach (var c in callersResult.Nodes) callersArr.Add(c);
+                json["callers"] = callersArr;
+                json["callersTruncated"] = callersResult.Truncated;
+
+                var calleesArr = new JArray();
+                foreach (var c in calleesResult.Nodes) calleesArr.Add(c);
+                json["callees"] = calleesArr;
+                json["calleesTruncated"] = calleesResult.Truncated;
+                json["maxDepth"] = Math.Max(callersResult.Depth, calleesResult.Depth);
+
                 var topEntryPoints = new JArray();
-                foreach(var ep in entryPoints.Take(50)) topEntryPoints.Add(ep);
+                foreach (var ep in entryPoints.Take(50)) topEntryPoints.Add(ep);
                 json["affectedEntryPoints"] = topEntryPoints;
 
                 var topAffected = new JArray();
-                foreach(var aff in affected.Take(50)) topAffected.Add(aff);
+                foreach (var aff in affected.Take(50)) topAffected.Add(aff);
                 json["topImpacted"] = topAffected;
 
                 return json.ToString();
@@ -192,6 +239,25 @@ namespace GxMcp.Worker.Services
             {
                 return "{\"error\": \"Impact Analysis failed: " + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
             }
+        }
+
+        // Helper: graph service returns bare names (e.g. "A"), but the index
+        // keys things as "Type:Name". Resolve a bare name back to its entry by
+        // scanning the keys once we don't have a direct hit.
+        private static bool TryFindByBareName(SearchIndex index, string bareName, out SearchIndex.IndexEntry entry)
+        {
+            entry = null;
+            if (index?.Objects == null || string.IsNullOrEmpty(bareName)) return false;
+            foreach (var kv in index.Objects)
+            {
+                var v = kv.Value;
+                if (v != null && string.Equals(v.Name, bareName, StringComparison.OrdinalIgnoreCase))
+                {
+                    entry = v;
+                    return true;
+                }
+            }
+            return false;
         }
 
         private int GetTypeWeight(string type)

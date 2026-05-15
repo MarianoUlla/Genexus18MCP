@@ -31,7 +31,12 @@ namespace GxMcp.Gateway.Routers
                         case "hierarchy":
                             return new { module = "Analyze", action = "GetHierarchy", target = target, type = type };
                         case "impact":
-                            return new { module = "Analyze", action = "Analyze", target = target, type = type };
+                            // v2.3.8 (Task 1.4): delegate to ImpactAnalysis with index-readiness envelope.
+                            bool waitForIndex = args?["waitForIndex"]?.ToObject<bool?>() ?? true;
+                            int? waitTimeoutMs = args?["waitTimeoutMs"]?.ToObject<int?>();
+                            var impactParams = new JObject { ["waitForIndex"] = waitForIndex };
+                            if (waitTimeoutMs.HasValue) impactParams["waitTimeoutMs"] = waitTimeoutMs.Value;
+                            return new { module = "Analyze", action = "ImpactAnalysis", target = target, type = type, @params = impactParams };
                         case "data_context":
                             return new { module = "Analyze", action = "GetDataContext", target = target, type = type };
                         case "ui_context":

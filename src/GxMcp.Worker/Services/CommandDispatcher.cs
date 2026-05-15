@@ -71,7 +71,7 @@ namespace GxMcp.Worker.Services
             _navigationSqlService = new NavigationSqlService(_navigationService);
             _listService = new ListService(_kbService, _indexCacheService);
             _uiService = new UIService(_kbService, _objectService);
-            _analyzeService = new AnalyzeService(_kbService, _objectService, _indexCacheService, _navigationService, _uiService);
+            _analyzeService = new AnalyzeService(_kbService, _objectService, _indexCacheService, _navigationService, _uiService, new CallerGraphService(_indexCacheService, _objectService));
             _summarizeService = new SummarizeService(_kbService, _objectService);
             _injectionService = new InjectionService(_kbService, _objectService, _analyzeService);
             _patternAnalysisService = new PatternAnalysisService(_objectService);
@@ -398,6 +398,13 @@ namespace GxMcp.Worker.Services
                             return _dataInsightService.GetTableDDL(target, includeSub);
                         }
                         if (action == "ExplainCode") return _analyzeService.ExplainCode(target, payload);
+                        if (action == "ImpactAnalysis")
+                        {
+                            // v2.3.8 (Task 1.4): index-aware impact with optional wait-for-index.
+                            bool waitForIndex = args?["waitForIndex"]?.ToObject<bool?>() ?? true;
+                            int waitTimeoutMs = args?["waitTimeoutMs"]?.ToObject<int?>() ?? 30000;
+                            return _analyzeService.ImpactAnalysis(target, waitForIndex, waitTimeoutMs);
+                        }
                         if (action == "InjectContext")
                         {
                             bool recursive = args?["recursive"]?.ToObject<bool>() ?? false;
