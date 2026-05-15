@@ -1928,7 +1928,25 @@ namespace GxMcp.Gateway
                                 ["content"] = new JArray { new JObject { ["type"] = "text", ["text"] = axiPayload.ToString(Formatting.None) } }
                             };
 
-                            if (!isErr && !tName.Contains("write") && !tName.Contains("patch") && !isLiveTool)
+                            // v2.3.8 (post-self-review) — don't cache transient envelopes.
+                            // A "Reindexing"/"IndexCold"/"Timeout"/"Cancelled"/"BuildPlanTooLarge"
+                            // response is a snapshot of the worker's current state, not a stable
+                            // semantic answer. Caching it kept analyze impact pinned to the
+                            // first response (often Timeout during a reindex), so callers got
+                            // the same stale envelope on every retry until cache eviction.
+                            bool isTransient = false;
+                            if (finalResult is JObject transientCheck)
+                            {
+                                var s = transientCheck["status"]?.ToString();
+                                isTransient = string.Equals(s, "Reindexing", StringComparison.OrdinalIgnoreCase)
+                                              || string.Equals(s, "IndexCold", StringComparison.OrdinalIgnoreCase)
+                                              || string.Equals(s, "Timeout", StringComparison.OrdinalIgnoreCase)
+                                              || string.Equals(s, "Cancelled", StringComparison.OrdinalIgnoreCase)
+                                              || string.Equals(s, "BuildPlanTooLarge", StringComparison.OrdinalIgnoreCase)
+                                              || string.Equals(s, "Running", StringComparison.OrdinalIgnoreCase);
+                            }
+
+                            if (!isErr && !isTransient && !tName.Contains("write") && !tName.Contains("patch") && !isLiveTool)
                             {
                                 // Store full envelope in semantic cache (rebuilt on hit above)
                                 _semanticCache[cKey] = new JObject
