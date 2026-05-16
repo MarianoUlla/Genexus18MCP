@@ -66,6 +66,7 @@ namespace GxMcp.Gateway
         private static HttpSessionRegistry _httpSessions = new HttpSessionRegistry(TimeSpan.FromMinutes(10));
         private static IdempotencyCache _idempotencyCache = new IdempotencyCache(15, 1000);
         private static readonly OperationTracker _operationTracker = new OperationTracker(TimeSpan.FromMinutes(60));
+        internal static OperationTracker OperationTracker => _operationTracker;
         internal static BackgroundJobRegistry JobRegistry = new BackgroundJobRegistry(600);
         private static int _workerWarmupStarted;
         private static int _indexBootstrapStarted;

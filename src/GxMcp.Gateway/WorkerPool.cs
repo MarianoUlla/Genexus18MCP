@@ -123,6 +123,10 @@ namespace GxMcp.Gateway
                     _entries.TryRemove(capturedHandle.NormalizedAlias, out _);
                 };
                 worker.Start();
+                if (worker.SpawnMs.HasValue)
+                {
+                    Program.OperationTracker.RegisterSpawnSample(handle.NormalizedAlias, worker.SpawnMs.Value);
+                }
                 entry.Worker = worker;
                 entry.LastActivityUtc = DateTime.UtcNow;
                 return worker;
