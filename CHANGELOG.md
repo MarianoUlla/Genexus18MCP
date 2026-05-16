@@ -25,6 +25,10 @@
 - **Error UX**: `genexus_edit` now embeds alternative matches inline (`alternatives` array) when
   an object name is ambiguous, so callers no longer need a separate `genexus_list_objects` turn
   to disambiguate.
+- **Streaming**: long-running operations now emit `notifications/progress` bound to their
+  `operationId`. Build phases, impact-analysis BFS, and KB index report incremental progress
+  so the LLM can read status without polling `genexus_lifecycle action=status`. The gateway
+  already forwards `notifications/progress` to both stdio and HTTP transports.
 
 ## v2.3.8 — 2026-05-15
 
