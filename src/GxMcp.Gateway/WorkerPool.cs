@@ -55,6 +55,17 @@ namespace GxMcp.Gateway
             return _entries.Count >= max;
         }
 
+        public IReadOnlyList<string> GetKnownAliases()
+        {
+            return _entries.Keys.ToList();
+        }
+
+        public WorkerProcess? TryGetWorker(string alias)
+        {
+            if (_entries.TryGetValue(alias, out var entry)) return entry.Worker;
+            return null;
+        }
+
         public WorkerProcess? TryGet(string alias)
         {
             if (_entries.TryGetValue(alias.ToLowerInvariant(), out var entry))

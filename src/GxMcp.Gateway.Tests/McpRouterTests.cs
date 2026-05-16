@@ -738,5 +738,25 @@ namespace GxMcp.Gateway.Tests
             Assert.Contains(templates, t =>
                 string.Equals(t["uriTemplate"]?.ToString(), "genexus://kb/tool-help/{name}", System.StringComparison.OrdinalIgnoreCase));
         }
+
+        [Fact]
+        public void HealthResource_IncludesSpawnAndSdkInitBlocks()
+        {
+            var request = JObject.Parse(@"{
+                ""method"": ""resources/read"",
+                ""params"": { ""uri"": ""genexus://kb/health"" }
+            }");
+
+            var result = McpRouter.Handle(request);
+            Assert.NotNull(result);
+
+            var json = JObject.FromObject(result!);
+            var contents = (JArray)json["contents"]!;
+            var first = (JObject)contents[0];
+            var body = first["text"]!.ToString();
+
+            Assert.Contains("spawnMs", body);
+            Assert.Contains("sdkInitMs", body);
+        }
     }
 }

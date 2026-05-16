@@ -692,6 +692,23 @@ namespace GxMcp.Gateway
         private static object? BuildStaticResourceResponse(JObject request)
         {
             string uri = request["params"]?["uri"]?.ToString() ?? string.Empty;
+
+            if (string.Equals(uri, "genexus://kb/health", StringComparison.OrdinalIgnoreCase))
+            {
+                return new
+                {
+                    contents = new[]
+                    {
+                        new
+                        {
+                            uri = "genexus://kb/health",
+                            mimeType = "text/markdown",
+                            text = BuildHealthReport()
+                        }
+                    }
+                };
+            }
+
             if (string.Equals(uri, "genexus://kb/agent-playbook", StringComparison.OrdinalIgnoreCase))
             {
                 return new
@@ -746,6 +763,38 @@ namespace GxMcp.Gateway
             }
 
             return null;
+        }
+
+        private static string BuildHealthReport()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("# Gateway Health Report");
+            sb.AppendLine();
+            sb.AppendLine("## Latency");
+
+            var pool = Program.GetWorkerPool();
+            var aliases = pool?.GetKnownAliases() ?? System.Array.Empty<string>();
+
+            sb.AppendLine("| KB | spawnMs samples | spawnMs p50 | spawnMs p95 | spawnMs lastMs | sdkInitMs lastMs |");
+            sb.AppendLine("|---|---|---|---|---|---|");
+
+            if (aliases.Count == 0)
+            {
+                sb.AppendLine("| _(no KBs tracked)_ | — | — | — | — | — |");
+            }
+            else
+            {
+                foreach (var alias in aliases)
+                {
+                    var (count, p50, p95) = Program.OperationTracker.GetSpawnStats(alias);
+                    var worker = pool?.TryGetWorker(alias);
+                    var lastSpawn = worker?.SpawnMs?.ToString() ?? "n/a";
+                    var lastSdkInit = worker?.SdkInitMs?.ToString() ?? "n/a";
+                    sb.AppendLine($"| {alias} | {count} | {p50:0.#} | {p95:0.#} | {lastSpawn} | {lastSdkInit} |");
+                }
+            }
+
+            return sb.ToString();
         }
 
         private static string BuildAgentPlaybook()
