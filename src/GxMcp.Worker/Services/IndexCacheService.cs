@@ -55,7 +55,9 @@ namespace GxMcp.Worker.Services
                     LastIndexedAt = _state.LastIndexedAt,
                     TotalObjects = _state.TotalObjects,
                     Progress = _state.Progress,
-                    EtaMs = _state.EtaMs
+                    EtaMs = _state.EtaMs,
+                    LitePassCompletedUtc = _state.LitePassCompletedUtc,
+                    EnrichmentStartedUtc = _state.EnrichmentStartedUtc
                 };
             }
         }
@@ -100,6 +102,27 @@ namespace GxMcp.Worker.Services
                 _state.TotalObjects = totalObjects;
                 _state.Progress = null;
                 _state.EtaMs = null;
+            }
+        }
+
+        public void MarkLitePassComplete(int totalObjects)
+        {
+            lock (_stateLock)
+            {
+                _state.Status = "LiteReady";
+                _state.TotalObjects = totalObjects;
+                _state.LitePassCompletedUtc = DateTime.UtcNow;
+                _state.Progress = 1.0;
+                _state.EtaMs = 0;
+            }
+        }
+
+        public void MarkEnrichmentStarted()
+        {
+            lock (_stateLock)
+            {
+                _state.Status = "Enriching";
+                _state.EnrichmentStartedUtc = DateTime.UtcNow;
             }
         }
 
