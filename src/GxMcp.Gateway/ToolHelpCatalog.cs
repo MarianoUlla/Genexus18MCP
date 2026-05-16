@@ -96,7 +96,31 @@ namespace GxMcp.Gateway
                 "## Examples\n" +
                 "- `{ name: 'InvoiceProc', parts: ['Source', 'Variables'] }`\n" +
                 "- `{ name: 'OrderTrn', parts: ['Rules'], offset: 0, limit: 200 }`\n" +
-                "- `{ targets: [{ name: 'A' }, { name: 'B' }], parts: ['Source'] }`\n"
+                "- `{ targets: [{ name: 'A' }, { name: 'B' }], parts: ['Source'] }`\n",
+
+            ["genexus_edit_and_build"] =
+                "# genexus_edit_and_build\n\n" +
+                "Edit an object and rebuild its callers in one call.\n\n" +
+                "## Required\n" +
+                "- `name` — object to edit\n" +
+                "- `part` — which part (e.g., `Source`, `Rules`)\n" +
+                "- `content` — full text or unified diff\n\n" +
+                "## Optional\n" +
+                "- `mode` — `patch` (default) or `full`\n" +
+                "- `type` — disambiguates when name matches multiple objects\n" +
+                "- `dryRun` — preview without persisting (default `false`)\n" +
+                "- `buildIncludeCallees` — `none` | `direct` (default) | `transitive`\n" +
+                "- `buildPlanCap` — max build-plan size (default 200)\n\n" +
+                "## Response\n" +
+                "Returns a composite envelope with three blocks:\n" +
+                "- `edit` — the diff from genexus_edit\n" +
+                "- `impact` — output of genexus_analyze mode=impact (callers, risk, etc.)\n" +
+                "- `build` — `{ taskId, status: 'Accepted' }` for async build, or `{ status: 'Skipped' }` when no callers\n\n" +
+                "Poll the build via `genexus_lifecycle action=status target=op:<taskId>`.\n\n" +
+                "## Errors\n" +
+                "If `name` matches multiple objects, the edit phase aborts and the envelope returns `status=Error` with an `alternatives` array — retry with one of the (`name`, `type`) pairs.\n\n" +
+                "## Example\n" +
+                "`{ name: 'InvoiceProc', part: 'Source', mode: 'patch', content: '<diff>', buildIncludeCallees: 'direct' }`\n"
         };
 
         internal static string? Get(string toolName)

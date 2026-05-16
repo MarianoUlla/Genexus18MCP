@@ -758,5 +758,25 @@ namespace GxMcp.Gateway.Tests
             Assert.Contains("spawnMs", body);
             Assert.Contains("sdkInitMs", body);
         }
+
+        [Fact]
+        public void GenexusEditAndBuild_RoutesToEditAndBuildModule()
+        {
+            var args = JObject.Parse(@"{
+                ""name"": ""InvoiceProc"",
+                ""part"": ""Source"",
+                ""content"": ""@@ -1 +1 @@\n-old\n+new"",
+                ""mode"": ""patch""
+            }");
+
+            var router = new GxMcp.Gateway.Routers.ObjectRouter();
+            var converted = router.ConvertToolCall("genexus_edit_and_build", args);
+
+            var json = JObject.FromObject(converted!);
+            Assert.Equal("EditAndBuild", json["module"]?.ToString());
+            Assert.Equal("Orchestrate",  json["action"]?.ToString());
+            Assert.Equal("InvoiceProc",  json["target"]?.ToString());
+            Assert.NotNull(json["args"]);
+        }
     }
 }

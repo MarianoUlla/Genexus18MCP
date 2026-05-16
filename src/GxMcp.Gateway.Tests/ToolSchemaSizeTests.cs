@@ -46,7 +46,8 @@ namespace GxMcp.Gateway.Tests
             // (tool description trim) will reclaim space and lower this back to 4900.
             //   v2.4.0 (SP2.T3): 5200 → 5000 (description trim; long-form moved to genexus://kb/tool-help/{name};
             //   actual ~4956 — budget set to 5000, tighten further once remaining descriptions are trimmed)
-            Assert.True(approxTokens < 5000, $"tool_definitions.json is ~{approxTokens} tokens; budget 5000.");
+            //   v2.4.0 (SP4.T5): 5000 → 5300 to accommodate genexus_edit_and_build composite tool (~240 tokens).
+            Assert.True(approxTokens < 5300, $"tool_definitions.json is ~{approxTokens} tokens; budget 5300.");
         }
     }
 }
