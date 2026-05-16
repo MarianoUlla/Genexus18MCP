@@ -677,5 +677,106 @@ namespace GxMcp.Gateway.Tests
 
             Assert.False(GatewayProcessLease.IsLeaseActive(lease));
         }
+
+        [Fact]
+        public void ToolHelpCatalog_HasEntriesForTrimmedTools()
+        {
+            string[] expected = { "genexus_query", "genexus_lifecycle", "genexus_edit", "genexus_analyze", "genexus_read" };
+            foreach (var name in expected)
+            {
+                var help = ToolHelpCatalog.Get(name);
+                Assert.False(string.IsNullOrWhiteSpace(help), $"No help text for {name}");
+                Assert.True(help!.Length >= 200, $"Help for {name} should be more detailed than the trimmed description");
+            }
+        }
+
+        [Fact]
+        public void ToolHelpCatalog_ReturnsNullForUnknownTool()
+        {
+            Assert.Null(ToolHelpCatalog.Get("genexus_unknown_tool"));
+        }
+
+        [Fact]
+        public void ResourcesRead_ToolHelp_ReturnsMarkdownForKnownTool()
+        {
+            var request = JObject.Parse(@"{
+                ""method"": ""resources/read"",
+                ""params"": { ""uri"": ""genexus://kb/tool-help/genexus_query"" }
+            }");
+
+            var result = McpRouter.Handle(request);
+            Assert.NotNull(result);
+
+            var json = JObject.FromObject(result!);
+            var contents = (JArray)json["contents"]!;
+            var first = (JObject)contents[0];
+            Assert.Equal("genexus://kb/tool-help/genexus_query", first["uri"]!.ToString());
+            Assert.Equal("text/markdown", first["mimeType"]!.ToString());
+            Assert.Contains("Query prefixes", first["text"]!.ToString());
+        }
+
+        [Fact]
+        public void ResourcesRead_ToolHelp_ReturnsNullForUnknownTool()
+        {
+            var request = JObject.Parse(@"{
+                ""method"": ""resources/read"",
+                ""params"": { ""uri"": ""genexus://kb/tool-help/genexus_does_not_exist"" }
+            }");
+            var result = McpRouter.Handle(request);
+            Assert.Null(result);
+        }
+
+        [Fact]
+        public void ResourcesTemplatesList_IncludesToolHelpTemplate()
+        {
+            var request = JObject.Parse(@"{ ""method"": ""resources/templates/list"" }");
+            var result = McpRouter.Handle(request);
+            Assert.NotNull(result);
+
+            var json = JObject.FromObject(result!);
+            var templates = (JArray)json["resourceTemplates"]!;
+            Assert.Contains(templates, t =>
+                string.Equals(t["uriTemplate"]?.ToString(), "genexus://kb/tool-help/{name}", System.StringComparison.OrdinalIgnoreCase));
+        }
+
+        [Fact]
+        public void HealthResource_IncludesSpawnAndSdkInitBlocks()
+        {
+            var request = JObject.Parse(@"{
+                ""method"": ""resources/read"",
+                ""params"": { ""uri"": ""genexus://kb/health"" }
+            }");
+
+            var result = McpRouter.Handle(request);
+            Assert.NotNull(result);
+
+            var json = JObject.FromObject(result!);
+            var contents = (JArray)json["contents"]!;
+            var first = (JObject)contents[0];
+            var body = first["text"]!.ToString();
+
+            Assert.Contains("spawnMs", body);
+            Assert.Contains("sdkInitMs", body);
+        }
+
+        [Fact]
+        public void GenexusEditAndBuild_RoutesToEditAndBuildModule()
+        {
+            var args = JObject.Parse(@"{
+                ""name"": ""InvoiceProc"",
+                ""part"": ""Source"",
+                ""content"": ""@@ -1 +1 @@\n-old\n+new"",
+                ""mode"": ""patch""
+            }");
+
+            var router = new GxMcp.Gateway.Routers.ObjectRouter();
+            var converted = router.ConvertToolCall("genexus_edit_and_build", args);
+
+            var json = JObject.FromObject(converted!);
+            Assert.Equal("EditAndBuild", json["module"]?.ToString());
+            Assert.Equal("Orchestrate",  json["action"]?.ToString());
+            Assert.Equal("InvoiceProc",  json["target"]?.ToString());
+            Assert.NotNull(json["args"]);
+        }
     }
 }

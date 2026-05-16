@@ -12,7 +12,7 @@ using GxMcp.Worker.Models;
 
 namespace GxMcp.Worker.Services
 {
-    public class WriteService
+    public class WriteService : IWriteServiceFacade
     {
         private readonly ObjectService _objectService;
         private readonly PatternAnalysisService _patternAnalysisService;
@@ -522,6 +522,29 @@ namespace GxMcp.Worker.Services
             }
         }
 
+        // IWriteServiceFacade adapter — translates JObject args into the canonical WriteObject call.
+        public string WriteObject(string target, JObject args)
+        {
+            string mode = args?["mode"]?.ToString();
+            string action = string.Equals(mode, "patch", StringComparison.OrdinalIgnoreCase) ? "WritePatch" : "WriteObject";
+            JObject payload = args?["content"] as JObject;
+            if (payload == null && args?["content"] != null)
+            {
+                payload = new JObject { ["text"] = args["content"].ToString() };
+            }
+            if (payload == null) payload = new JObject();
+
+            return WriteObject(
+                target,
+                action,
+                payload?.ToString(),
+                args?["type"]?.ToString(),
+                true,
+                false,
+                true,
+                args?["dryRun"]?.ToObject<bool?>() ?? false);
+        }
+
         public string WriteObject(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)
         {
             string raw = WriteObjectInternal(target, partName, code, typeFilter, autoValidate, preferFastSourceSave, autoInjectVariables, dryRun);
@@ -547,6 +570,40 @@ namespace GxMcp.Worker.Services
                 }
 
                 Logger.Info(string.Format("[DEBUG-SAVE] Request received for {0} (Part: {1}, Code Length: {2})", target, partName, decodedCode?.Length ?? 0));
+
+                // SP4.T1: When no type filter is given and the index contains multiple entries
+                // with the same name (different types), return an inline alternatives array so
+                // the caller can disambiguate without a separate list_objects round-trip.
+                if (typeFilter == null && !target.Contains(":"))
+                {
+                    var candidates = _objectService.FindCandidateEntries(target);
+                    // Only signal ambiguity when there are genuinely different types; a single
+                    // entry (or all entries of the same type) is not ambiguous.
+                    var distinctTypes = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var c in candidates) { if (!string.IsNullOrEmpty(c.Type)) distinctTypes.Add(c.Type); }
+                    if (distinctTypes.Count > 1)
+                    {
+                        var alternatives = new JArray();
+                        foreach (var c in candidates)
+                        {
+                            alternatives.Add(new JObject
+                            {
+                                ["name"] = c.Name,
+                                ["type"] = c.Type,
+                                ["parentPath"] = c.ParentPath ?? c.Path ?? string.Empty
+                            });
+                        }
+                        return new JObject
+                        {
+                            ["status"] = "Error",
+                            ["error"] = "Ambiguous object name",
+                            ["target"] = target,
+                            ["suggestion"] = "Disambiguate by passing 'type' or by using a fully-qualified parentPath.",
+                            ["alternatives"] = alternatives,
+                            ["hint"] = "Retry with one of the alternatives' (name, type) pairs."
+                        }.ToString();
+                    }
+                }
 
                 var obj = _objectService.FindObject(target, typeFilter);
                 if (obj == null) {

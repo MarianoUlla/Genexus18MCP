@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="GxMcp.Gateway.Tests" />
+    <InternalsVisibleTo Include="GxMcp.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>

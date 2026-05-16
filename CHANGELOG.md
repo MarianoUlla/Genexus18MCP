@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.4.0 — Unreleased
+
+### Changed
+
+- **BREAKING (envelope)**: `axiCompact` now defaults to `true` for `genexus_query` and
+  `genexus_list_objects`. Callers that relied on full payloads must now pass
+  `axiCompact: false` explicitly. The flag is declared in `inputSchema` for discoverability.
+- **Token reduction**: `tool_definitions.json` shrunk from ~5200 to ~4956 tokens by trimming
+  the descriptions of `genexus_query`, `genexus_lifecycle`, `genexus_edit`, `genexus_analyze`,
+  and `genexus_read`. Long-form help is now served on demand at
+  `genexus://kb/tool-help/{name}` via the MCP resources protocol.
+
+### Added
+
+- **Observability**: worker spawn time and SDK init time are now measured per KB and exposed via
+  `genexus://kb/health` (`spawnMs` samples + p50/p95, `sdkInitMs.lastMs`). New
+  `src/GxMcp.Benchmarks` project provides a BenchmarkDotNet baseline for envelope projection,
+  tool-definition loading, and spawn-tracker hot paths.
+- **New tool**: `genexus_edit_and_build` collapses the edit → analyze impact → build callers
+  workflow from 3-5 turns into a single call. Returns a composite envelope with `edit`, `impact`,
+  and `build` blocks. The build runs asynchronously and is polled via
+  `genexus_lifecycle action=status target=op:<taskId>`.
+- **Error UX**: `genexus_edit` now embeds alternative matches inline (`alternatives` array) when
+  an object name is ambiguous, so callers no longer need a separate `genexus_list_objects` turn
+  to disambiguate.
+- **Streaming**: long-running operations now emit `notifications/progress` bound to their
+  `operationId`. Build phases, impact-analysis BFS, and KB index report incremental progress
+  so the LLM can read status without polling `genexus_lifecycle action=status`. The gateway
+  already forwards `notifications/progress` to both stdio and HTTP transports.
+- **Fast index**: `BulkIndex` is now split into a lite pass (metadata only, ~30-45s on a
+  38k-object KB) followed by background enrichment. `genexus_list_objects`, `genexus_read`,
+  and `genexus_inspect` are usable immediately after the lite pass. `genexus_analyze
+  mode=impact` enriches only the target's reachable graph on demand, returning in seconds
+  even before full enrichment finishes. The legacy monolithic path is preserved behind
+  the `Indexing.UseLitePass=false` flag in App.config for rollback safety.
+
 ## v2.3.8 — 2026-05-15
 
 Two waves into a single release. Wave 1 (morning) shipped the six new tools and

@@ -55,6 +55,7 @@ namespace GxMcp.Worker.Services
         private readonly ExportObjectService _exportObjectService;
         private readonly DiffService _diffService;
         private readonly ApplyTemplateService _applyTemplateService;
+        private readonly EditAndBuildOrchestrator _editAndBuildOrchestrator;
 
         private CommandDispatcher()
         {
@@ -103,6 +104,7 @@ namespace GxMcp.Worker.Services
             _exportObjectService = new ExportObjectService(_objectService);
             _diffService = new DiffService(_objectService);
             _applyTemplateService = new ApplyTemplateService(_writeService);
+            _editAndBuildOrchestrator = new EditAndBuildOrchestrator(_writeService, _analyzeService, _buildService);
 
             // Phase 2: Late Linking
             _kbService.SetBuildService(_buildService);
@@ -174,8 +176,14 @@ namespace GxMcp.Worker.Services
                 var payload = request["payload"]?.ToString();
                 var args = request["params"] as JObject;
 
+                string progressToken = request["_meta"] != null
+                    ? request["_meta"]["progressToken"]?.ToString()
+                    : null;
+
                 Logger.Info(string.Format("[DISPATCHER] Method: {0}, Action: {1}, Target: {2}", method, action, target));
 
+                using (GxMcp.Worker.Helpers.ProgressContext.Use(progressToken))
+                {
                 switch (method?.ToLower())
                 {
                     case "ping": return "{\"status\":\"pong\"}";
@@ -408,6 +416,12 @@ namespace GxMcp.Worker.Services
                             false,
                             true,
                             args?["dryRun"]?.ToObject<bool?>() ?? false);
+                    case "editandbuild":
+                        if (action == "Orchestrate")
+                        {
+                            return _editAndBuildOrchestrator.Orchestrate(args ?? new JObject());
+                        }
+                        break;
                     case "semanticops":
                         if (action == "Apply") return _writeService.ApplySemanticOps(args ?? request);
                         break;
@@ -647,6 +661,7 @@ namespace GxMcp.Worker.Services
                     action,
                     string.Format("Unsupported dispatch combination. Method='{0}', Action='{1}'.", method ?? "", action ?? "")
                 );
+                } // end using ProgressContext
             }
             catch (Exception ex)
             {

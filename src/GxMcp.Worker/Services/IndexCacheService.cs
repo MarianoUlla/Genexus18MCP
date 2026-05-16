@@ -55,7 +55,9 @@ namespace GxMcp.Worker.Services
                     LastIndexedAt = _state.LastIndexedAt,
                     TotalObjects = _state.TotalObjects,
                     Progress = _state.Progress,
-                    EtaMs = _state.EtaMs
+                    EtaMs = _state.EtaMs,
+                    LitePassCompletedUtc = _state.LitePassCompletedUtc,
+                    EnrichmentStartedUtc = _state.EnrichmentStartedUtc
                 };
             }
         }
@@ -100,6 +102,27 @@ namespace GxMcp.Worker.Services
                 _state.TotalObjects = totalObjects;
                 _state.Progress = null;
                 _state.EtaMs = null;
+            }
+        }
+
+        public void MarkLitePassComplete(int totalObjects)
+        {
+            lock (_stateLock)
+            {
+                _state.Status = "LiteReady";
+                _state.TotalObjects = totalObjects;
+                _state.LitePassCompletedUtc = DateTime.UtcNow;
+                _state.Progress = 1.0;
+                _state.EtaMs = 0;
+            }
+        }
+
+        public void MarkEnrichmentStarted()
+        {
+            lock (_stateLock)
+            {
+                _state.Status = "Enriching";
+                _state.EnrichmentStartedUtc = DateTime.UtcNow;
             }
         }
 
@@ -847,6 +870,38 @@ namespace GxMcp.Worker.Services
                 _hierarchyCache.Clear(); // PERFORMANCE (W-M5): drop stale hierarchy on KB unload.
             }
         }
+
+        // SP6.T6 — fast-index lite pass uses this to bulk-replace the in-memory index with
+        // stub entries (no SourceSnippet/Calls/CalledBy/Embedding). Keys follow the same
+        // GetEntryStorageKey scheme so subsequent UpdateEntry calls AddOrUpdate cleanly.
+        public void ReplaceAll(IEnumerable<SearchIndex.IndexEntry> entries)
+        {
+            lock (_lock)
+            {
+                var idx = new SearchIndex();
+                if (entries != null)
+                {
+                    foreach (var e in entries)
+                    {
+                        if (e == null || string.IsNullOrEmpty(e.Name)) continue;
+                        string key = GetEntryStorageKey(e);
+                        idx.Objects[key] = e;
+                    }
+                }
+                idx.LastUpdated = DateTime.UtcNow;
+                BuildParentIndex(idx);
+                _index = idx;
+                _initialized = true;
+            }
+        }
+
+        // SP6.T6 — wires the EnrichmentQueue produced by KbService so callers (analyze, etc.)
+        // can PromoteAsync individual entries on demand instead of waiting for the background
+        // drain to reach them.
+        private EnrichmentQueue _enrichmentQueue;
+
+        public void SetEnrichmentQueue(EnrichmentQueue queue) { _enrichmentQueue = queue; }
+        public EnrichmentQueue GetEnrichmentQueue() { return _enrichmentQueue; }
 
         // v2.3.8 (post-self-review) — companion to Clear() for force-reindex.
         // Removes the on-disk snapshot files so the next GetIndex() hydration

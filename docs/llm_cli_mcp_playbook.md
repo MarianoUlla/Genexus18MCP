@@ -61,7 +61,7 @@ Gateway AXI-like enrichments are additive (under `_meta` — underscore-prefixed
 
 Optional shaping for `genexus_query` and `genexus_list_objects`:
 - `fields`: array or CSV projection.
-- `axiCompact=true`: compact default projection.
+- `axiCompact`: defaults to `true`; pass `axiCompact: false` to receive the full payload.
 
 ## High-Value Query Patterns
 
@@ -114,8 +114,8 @@ Always set:
 - `offset` and `limit` for `genexus_read`.
 
 Prefer:
-- `fields` or `axiCompact=true` on list-heavy calls.
 - Multiple narrow calls over one large payload.
+- `genexus_query` and `genexus_list_objects` return a compact projection by default (`name`, `type`, `path`[, `parentPath`]). Pass `axiCompact: false` only when you need the full payload (description, metadata, etc.), or use `fields` for a custom subset.
 
 ## Error Handling Policy for Agents
 
@@ -141,5 +141,5 @@ Find + inspect + patch:
 4. `genexus_edit(... dryRun=false ...)`
 
 Large list with deterministic follow-up:
-1. `genexus_list_objects(parentPath='Root Module', limit=200, offset=0, axiCompact=true)`
+1. `genexus_list_objects(parentPath='Root Module', limit=200, offset=0)` — compact projection is on by default; pass `axiCompact: false` if you need the full payload.
 2. If `hasMore=true`, call again with `offset=nextOffset`.

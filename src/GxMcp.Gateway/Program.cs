@@ -66,6 +66,7 @@ namespace GxMcp.Gateway
         private static HttpSessionRegistry _httpSessions = new HttpSessionRegistry(TimeSpan.FromMinutes(10));
         private static IdempotencyCache _idempotencyCache = new IdempotencyCache(15, 1000);
         private static readonly OperationTracker _operationTracker = new OperationTracker(TimeSpan.FromMinutes(60));
+        internal static OperationTracker OperationTracker => _operationTracker;
         internal static BackgroundJobRegistry JobRegistry = new BackgroundJobRegistry(600);
         private static int _workerWarmupStarted;
         private static int _indexBootstrapStarted;
@@ -954,9 +955,9 @@ namespace GxMcp.Gateway
             } catch (Exception ex) { Log($"HandleWorkerResponse Error: {ex.Message}"); }
         }
 
-        private static JObject BuildWorkerRpcRequest(JObject workerCommand, string requestId)
+        private static JObject BuildWorkerRpcRequest(JObject workerCommand, string requestId, string? operationId = null)
         {
-            return new JObject
+            var rpc = new JObject
             {
                 ["jsonrpc"] = "2.0",
                 ["id"] = requestId,
@@ -966,6 +967,16 @@ namespace GxMcp.Gateway
                 ["payload"] = workerCommand["payload"]?.DeepClone(),
                 ["params"] = workerCommand.DeepClone()
             };
+
+            if (!string.IsNullOrWhiteSpace(operationId))
+            {
+                rpc["_meta"] = new JObject
+                {
+                    ["progressToken"] = operationId
+                };
+            }
+
+            return rpc;
         }
 
         private static async Task<JObject?> SendWorkerCommandAsync(
@@ -998,7 +1009,7 @@ namespace GxMcp.Gateway
             }
 
             workerCommand["correlationId"] = correlationId;
-            var workerRequest = BuildWorkerRpcRequest(workerCommand, requestId);
+            var workerRequest = BuildWorkerRpcRequest(workerCommand, requestId, operationId);
             var worker = await GetActiveWorkerAsync();
             var pending = new PendingWorkerRequest
             {
@@ -2625,14 +2636,19 @@ namespace GxMcp.Gateway
             return projected;
         }
 
+        // Returns true when compact-by-default projection should be applied for tools that
+        // declare a default compact field set in GetDefaultCompactFields. Default behavior
+        // (no axiCompact key) is TRUE — the LLM must pass `axiCompact: false` to opt out.
         private static bool ShouldUseCompactDefaults(JObject? toolArgs)
         {
-            if (toolArgs == null) return false;
+            if (toolArgs == null) return true;
             var token = toolArgs["axiCompact"];
-            if (token == null) return false;
-            return token.Type == JTokenType.Boolean
-                ? token.Value<bool>()
-                : bool.TryParse(token.ToString(), out bool parsed) && parsed;
+            if (token == null) return true;
+            if (token.Type == JTokenType.Boolean)
+            {
+                return token.Value<bool>();
+            }
+            return !bool.TryParse(token.ToString(), out bool parsed) || parsed;
         }
 
         private static HashSet<string>? GetDefaultCompactFields(string toolName)

@@ -247,6 +247,15 @@ namespace GxMcp.Gateway.Routers
                         type = args?["type"]?.ToString()
                     };
 
+                case "genexus_edit_and_build":
+                    return new
+                    {
+                        module = "EditAndBuild",
+                        action = "Orchestrate",
+                        target = args?["name"]?.ToString(),
+                        args = args
+                    };
+
                 default:
                     return null;
             }

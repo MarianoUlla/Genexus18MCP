@@ -40,8 +40,8 @@ Tool response notes (`tools/call` text payload):
 - These enrichments are additive and keep existing response fields for backward compatibility.
 
 Optional response-shaping arguments for list-heavy tools:
-- `genexus_query` and `genexus_list_objects` accept optional `fields` (array or comma-separated string) for field projection.
-- `genexus_query` and `genexus_list_objects` accept optional `axiCompact=true` for compact default projection.
+- `genexus_query` and `genexus_list_objects` accept optional `fields` (array or comma-separated string) for a custom field subset.
+- `axiCompact` defaults to **`true`** for `genexus_query` and `genexus_list_objects`. The compact projection returns only `name`, `type`, and `path` (plus `parentPath` for `genexus_list_objects`). Pass `axiCompact: false` to receive the full payload (description, parent, metadata, etc.).
 - `meta.fields` is returned when field projection is active.
 - `meta.totalByType` may be emitted when result rows expose a `type` field.
 

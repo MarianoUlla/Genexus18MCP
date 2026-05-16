@@ -95,16 +95,16 @@ Prefer checking `patchStatus` and `details` before retrying with larger payload 
 - truncation signal (`_meta.truncated=true`) and contextual `help` hints
 - v2.0.0 fields: `_meta.idempotent`, `_meta.batched`, `_meta.dryRun`, `_meta.removedTools` (see `docs/llm_cli_mcp_playbook.md`)
 
-If a client seems to "lose fields", check whether `fields` or `axiCompact` was passed in the tool arguments for `genexus_query` or `genexus_list_objects`.
+If a response from `genexus_query` or `genexus_list_objects` is missing fields such as `description`, `parent`, or other metadata, the most likely cause is the compact projection being applied. `axiCompact` defaults to **`true`** for both tools, returning only `name`, `type`, and `path` (plus `parentPath` for `genexus_list_objects`).
 
 ### Field projection and compact mode
 
-For list-heavy calls:
+`genexus_query` and `genexus_list_objects` apply compact projection by default:
 
-- `fields`: array or comma-separated list for explicit projection
-- `axiCompact=true`: compact defaults without changing tool semantics
+- To get the full payload (description, parent, metadata, etc.), pass `axiCompact: false` explicitly.
+- To receive a custom subset of fields, use the `fields` parameter (array or comma-separated string).
 
-These options reduce token volume while preserving protocol compatibility.
+These options keep token volume low while preserving protocol compatibility. If you are here because a field is missing, adding `axiCompact: false` to the call is the first thing to try.
 
 ### Save fallback diagnostics
 

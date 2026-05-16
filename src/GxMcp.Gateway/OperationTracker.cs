@@ -251,6 +251,64 @@ namespace GxMcp.Gateway
             }
         }
 
+        private readonly ConcurrentDictionary<string, SpawnSampleRing> _spawnSamples =
+            new ConcurrentDictionary<string, SpawnSampleRing>(StringComparer.OrdinalIgnoreCase);
+
+        public void RegisterSpawnSample(string kbAlias, double ms)
+        {
+            if (string.IsNullOrWhiteSpace(kbAlias)) return;
+            var ring = _spawnSamples.GetOrAdd(kbAlias, _ => new SpawnSampleRing(capacity: 256));
+            ring.Add(ms);
+        }
+
+        public (int Count, double P50, double P95) GetSpawnStats(string kbAlias)
+        {
+            if (!_spawnSamples.TryGetValue(kbAlias, out var ring)) return (0, 0, 0);
+            return ring.Snapshot();
+        }
+
+        private sealed class SpawnSampleRing
+        {
+            private readonly int _capacity;
+            private readonly double[] _buffer;
+            private int _count;
+            private int _next;
+            private readonly object _lock = new object();
+
+            public SpawnSampleRing(int capacity)
+            {
+                _capacity = capacity;
+                _buffer = new double[capacity];
+            }
+
+            public void Add(double sample)
+            {
+                lock (_lock)
+                {
+                    _buffer[_next] = sample;
+                    _next = (_next + 1) % _capacity;
+                    if (_count < _capacity) _count++;
+                }
+            }
+
+            public (int Count, double P50, double P95) Snapshot()
+            {
+                double[] snapshot;
+                int count;
+                lock (_lock)
+                {
+                    count = _count;
+                    snapshot = new double[count];
+                    System.Array.Copy(_buffer, snapshot, count);
+                }
+                if (count == 0) return (0, 0, 0);
+                System.Array.Sort(snapshot);
+                double p50 = snapshot[(int)(count * 0.50)];
+                double p95 = snapshot[System.Math.Min(count - 1, (int)(count * 0.95))];
+                return (count, p50, p95);
+            }
+        }
+
         private sealed class OperationRecord
         {
             public readonly object SyncRoot = new object();

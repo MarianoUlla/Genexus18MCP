@@ -160,6 +160,14 @@ namespace GxMcp.Worker.Services
                     }
                     queue.Enqueue((caller, d + 1));
                 }
+
+                if (visited.Count > 0 && visited.Count % 25 == 0)
+                {
+                    GxMcp.Worker.Helpers.ProgressEmitter.Emit(
+                        progress: System.Math.Min(95, visited.Count),
+                        total: System.Math.Max(100, visited.Count + queue.Count),
+                        message: "Impact analysis: " + visited.Count + " visited, " + queue.Count + " pending");
+                }
             }
 
             result.Depth = maxDepth;
@@ -201,6 +209,14 @@ namespace GxMcp.Worker.Services
                         return result;
                     }
                     queue.Enqueue((callee, d + 1));
+                }
+
+                if (visited.Count > 0 && visited.Count % 25 == 0)
+                {
+                    GxMcp.Worker.Helpers.ProgressEmitter.Emit(
+                        progress: System.Math.Min(95, visited.Count),
+                        total: System.Math.Max(100, visited.Count + queue.Count),
+                        message: "Impact analysis: " + visited.Count + " visited, " + queue.Count + " pending");
                 }
             }
 
