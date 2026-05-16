@@ -18,6 +18,13 @@
   `genexus://kb/health` (`spawnMs` samples + p50/p95, `sdkInitMs.lastMs`). New
   `src/GxMcp.Benchmarks` project provides a BenchmarkDotNet baseline for envelope projection,
   tool-definition loading, and spawn-tracker hot paths.
+- **New tool**: `genexus_edit_and_build` collapses the edit → analyze impact → build callers
+  workflow from 3-5 turns into a single call. Returns a composite envelope with `edit`, `impact`,
+  and `build` blocks. The build runs asynchronously and is polled via
+  `genexus_lifecycle action=status target=op:<taskId>`.
+- **Error UX**: `genexus_edit` now embeds alternative matches inline (`alternatives` array) when
+  an object name is ambiguous, so callers no longer need a separate `genexus_list_objects` turn
+  to disambiguate.
 
 ## v2.3.8 — 2026-05-15
 
