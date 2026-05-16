@@ -548,6 +548,40 @@ namespace GxMcp.Worker.Services
 
                 Logger.Info(string.Format("[DEBUG-SAVE] Request received for {0} (Part: {1}, Code Length: {2})", target, partName, decodedCode?.Length ?? 0));
 
+                // SP4.T1: When no type filter is given and the index contains multiple entries
+                // with the same name (different types), return an inline alternatives array so
+                // the caller can disambiguate without a separate list_objects round-trip.
+                if (typeFilter == null && !target.Contains(":"))
+                {
+                    var candidates = _objectService.FindCandidateEntries(target);
+                    // Only signal ambiguity when there are genuinely different types; a single
+                    // entry (or all entries of the same type) is not ambiguous.
+                    var distinctTypes = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var c in candidates) { if (!string.IsNullOrEmpty(c.Type)) distinctTypes.Add(c.Type); }
+                    if (distinctTypes.Count > 1)
+                    {
+                        var alternatives = new JArray();
+                        foreach (var c in candidates)
+                        {
+                            alternatives.Add(new JObject
+                            {
+                                ["name"] = c.Name,
+                                ["type"] = c.Type,
+                                ["parentPath"] = c.ParentPath ?? c.Path ?? string.Empty
+                            });
+                        }
+                        return new JObject
+                        {
+                            ["status"] = "Error",
+                            ["error"] = "Ambiguous object name",
+                            ["target"] = target,
+                            ["suggestion"] = "Disambiguate by passing 'type' or by using a fully-qualified parentPath.",
+                            ["alternatives"] = alternatives,
+                            ["hint"] = "Retry with one of the alternatives' (name, type) pairs."
+                        }.ToString();
+                    }
+                }
+
                 var obj = _objectService.FindObject(target, typeFilter);
                 if (obj == null) {
                     Logger.Error("[DEBUG-SAVE] Object NOT FOUND: " + target);

@@ -52,6 +52,25 @@ namespace GxMcp.Worker.Services
 
         public SearchIndex GetIndex() { return _kbService.GetIndexCache().GetIndex(); }
 
+        /// <summary>
+        /// Returns all index entries whose name matches <paramref name="name"/> (case-insensitive).
+        /// Works without a KB open — the index may be pre-populated via IndexCacheService.UpdateIndex().
+        /// Returns an empty list when the index is empty or no entries match.
+        /// </summary>
+        public List<SearchIndex.IndexEntry> FindCandidateEntries(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return new List<SearchIndex.IndexEntry>();
+            var index = GetIndex();
+            if (index?.Objects == null) return new List<SearchIndex.IndexEntry>();
+            var results = new List<SearchIndex.IndexEntry>();
+            foreach (var entry in index.Objects.Values)
+            {
+                if (string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase))
+                    results.Add(entry);
+            }
+            return results;
+        }
+
         public string CreateObject(string type, string name)
         {
             var sw = Stopwatch.StartNew();
