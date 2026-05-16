@@ -38,6 +38,13 @@ namespace GxMcp.Gateway
         private string _stopReason = "none";
         private int _inFlightCommands;
         private int _queuedCommands;
+        private long _spawnMs = -1;
+        private long _sdkInitMs = -1;
+        private System.Diagnostics.Stopwatch? _spawnWatch;
+        private System.Diagnostics.Stopwatch? _sdkInitWatch;
+
+        public long? SpawnMs { get { var v = System.Threading.Interlocked.Read(ref _spawnMs); return v < 0 ? (long?)null : v; } }
+        public long? SdkInitMs { get { var v = System.Threading.Interlocked.Read(ref _sdkInitMs); return v < 0 ? (long?)null : v; } }
 
         public event Action<string>? OnRpcResponse;
         public event Action? OnWorkerExited;
@@ -469,12 +476,17 @@ namespace GxMcp.Gateway
                     }
                 };
 
+                _spawnWatch = System.Diagnostics.Stopwatch.StartNew();
+                _sdkInitWatch = System.Diagnostics.Stopwatch.StartNew();
+
                 for (int attempt = 1; attempt <= 10; attempt++)
                 {
                     try
                     {
                         _process.Start();
-                        Program.Log($"[Gateway] worker_spawned pid={_process.Id} attempt={attempt} idleTimeoutMinutes={_workerIdleTimeout.TotalMinutes}");
+                        _spawnWatch.Stop();
+                        System.Threading.Interlocked.Exchange(ref _spawnMs, _spawnWatch.ElapsedMilliseconds);
+                        Program.Log($"[Gateway] worker_spawned pid={_process.Id} spawnMs={_spawnWatch.ElapsedMilliseconds} attempt={attempt} idleTimeoutMinutes={_workerIdleTimeout.TotalMinutes}");
                         break;
                     }
                     catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 5)
@@ -502,6 +514,13 @@ namespace GxMcp.Gateway
                     if (!string.IsNullOrEmpty(e.Data))
                     {
                         _lastResponse = DateTime.UtcNow;
+                        if (_sdkInitWatch != null && _sdkInitWatch.IsRunning &&
+                            e.Data.Contains("Full SDK Initialization SUCCESS"))
+                        {
+                            _sdkInitWatch.Stop();
+                            System.Threading.Interlocked.Exchange(ref _sdkInitMs, _sdkInitWatch.ElapsedMilliseconds);
+                            Program.Log($"[Gateway] worker_sdk_init pid={_process?.Id} sdkInitMs={_sdkInitWatch.ElapsedMilliseconds}");
+                        }
                         if (e.Data.TrimStart().StartsWith("{") && e.Data.Contains("\"jsonrpc\""))
                         {
                             HandleWorkerRpcResponse(e.Data);
