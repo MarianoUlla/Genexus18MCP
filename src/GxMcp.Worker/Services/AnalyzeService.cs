@@ -251,6 +251,8 @@ namespace GxMcp.Worker.Services
                 foreach (var aff in affected.Take(50)) topAffected.Add(aff);
                 json["topImpacted"] = topAffected;
 
+                GxMcp.Worker.Helpers.ProgressEmitter.Emit(100, 100, "Impact analysis: complete");
+
                 return json.ToString();
             }
             catch (Exception ex)
