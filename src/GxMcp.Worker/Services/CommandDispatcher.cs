@@ -176,8 +176,14 @@ namespace GxMcp.Worker.Services
                 var payload = request["payload"]?.ToString();
                 var args = request["params"] as JObject;
 
+                string progressToken = request["_meta"] != null
+                    ? request["_meta"]["progressToken"]?.ToString()
+                    : null;
+
                 Logger.Info(string.Format("[DISPATCHER] Method: {0}, Action: {1}, Target: {2}", method, action, target));
 
+                using (GxMcp.Worker.Helpers.ProgressContext.Use(progressToken))
+                {
                 switch (method?.ToLower())
                 {
                     case "ping": return "{\"status\":\"pong\"}";
@@ -655,6 +661,7 @@ namespace GxMcp.Worker.Services
                     action,
                     string.Format("Unsupported dispatch combination. Method='{0}', Action='{1}'.", method ?? "", action ?? "")
                 );
+                } // end using ProgressContext
             }
             catch (Exception ex)
             {
