@@ -12,7 +12,7 @@ using GxMcp.Worker.Models;
 
 namespace GxMcp.Worker.Services
 {
-    public class WriteService
+    public class WriteService : IWriteServiceFacade
     {
         private readonly ObjectService _objectService;
         private readonly PatternAnalysisService _patternAnalysisService;
@@ -520,6 +520,29 @@ namespace GxMcp.Worker.Services
                 try { name = v.Name; } catch { }
                 if (!string.IsNullOrWhiteSpace(name)) yield return name;
             }
+        }
+
+        // IWriteServiceFacade adapter — translates JObject args into the canonical WriteObject call.
+        public string WriteObject(string target, JObject args)
+        {
+            string mode = args?["mode"]?.ToString();
+            string action = string.Equals(mode, "patch", StringComparison.OrdinalIgnoreCase) ? "WritePatch" : "WriteObject";
+            JObject payload = args?["content"] as JObject;
+            if (payload == null && args?["content"] != null)
+            {
+                payload = new JObject { ["text"] = args["content"].ToString() };
+            }
+            if (payload == null) payload = new JObject();
+
+            return WriteObject(
+                target,
+                action,
+                payload?.ToString(),
+                args?["type"]?.ToString(),
+                true,
+                false,
+                true,
+                args?["dryRun"]?.ToObject<bool?>() ?? false);
         }
 
         public string WriteObject(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)

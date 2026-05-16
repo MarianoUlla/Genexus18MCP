@@ -12,7 +12,7 @@ using GxMcp.Worker.Models;
 
 namespace GxMcp.Worker.Services
 {
-    public class AnalyzeService
+    public class AnalyzeService : IAnalyzeServiceFacade
     {
         private readonly KbService _kbService;
         private readonly ObjectService _objectService;

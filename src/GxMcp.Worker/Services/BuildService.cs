@@ -15,7 +15,7 @@ using System.Security;
 
 namespace GxMcp.Worker.Services
 {
-    public class BuildService
+    public class BuildService : IBuildServiceFacade
     {
         private string _msbuildPath;
         private string _gxDir;
