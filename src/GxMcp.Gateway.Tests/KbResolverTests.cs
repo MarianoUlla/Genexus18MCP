@@ -106,5 +106,26 @@ namespace GxMcp.Gateway.Tests
             var ex = Assert.Throws<KbResolutionException>(() => resolver.Resolve(null, Array.Empty<KbHandle>()));
             Assert.Equal("KB_AMBIGUOUS", ex.Code);
         }
+
+        [Fact]
+        public void Throws_not_found_when_default_kb_is_missing_from_declared_list()
+        {
+            var cfg = new Configuration
+            {
+                Environment = new EnvironmentConfig
+                {
+                    DefaultKb = "missing",
+                    KBs =
+                    {
+                        new KbEntry { Alias = "customer", Path = "C:/KB/Customer" }
+                    }
+                }
+            };
+            var resolver = new KbResolver(cfg);
+
+            var ex = Assert.Throws<KbResolutionException>(() => resolver.Resolve(null, Array.Empty<KbHandle>()));
+
+            Assert.Equal("KB_NOT_FOUND", ex.Code);
+        }
     }
 }

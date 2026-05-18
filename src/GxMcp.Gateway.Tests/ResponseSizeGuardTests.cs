@@ -24,6 +24,14 @@ namespace GxMcp.Gateway.Tests
         private static JObject SomeArgs() =>
             JObject.Parse("""{"object_name":"Invoice","type":"Transaction"}""");
 
+        [Fact]
+        public void ByteSize_StringOverload_CountsUtf8Bytes()
+        {
+            var serialized = """{"text":"café ✓"}""";
+
+            Assert.Equal(Encoding.UTF8.GetByteCount(serialized), ResponseSizeGuard.ByteSize(serialized));
+        }
+
         // ── small payload passes through unchanged ────────────────────────────
 
         [Fact]
@@ -49,6 +57,19 @@ namespace GxMcp.Gateway.Tests
             guard.Apply(payload, "genexus_read", SomeArgs());
 
             Assert.Equal(before, payload.ToString(Newtonsoft.Json.Formatting.None));
+        }
+
+        [Fact]
+        public void ExactCap_SerialisedPayload_DoesNotTruncate()
+        {
+            var payload = JObject.Parse("""{"result":"ok","data":"hello"}""");
+            var exactCap = checked((int)ResponseSizeGuard.ByteSize(payload));
+            var guard = new ResponseSizeGuard(maxBytes: exactCap);
+
+            var (result, truncated) = guard.Apply(payload, "genexus_read", SomeArgs());
+
+            Assert.False(truncated);
+            Assert.Equal(payload.ToString(Newtonsoft.Json.Formatting.None), result.ToString(Newtonsoft.Json.Formatting.None));
         }
 
         // ── oversized payload returns sentinel ───────────────────────────────

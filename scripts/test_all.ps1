@@ -29,7 +29,12 @@ try {
     $initResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:5000/mcp" -Body $initializeBody -ContentType "application/json" -Headers @{ "MCP-Protocol-Version" = $protocolVersion } -TimeoutSec 60
     $sessionId = $null
     if ($initResponse -and $initResponse.Headers) {
-        $sessionId = $initResponse.Headers["MCP-Session-Id"]
+        $rawSessionHeader = $initResponse.Headers["MCP-Session-Id"]
+        if ($rawSessionHeader -is [System.Array]) {
+            $sessionId = [string]($rawSessionHeader | Select-Object -First 1)
+        } else {
+            $sessionId = [string]$rawSessionHeader
+        }
     }
     if (-not $sessionId) { throw "MCP session not established." }
 

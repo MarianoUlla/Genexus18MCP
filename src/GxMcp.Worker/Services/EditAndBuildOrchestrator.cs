@@ -4,26 +4,16 @@ using Newtonsoft.Json.Linq;
 
 namespace GxMcp.Worker.Services
 {
-    public interface IWriteServiceFacade
-    {
-        string WriteObject(string target, JObject args);
-    }
-
-    public interface IAnalyzeServiceFacade
-    {
-        string ImpactAnalysis(string target, bool waitForIndex, int waitTimeoutMs);
-    }
-
-    public interface IBuildServiceFacade
-    {
-        string Build(string action, string target, string includeCallees, int buildPlanCap);
-    }
-
     public class EditAndBuildOrchestrator
     {
         private readonly IWriteServiceFacade _write;
         private readonly IAnalyzeServiceFacade _analyze;
         private readonly IBuildServiceFacade _build;
+
+        public EditAndBuildOrchestrator(WriteService write, AnalyzeService analyze, BuildService build)
+            : this((IWriteServiceFacade)write, (IAnalyzeServiceFacade)analyze, (IBuildServiceFacade)build)
+        {
+        }
 
         public EditAndBuildOrchestrator(IWriteServiceFacade write, IAnalyzeServiceFacade analyze, IBuildServiceFacade build)
         {

@@ -69,5 +69,31 @@ namespace GxMcp.Gateway.Tests
 
             Assert.Equal(2, calls);
         }
+
+        [Fact]
+        public async Task ReorderedArguments_WithSameIdempotencyKey_ReusesCachedResult()
+        {
+            var calls = 0;
+            var middleware = new IdempotencyMiddleware(new IdempotencyCache(15, 1000), kbPath: "kb1");
+
+            Task<JObject> Inner(JObject req)
+            {
+                calls++;
+                return Task.FromResult(JObject.Parse("{\"isError\":false,\"data\":{\"id\":1}}"));
+            }
+
+            var req1 = JObject.Parse(
+                "{\"name\":\"genexus_edit\",\"arguments\":{\"name\":\"X\",\"content\":\"<x/>\",\"idempotencyKey\":\"k1\"}}");
+            var req2 = JObject.Parse(
+                "{\"name\":\"genexus_edit\",\"arguments\":{\"content\":\"<x/>\",\"name\":\"X\",\"idempotencyKey\":\"k1\"}}");
+
+            var first = await middleware.Invoke(req1, Inner);
+            var second = await middleware.Invoke(req2, Inner);
+
+            Assert.Equal(1, calls);
+            Assert.Equal(first["data"]!.ToString(), second["data"]!.ToString());
+            Assert.Null(first["meta"]);
+            Assert.True((bool)second["meta"]!["idempotent"]!);
+        }
     }
 }

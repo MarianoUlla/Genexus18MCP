@@ -86,5 +86,16 @@ namespace GxMcp.Gateway.Tests
             Assert.False(obj["truncated"].Value<bool>());
             Assert.Equal(2, ((JArray)obj["errors"]).Count);
         }
+
+        [Fact]
+        public void ShouldCompact_DefaultsToTrue_AndHonorsExplicitFalseFlags()
+        {
+            Assert.True(LifecycleResponseShaper.ShouldCompact(null!));
+            Assert.True(LifecycleResponseShaper.ShouldCompact(new JObject()));
+            Assert.True(LifecycleResponseShaper.ShouldCompact(new JObject { ["compact"] = true }));
+            Assert.False(LifecycleResponseShaper.ShouldCompact(new JObject { ["compact"] = false }));
+            Assert.False(LifecycleResponseShaper.ShouldCompact(new JObject { ["compact"] = "false" }));
+            Assert.False(LifecycleResponseShaper.ShouldCompact(new JObject { ["compact"] = "0" }));
+        }
     }
 }

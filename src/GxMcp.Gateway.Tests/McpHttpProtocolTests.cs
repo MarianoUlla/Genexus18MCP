@@ -89,5 +89,13 @@ namespace GxMcp.Gateway.Tests
             Assert.Equal("Unknown or expired MCP session.", error.Value.Message);
             Assert.Null(resolved);
         }
+
+        [Fact]
+        public void IsInitializeRequest_RequiresExactMethodName()
+        {
+            Assert.True(McpHttpProtocol.IsInitializeRequest(JObject.Parse("""{"method":"initialize"}""")));
+            Assert.False(McpHttpProtocol.IsInitializeRequest(JObject.Parse("""{"method":"Initialize"}""")));
+            Assert.False(McpHttpProtocol.IsInitializeRequest(JObject.Parse("""{"method":"initialize "}""")));
+        }
     }
 }

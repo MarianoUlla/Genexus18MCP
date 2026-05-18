@@ -42,19 +42,18 @@ jobs:
         working-directory: src/nexus-ide
         run: npm test
 
-      - name: Gateway tests
+      - name: Gateway and Worker coverage
         shell: pwsh
         run: |
-          dotnet test src/GxMcp.Gateway.Tests/GxMcp.Gateway.Tests.csproj -v minimal -p:BaseOutputPath="$env:RUNNER_TEMP\gx-gateway-tests\"
+          ./scripts/coverage/collect.ps1 -OutputRoot "$env:RUNNER_TEMP\gx-coverage-artifacts"
+          ./scripts/coverage/assert-threshold.ps1 -CoverageRoot "$env:RUNNER_TEMP\gx-coverage-artifacts" -MinLineRatePercent 50
 
-      - name: Worker tests
-        shell: pwsh
-        run: |
-          if (Test-Path "C:\Program Files (x86)\GeneXus\GeneXus18\Artech.Architecture.Common.dll") {
-            dotnet test src/GxMcp.Worker.Tests/GxMcp.Worker.Tests.csproj -v minimal -p:BaseOutputPath="$env:RUNNER_TEMP\gx-worker-tests\"
-          } else {
-            Write-Host "GeneXus 18 SDK not installed on runner; skipping Worker.Tests."
-          }
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-worker-coverage
+          path: ${{ runner.temp }}\gx-coverage-artifacts
 
       - name: LLM contract smoke
         shell: pwsh
