@@ -12,6 +12,7 @@
 !LICENSE.txt
 *.zip
 *.xpz
+/artifacts/
 .history/
 batch_buffer/
 cache/
