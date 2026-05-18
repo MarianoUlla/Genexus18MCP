@@ -23,3 +23,8 @@ broad rules that accumulate over time.
   GeneXus IDE / Visual Studio, force-killing build daemons under a different
   user, force-killing anything when no MSB lock error is present.
 - **Granted:** 2026-05-15 by user. Last reviewed: 2026-05-15.
+
+## Release discipline
+
+- Before any release (`scripts/release.ps1`, tag, or GitHub Release), update
+  `CHANGELOG.md` with an entry for the exact version being released.

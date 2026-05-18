@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.4.3 — 2026-05-18
+
+### Fixed
+
+- **KB reopen warning after MCP edits (`11.0.0.0` vs GeneXus 18)**:
+  worker now normalizes `.gxw` metadata right after `KnowledgeBase.Open(...)` using
+  active installation from `GX_PROGRAM_DIR`. It updates `InstallationPath`,
+  `ProductVersion`, `FriendlyVersion`, and `VersionNumber` so IDE reopen no longer
+  warns about mismatched GeneXus installation after MCP writes.
+
 ## v2.4.2 — Unreleased
 
 ### Fixed
