@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Threading;
 using System.IO;
 using System.Linq;
+using System.Xml.Linq;
 using GxMcp.Worker.Helpers;
 using GxMcp.Worker.Models;
 using Artech.Architecture.Common.Objects;
@@ -91,6 +92,7 @@ namespace GxMcp.Worker.Services
 
                         var options = new KnowledgeBase.OpenOptions(path);
                         _kb = KnowledgeBase.Open(options);
+                        NormalizeGxwVersionMetadata(path);
 
                         sw.Stop();
                         Logger.Info($"[KB-OPEN] elapsedMs={sw.ElapsedMilliseconds} path={path}");
@@ -105,6 +107,102 @@ namespace GxMcp.Worker.Services
                     return "{\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
                 }
             }
+        }
+
+        private static void NormalizeGxwVersionMetadata(string kbPath)
+        {
+            try
+            {
+                string kbDir = ResolveKbDirectory(kbPath);
+                if (string.IsNullOrWhiteSpace(kbDir) || !Directory.Exists(kbDir)) return;
+
+                string gxwPath = Directory.GetFiles(kbDir, "*.gxw", SearchOption.TopDirectoryOnly).FirstOrDefault();
+                if (string.IsNullOrWhiteSpace(gxwPath) || !File.Exists(gxwPath)) return;
+
+                string gxPath = Environment.GetEnvironmentVariable("GX_PROGRAM_DIR") ?? string.Empty;
+                string gxVersion = DetectGeneXusVersion(gxPath);
+                if (string.IsNullOrWhiteSpace(gxVersion)) return;
+
+                XDocument doc = XDocument.Load(gxwPath, LoadOptions.PreserveWhitespace);
+                XElement root = doc.Root;
+                if (root == null || !string.Equals(root.Name.LocalName, "GeneXusInformation", StringComparison.OrdinalIgnoreCase)) return;
+
+                bool changed = false;
+                changed |= UpsertElementValue(root, "InstallationPath", gxPath);
+                changed |= UpsertElementValue(root, "ProductVersion", gxVersion);
+                changed |= UpsertElementValue(root, "FriendlyVersion", gxVersion);
+                changed |= UpsertElementValue(root, "VersionNumber", gxVersion);
+
+                if (!changed) return;
+
+                doc.Save(gxwPath, SaveOptions.DisableFormatting);
+                Logger.Info($"[KB-METADATA] Updated '{Path.GetFileName(gxwPath)}' to version '{gxVersion}'.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[KB-METADATA] Failed to normalize .gxw version metadata: {ex.Message}");
+            }
+        }
+
+        private static string ResolveKbDirectory(string kbPath)
+        {
+            if (string.IsNullOrWhiteSpace(kbPath)) return null;
+            if (Directory.Exists(kbPath)) return kbPath;
+            if (File.Exists(kbPath)) return Path.GetDirectoryName(kbPath);
+            string ext = Path.GetExtension(kbPath);
+            if (!string.IsNullOrEmpty(ext) && ext.Equals(".gxw", StringComparison.OrdinalIgnoreCase))
+            {
+                return Path.GetDirectoryName(kbPath);
+            }
+            return kbPath;
+        }
+
+        private static bool UpsertElementValue(XElement parent, string elementName, string value)
+        {
+            if (parent == null || string.IsNullOrWhiteSpace(elementName)) return false;
+            XElement child = parent.Elements().FirstOrDefault(e => string.Equals(e.Name.LocalName, elementName, StringComparison.OrdinalIgnoreCase));
+            if (child == null)
+            {
+                parent.Add(new XElement(elementName, value ?? string.Empty));
+                return true;
+            }
+
+            string current = (child.Value ?? string.Empty).Trim();
+            string next = (value ?? string.Empty).Trim();
+            if (string.Equals(current, next, StringComparison.Ordinal)) return false;
+
+            child.Value = next;
+            return true;
+        }
+
+        private static string DetectGeneXusVersion(string gxPath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(gxPath) || !Directory.Exists(gxPath)) return null;
+
+                string[] candidates = new[]
+                {
+                    Path.Combine(gxPath, "version.txt"),
+                    Path.Combine(gxPath, "Version.txt"),
+                    Path.Combine(gxPath, "GeneXus.version")
+                };
+
+                foreach (string candidate in candidates)
+                {
+                    if (!File.Exists(candidate)) continue;
+                    string raw = File.ReadAllText(candidate)?.Trim();
+                    if (!string.IsNullOrWhiteSpace(raw)) return raw;
+                }
+
+                string exePath = Path.Combine(gxPath, "GeneXus.exe");
+                if (!File.Exists(exePath)) return null;
+                var info = FileVersionInfo.GetVersionInfo(exePath);
+                string version = info.ProductVersion ?? info.FileVersion;
+                if (!string.IsNullOrWhiteSpace(version)) return version.Trim();
+            }
+            catch { }
+            return null;
         }
 
         public string BulkIndex() => BulkIndex(force: false);
