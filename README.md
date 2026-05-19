@@ -7,6 +7,7 @@
 [![MCP Badge](https://lobehub.com/badge/mcp/lennix1337-genexus18mcp)](https://lobehub.com/mcp/lennix1337-genexus18mcp)
 
 > **¿Hablás español?** → [Guía de inicio en español](docs/GETTING_STARTED.es.md)
+> **Fala português?** → [Guia de início em português](docs/GETTING_STARTED.pt-br.md)
 > **Stuck?** → [Troubleshooting guide](TROUBLESHOOTING.md)
 
 ---
