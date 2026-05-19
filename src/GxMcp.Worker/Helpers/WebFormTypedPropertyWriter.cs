@@ -146,7 +146,31 @@ namespace GxMcp.Worker.Helpers
                 XmlElement node = FindElementInPartDoc(partDoc, controlName);
                 if (node == null) { failure = "no element id='" + controlName + "' (nor ControlName) in part.Document"; return false; }
 
+                // FR#1 (friction-report 2026-05-19): properties whose XML attribute name differs
+                // from the descriptor name MUST go through PropertiesObject.SetPropertyValueString,
+                // not raw XML mutation. The HTML generator reads the XML attribute the SDK chose
+                // (e.g. gxButton: descriptor "OnClickEvent" → XML attr "Event"), so writing the
+                // descriptor name as an XML attribute leaves it unread → silent fallback to Enter.
+                //
+                // Strategy: extract these properties into a "descriptor delta" set; remaining
+                // properties still go through raw XML mutation (which works for Caption, Class,
+                // Visible, etc. where XML attr name == descriptor name).
+                var descriptorDeltas = new List<WebFormPropertyDelta>();
+                var rawXmlDeltas = new List<WebFormPropertyDelta>();
                 foreach (var d in kv.Value)
+                {
+                    if (NeedsDescriptorPath(d.PropertyName)) descriptorDeltas.Add(d);
+                    else rawXmlDeltas.Add(d);
+                }
+
+                // 1. Descriptor path — PropertiesObject.SetPropertyValueString
+                if (descriptorDeltas.Count > 0)
+                {
+                    ApplyDescriptorDeltas(tag, controlName, descriptorDeltas);
+                }
+
+                // 2. Raw XML path — direct attribute mutation
+                foreach (var d in rawXmlDeltas)
                 {
                     if (d.Value == null)
                     {
@@ -362,6 +386,208 @@ namespace GxMcp.Worker.Helpers
             }
 
             return true;
+        }
+
+        // Post-write hook called from WebFormXmlHelper.ApplyEditableXml after the raw XML is
+        // persisted and the part has reparsed via DeserializeDataFromDocument. Walks every
+        // IWebTag in the part; for any tag whose XmlNode has a descriptor-name attribute
+        // (e.g. OnClickEvent), invokes PropertiesObject.SetPropertyValueString so the SDK
+        // converter writes the canonical XML attr (e.g. Event=) the HTML generator reads.
+        // Idempotent: SDK no-ops when value already correct.
+        public static void ApplyDescriptorPathFixup(object webFormPart)
+        {
+            if (webFormPart == null) return;
+            try
+            {
+                Type helperType = FindType("Artech.Genexus.Common.Parts.WebForm.WebFormHelper");
+                if (helperType == null) return;
+
+                XmlDocument partDoc = null;
+                try
+                {
+                    var docField = webFormPart.GetType().GetField("m_Document",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    partDoc = docField?.GetValue(webFormPart) as XmlDocument;
+                }
+                catch { }
+                if (partDoc == null) partDoc = GetReadProperty(webFormPart, "Document") as XmlDocument;
+                if (partDoc == null) return;
+
+                var partKbObj = GetReadProperty(webFormPart, "KBObject") ?? GetReadProperty(webFormPart, "ContainerObject") ?? GetReadProperty(webFormPart, "Parent") ?? GetReadProperty(webFormPart, "Container");
+                MethodInfo enumerate = null;
+                object[] enumArgs = null;
+                if (partKbObj != null)
+                {
+                    enumerate = helperType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m =>
+                        {
+                            if (m.Name != "EnumerateWebTag") return false;
+                            var ps = m.GetParameters();
+                            return ps.Length == 2 && ps[1].ParameterType == typeof(XmlDocument) && ps[0].ParameterType.IsInstanceOfType(partKbObj);
+                        });
+                    if (enumerate != null) enumArgs = new object[] { partKbObj, partDoc };
+                }
+                if (enumerate == null)
+                {
+                    enumerate = helperType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                        .FirstOrDefault(m =>
+                        {
+                            if (m.Name != "EnumerateWebTag") return false;
+                            var ps = m.GetParameters();
+                            return ps.Length == 1 && ps[0].ParameterType.IsInstanceOfType(webFormPart);
+                        });
+                    enumArgs = new object[] { webFormPart };
+                }
+                if (enumerate == null) return;
+
+                int fixupCount = 0;
+                IEnumerable tags;
+                try { tags = (IEnumerable)enumerate.Invoke(null, enumArgs); }
+                catch (Exception ex) { Logger.Info("[DescFixup] EnumerateWebTag threw: " + (ex.InnerException ?? ex).Message); return; }
+
+                foreach (var tag in tags)
+                {
+                    var node = GetReadProperty(tag, "Node") as XmlNode;
+                    if (node?.Attributes == null) continue;
+
+                    // Collect descriptor-name attributes present on this tag's XML node.
+                    var deltas = new List<WebFormPropertyDelta>();
+                    string ctrlId = node.Attributes["id"]?.Value ?? node.Attributes["ControlName"]?.Value ?? node.LocalName;
+                    foreach (var descName in _descriptorPathProps)
+                    {
+                        var attr = node.Attributes[descName];
+                        if (attr == null) continue;
+                        deltas.Add(new WebFormPropertyDelta {
+                            ControlName = ctrlId,
+                            PropertyName = descName,
+                            Value = attr.Value
+                        });
+                    }
+                    if (deltas.Count == 0) continue;
+
+                    ApplyDescriptorDeltas(tag, ctrlId, deltas);
+                    fixupCount += deltas.Count;
+
+                    // Remove the wrong-named XML attribute now that SDK has written the right one.
+                    // Otherwise generator may see both and the HTML output is unpredictable.
+                    foreach (var d in deltas)
+                    {
+                        try { node.Attributes.RemoveNamedItem(d.PropertyName); } catch { }
+                    }
+                }
+
+                if (fixupCount > 0)
+                    Logger.Info("[DescFixup] routed " + fixupCount + " descriptor-property write(s) through SDK.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("[DescFixup] outer fault: " + (ex.InnerException ?? ex).Message);
+            }
+        }
+
+        // FR#1 (friction-report 2026-05-19): properties whose XML attribute name differs from
+        // the SDK descriptor name. Writing them as raw XML attributes leaves them unread by the
+        // HTML generator (it looks for the descriptor's mapped XML attr — e.g. "Event" for
+        // gxButton.OnClickEvent, not "OnClickEvent"). These MUST route through
+        // PropertiesObject.SetPropertyValueString so the SDK applies the canonical mapping.
+        //
+        // List is intentionally conservative — only properties confirmed via probe / friction
+        // report. Extend cautiously: a wrong-positive (mapped-when-shouldn't) makes the SDK
+        // path swallow user intent.
+        private static readonly HashSet<string> _descriptorPathProps =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+                "OnClickEvent",      // gxButton → Event; gxAttribute/gxImage → eventGX
+            };
+
+        private static bool NeedsDescriptorPath(string propertyName)
+        {
+            return !string.IsNullOrEmpty(propertyName) && _descriptorPathProps.Contains(propertyName);
+        }
+
+        // Apply deltas via Artech.Common.Properties.PropertiesObject.SetPropertyValueString(desc,
+        // value). The SDK runs the registered PropertyValueConverter (e.g. GxEventReferenceConverter
+        // for OnClickEvent) which produces the correct XML attribute name and quoted format.
+        // SaveProperties() then mirrors the typed model into the tag's XmlNode in m_Document.
+        private static void ApplyDescriptorDeltas(object tag, string controlName, List<WebFormPropertyDelta> deltas)
+        {
+            if (tag == null || deltas == null || deltas.Count == 0) return;
+
+            object propsObj;
+            try { propsObj = GetReadProperty(tag, "Properties"); }
+            catch (Exception ex)
+            {
+                Logger.Info("[TypedWriter] descriptor path: GetProperties on " + controlName + " threw: " + (ex.InnerException ?? ex).Message);
+                return;
+            }
+            if (propsObj == null)
+            {
+                Logger.Info("[TypedWriter] descriptor path: tag " + controlName + " has no Properties — skipping " + deltas.Count + " delta(s).");
+                return;
+            }
+
+            // Probe candidate methods: SetPropertyValueString(name,value), SetPropertyValue(name,object).
+            // The exact signature varies across SDK versions; try several.
+            var poType = propsObj.GetType();
+            var candidates = new List<MethodInfo>();
+            foreach (var bindAttrs in new[] {
+                BindingFlags.Public | BindingFlags.Instance,
+                BindingFlags.NonPublic | BindingFlags.Instance,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance })
+            {
+                foreach (var name in new[] { "SetPropertyValueString", "SetPropertyValue" })
+                {
+                    var m = poType.GetMethods(bindAttrs).Where(mi => mi.Name == name && mi.GetParameters().Length == 2).ToList();
+                    candidates.AddRange(m);
+                }
+            }
+            candidates = candidates.Distinct().ToList();
+            if (candidates.Count == 0)
+            {
+                Logger.Info("[TypedWriter] descriptor path: no SetPropertyValue* found on " + poType.FullName + " — methods: " +
+                    string.Join(",", poType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                        .Where(mi => mi.Name.StartsWith("Set", StringComparison.OrdinalIgnoreCase))
+                        .Select(mi => mi.Name + "(" + string.Join(",", mi.GetParameters().Select(p => p.ParameterType.Name)) + ")")));
+                return;
+            }
+
+            foreach (var d in deltas)
+            {
+                bool applied = false;
+                foreach (var setMethod in candidates)
+                {
+                    try
+                    {
+                        var ps = setMethod.GetParameters();
+                        object[] args;
+                        if (ps[1].ParameterType == typeof(string))
+                            args = new object[] { d.PropertyName, d.Value ?? string.Empty };
+                        else
+                            args = new object[] { d.PropertyName, (object)(d.Value ?? string.Empty) };
+                        setMethod.Invoke(propsObj, args);
+                        Logger.Info("[TypedWriter] descriptor " + controlName + "." + d.PropertyName + " <- '" + Truncate(d.Value, 80) + "' via " + setMethod.Name + "(" + ps[1].ParameterType.Name + ")");
+                        applied = true;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        var inner = ex.InnerException ?? ex;
+                        Logger.Info("[TypedWriter] descriptor " + setMethod.Name + " threw: " + inner.GetType().Name + ": " + inner.Message);
+                    }
+                }
+                if (!applied)
+                    Logger.Info("[TypedWriter] descriptor path: no candidate accepted " + controlName + "." + d.PropertyName);
+            }
+
+            // Flush typed model back to tag.Node XML (mirrors into m_Document).
+            try
+            {
+                var save = tag.GetType().GetMethod("SaveProperties", Type.EmptyTypes);
+                save?.Invoke(tag, null);
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("[TypedWriter] descriptor path: SaveProperties on " + controlName + " threw: " + (ex.InnerException ?? ex).Message);
+            }
         }
 
         private static XmlElement FindElementInPartDoc(XmlDocument doc, string controlName)

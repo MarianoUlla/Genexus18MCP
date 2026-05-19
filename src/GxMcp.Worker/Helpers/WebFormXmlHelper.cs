@@ -169,6 +169,10 @@ namespace GxMcp.Worker.Helpers
                 if (WebFormTypedPropertyWriter.TryApply(part, propertyDeltas.Deltas, out failure))
                 {
                     Logger.Info("[LayoutFix] Typed-property write succeeded; raw XML rewrite skipped.");
+                    // FR#1: still run descriptor-property fixup so any pre-existing wrong-named
+                    // XML attrs (e.g. gxButton OnClickEvent= written by an earlier raw-XML pass)
+                    // get routed through SDK and the canonical attr gets emitted.
+                    WebFormTypedPropertyWriter.ApplyDescriptorPathFixup(part);
                     return;
                 }
                 Logger.Info("[LayoutFix] Typed-property write rejected: " + failure + " — falling back to raw XML rewrite.");
@@ -199,6 +203,16 @@ namespace GxMcp.Worker.Helpers
             }
 
             PushDocumentToStoredModel(part);
+
+            // FR#1 (friction-report 2026-05-19): post-write descriptor-property hook.
+            // Some XML attributes the user authors are descriptor names (e.g. gxButton
+            // "OnClickEvent") whose canonical XML attr name in the SDK is different
+            // (e.g. "Event"). The HTML generator reads the SDK's name, so the user's
+            // attribute sits ignored unless we route it through PropertiesObject.
+            // SetPropertyValueString — which writes the right XML attr internally.
+            // Runs always (not just on add/remove), idempotent — SDK no-ops when the
+            // value already matches the canonical form.
+            WebFormTypedPropertyWriter.ApplyDescriptorPathFixup(part);
         }
 
         private static bool TrySetEditableContent(object part, string normalizedXml)
