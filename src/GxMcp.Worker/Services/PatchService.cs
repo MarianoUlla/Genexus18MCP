@@ -25,11 +25,13 @@ namespace GxMcp.Worker.Services
 
         private readonly ObjectService _objectService;
         private readonly WriteService _writeService;
+        private readonly PatternAnalysisService _patternAnalysisService;
 
-        public PatchService(ObjectService objectService, WriteService writeService)
+        public PatchService(ObjectService objectService, WriteService writeService, PatternAnalysisService patternAnalysisService = null)
         {
             _objectService = objectService;
             _writeService = writeService;
+            _patternAnalysisService = patternAnalysisService;
         }
 
         /// <summary>
@@ -278,7 +280,20 @@ namespace GxMcp.Worker.Services
 
                 bool primaryWriteSuccess = string.Equals(writePayload["status"]?.ToString(), "Success", StringComparison.OrdinalIgnoreCase);
                 bool persistedMatches = false;
-                if (primaryWriteSuccess)
+                // Pattern parts: trust WriteService's own XmlEquivalence verification (it runs
+                // INSIDE WritePatternPart after the SDK save). PatchService's byte-level re-verify
+                // here would compare against `finalCode` — the pre-reconciler input — and would
+                // flag legitimate childrenOrderedList rewrites and SDK attribute reordering as
+                // false negatives. The WriteService payload already says Success only when the
+                // persisted pattern XML matches the saved content semantically.
+                bool isPatternPart = Services.PatternAnalysisService.IsPatternPart(partName);
+                if (primaryWriteSuccess && isPatternPart)
+                {
+                    persistedMatches = true;
+                    writePayload["persistedVerified"] = true;
+                    writePayload["persistedVerifyNote"] = "Pattern parts use WriteService's internal XmlEquivalence verification; byte-level re-verify was skipped because the auto-reconcile of childrenOrderedList legitimately reshapes the input.";
+                }
+                else if (primaryWriteSuccess)
                 {
                     persistedMatches = VerifyPersistedSource(target, partName, typeFilter, finalCode, out string verifyError);
                     writePayload["persistedVerified"] = persistedMatches;
@@ -881,6 +896,26 @@ namespace GxMcp.Worker.Services
                 }
 
                 string resolvedPart = string.IsNullOrWhiteSpace(partName) ? "Source" : partName;
+
+                // Pattern parts (PatternInstance / PatternVirtual, e.g. WorkWithPlus) do not
+                // implement ISource and PartAccessor.GetPart on the source object will miss them
+                // (the part lives on the resolved WWP instance). Route through
+                // PatternAnalysisService so patch-mode can read & rewrite pattern XML.
+                if (_patternAnalysisService != null && PatternAnalysisService.IsPatternPart(resolvedPart))
+                {
+                    string patternXml = _patternAnalysisService.ReadPatternPartXml(obj, resolvedPart, out _, out var resolvedPatternPartName);
+                    if (patternXml == null)
+                    {
+                        return Models.McpResponse.Error("Part not found", target, resolvedPart, "The object does not expose the requested pattern part.");
+                    }
+                    return new JObject
+                    {
+                        ["status"] = "Success",
+                        ["part"] = string.IsNullOrWhiteSpace(resolvedPatternPartName) ? resolvedPart : resolvedPatternPartName,
+                        ["source"] = patternXml
+                    }.ToString();
+                }
+
                 KBObjectPart part = PartAccessor.GetPart(obj, resolvedPart);
                 if (part == null)
                 {

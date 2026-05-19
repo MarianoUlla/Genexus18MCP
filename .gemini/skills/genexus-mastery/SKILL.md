@@ -41,12 +41,50 @@ The server can hold multiple KBs open at once (`Server.MaxOpenKbs`, default 3), 
 | Tool | Tip |
 | --- | --- |
 | `genexus_query` | Narrow down by `typeFilter` for faster results. |
-| `genexus_read` | Always check the `Variables` part if adding logic. |
-| `genexus_edit` | Prefer `mode=patch` for surgical changes; use `targets[]` for atomic multi-object edits. |
+| `genexus_read` | Always check the `Variables` part if adding logic. `PatternInstance` / `PatternVirtual` return the full pattern XML (WorkWithPlus). `Documentation` / `Help` are first-class write targets. |
+| `genexus_edit` | Prefer `mode=patch` for surgical changes; use `targets[]` for atomic multi-object edits. For pattern parts see "Pattern editing" below. |
 | `genexus_analyze` | One tool covers `linter`, `navigation`, `hierarchy`, `impact`, `data_context`, `ui_context`, `pattern_metadata`, `summary`, and `explain` (the last two replaced `genexus_summarize` and `genexus_explain_code`). |
 | `genexus_sql` | `action=ddl` for Transaction/Table DDL, `action=navigation` for the SQL produced by a For Each (replaces `genexus_get_sql` and `genexus_get_sql_for_navigation`). |
 | `genexus_kb` | List/open/close/set_default — multi-KB pool management (replaces `genexus_open_kb`). |
-| `genexus_properties` | Essential for enabling "Business Component" or "Expose as Web Service". |
+| `genexus_properties` | Essential for enabling "Business Component" or "Expose as Web Service". For WorkWithPlus also handles `SDPlus_Editor_Apply_On_Save` (toggle to keep pattern XML overrides). |
+| `genexus_list_objects --typeFilter ThemeClass --nameFilter <Button\|TextBlock\|Title\|...>` | Discover real theme-class names in the KB before applying styling. |
+
+## Pattern editing (WorkWithPlus PatternInstance / PatternVirtual)
+
+The MCP edits the IDE's full pattern XML model — containers, controls, actions, grids, orders, filters, rules, event blocks. Both `mode: full` and `mode: patch` work on `part: 'PatternInstance'` (and `'PatternVirtual'`).
+
+**Auto-reconcile `childrenOrderedList`** — don't manage it by hand. On every pattern write the MCP rebuilds (and creates if missing) every parent's `childrenOrderedList` from the actual child order in your XML, dropping orphans and adding new entries. The response carries a `childrenOrderedListReconciliation` block describing each rewrite (or skip with reason). The IDE only renders children listed there, so this matters.
+
+**Transaction view vs Selection view** — they're separate XPath subtrees inside the same PatternInstance:
+- `/instance/transaction/...` → form view (TableContent + TableActions, `<rule>`s).
+- `/instance/level/selection/...` → list view (TableSearch + `<orders>` + `<grid>`).
+
+Edit one without touching the other.
+
+**Element kinds** (XML node → IDE control):
+- **Custom buttons → `<userAction>`**, NOT `<standardAction>`. Only `Trn_Enter`/`Trn_Cancel`/`Trn_Delete` (transaction) and `Insert`/`Update`/`Delete`/`Export`/`ExportReport` (selection grid) are registered standard actions; the SDK rejects unknown standardAction names during validated ops.
+- Sections → `<table isGroup="True" title="…" groupThemeClass="GroupTela|GroupTelaResp|GroupFiltro">…</table>`.
+- Text → `<textBlock controlName="…" caption="…" themeClass="BigTitle|LinkText|…" format="HTML" />`.
+- Buttons style via `buttonClass="btn ButtonGreen|ButtonBlue|ButtonRed|ButtonCinza"` (resolve real class names from the KB; see the `genexus_list_objects` tip above).
+
+**Apply-on-save override** — when `SDPlus_Editor_Apply_On_Save` is enabled on the WorkWithPlus object, the pattern engine recomputes some attributes after every save (notably `title` bound to the underlying transaction). To keep hard overrides:
+
+```jsonc
+{ "tool": "genexus_properties",
+  "arguments": { "action": "set", "name": "WorkWithPlus<Object>",
+                 "propertyName": "SDPlus_Editor_Apply_On_Save", "value": "False" } }
+```
+
+Accepts `"True" | "False" | "Default"`.
+
+**Workflow for a pattern redesign**:
+1. `genexus_list_objects --typeFilter ThemeClass --nameFilter <kind>` — discover real class names.
+2. `genexus_read --part PatternInstance` — current state.
+3. Edit the XML in memory: add `<userAction>`/`<textBlock>`/group `<table isGroup="True">`/etc, apply theme classes. Don't worry about `childrenOrderedList`.
+4. `genexus_edit --mode full|patch --part PatternInstance` — MCP reconciles ordering, validates via SDK, returns `persistedVerified: true` plus the reconciliation report.
+5. Read back to confirm.
+
+See `genexus://kb/tool-help/genexus_edit` resource for concrete pattern examples.
 
 ## Anti-patterns
 

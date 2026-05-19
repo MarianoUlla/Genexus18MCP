@@ -117,6 +117,40 @@ Una vez que el "list 5 objects" funcionó, probá estos:
 
 > *"En el procedure CrearPedido, renombrá la variable &cant a &cantidad."*
 
+### Editar pantallas WorkWithPlus (patterns)
+
+El MCP edita el XML completo de `PatternInstance` / `PatternVirtual`: agregar, sacar y reordenar controles (textBlock, atributos, botones, grupos, órdenes, filtros), aplicar clases de tema (`themeClass`, `buttonClass`, `groupThemeClass`), y reorganizar las vistas **Transaction** y **Selection** de forma independiente.
+
+> *"En WorkWithPlusPedido, agregá un botón 'Duplicar' en la vista de transacción al lado de Guardar/Cancelar/Eliminar."*
+
+> *"Agrupá los atributos de la transacción Cliente en una sección 'Datos de contacto' con groupThemeClass='GroupTelaResp'."*
+
+> *"En la lista de WorkWithPlusFactura, agregá una ordenación nueva por FechaFactura descendente."*
+
+> *"Aplicale buttonClass='btn ButtonGreen' al botón Guardar de WorkWithPlusPedido y poné el header del formulario con themeClass='BigTitle'."*
+
+> *"Sacá la acción Exportar de la grilla de Selection en WorkWithPlusReporte."*
+
+> *"Leeme la parte Documentation de la transacción Cliente y reescribila en markdown."*
+
+El MCP recalcula automáticamente el atributo `childrenOrderedList` que el IDE usa para renderizar el orden — vos solo decís *dónde* va el elemento en el XML, el MCP se encarga de que aparezca ahí en el IDE. La respuesta incluye un bloque `childrenOrderedListReconciliation` con lo que se reescribió y por qué.
+
+Para descubrir las clases de tema disponibles en tu KB:
+
+> *"Listame todos los ThemeClass cuyo nombre contenga 'Button'."*
+
+(En el fondo eso llama `genexus_list_objects --typeFilter ThemeClass --nameFilter Button`.)
+
+**Detalle clave**: los botones custom (Duplicar, Auditar, Exportar…) deben ser `<userAction>`, no `<standardAction>`. Solo `Trn_Enter` / `Trn_Cancel` / `Trn_Delete` son acciones estándar registradas en una transaction WorkWithPlus. El reconciler trata `<userAction>` como par de `<standardAction>` y conviven en la misma fila de TableActions.
+
+Si querés que tus overrides de pattern sobrevivan al engine de WorkWithPlus (que normaliza algunos campos como el `title` en cada save), apagá el "Apply on save" así:
+
+> *"Setá la property SDPlus_Editor_Apply_On_Save de WorkWithPlusPedido a False."*
+
+Internamente eso es `genexus_properties --action set --name WorkWithPlus<Objeto> --propertyName SDPlus_Editor_Apply_On_Save --value False` (acepta `True | False | Default`).
+
+Detalles completos del workflow, la matriz de capacidades verificadas y orientaciones sobre el pattern-engine de WorkWithPlus: ver [README — WorkWithPlus pattern editing](../README.md#workwithplus-pattern-editing--what-you-can-actually-do).
+
 ### Build y testing
 
 > *"Compilá la KB y reportame los errores si hay alguno."*

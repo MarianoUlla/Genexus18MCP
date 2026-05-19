@@ -116,6 +116,14 @@ Once installed, here's what unlocks. Try these as your first prompts:
 - *"Add a new attribute CreatedAt of type DateTime to the Customer transaction."*
 - *"Rename the variable &qty to &quantity in procedure CreateOrder."*
 
+**WorkWithPlus pattern editing** (full structural + theming control)
+- *"In WorkWithPlusOrder, add a 'Duplicate' button to the transaction view alongside Save/Cancel/Delete."*
+- *"Group the Customer transaction attributes into a 'Contact Info' section with theme class GroupTelaResp."*
+- *"On the WorkWithPlusInvoice list, add a new ordering by InvoiceDate descending."*
+- *"Style the Save button on WorkWithPlusOrder with buttonClass='btn ButtonGreen' and apply BigTitle to the form header."*
+- *"Remove the Export action from the Selection grid of WorkWithPlusReport."*
+- *"Read the Documentation part of the transaction Customer and rewrite it in markdown."*
+
 **Analysis**
 - *"Explain what the procedure ProcessShipment does, step by step."*
 - *"What SQL does the query in WebPanel CustomerList generate?"*
@@ -170,13 +178,56 @@ The worker exposes these tool families to the MCP router. *(Detailed schemas in 
 - **Lifecycle & Build** — `genexus_lifecycle`, `genexus_test`, `genexus_format`
 - **Native Layout SDK** — `genexus_layout` (`get_tree`, `find_controls`, `set_property`, `rename_printblock`, `add_printblock`, `get_preview`, …)
 - **KB pool (v2.3.0+)** — `genexus_kb` (`list`, `open`, `close`, `set_default`) for multi-KB parallel work
-- **Patterns** — Smart XML generation/interpretation (e.g., WorkWithPlus PatternInstance).
+- **WorkWithPlus pattern editing** — full read/write of `PatternInstance` and `PatternVirtual` parts via `genexus_read` / `genexus_edit`. Supports the entire pattern XML surface: containers (`<table>`, groups), controls (`<textBlock>`, `<errorViewer>`, `<attribute>`, `<gridAttribute>`, `<filterAttribute>`), actions (`<standardAction>`, `<userAction>`), grids, orders, rules, and event blocks. Both **Transaction** and **Selection** views are addressable independently (XPath `/instance/transaction/...` vs `/instance/level/selection/...`).
+- **Documentation & Help parts** — `Documentation` (rich text / markdown) and `Help` (HTML) are now first-class write targets via `genexus_edit` (fixed in v2.4.4 — both parts had a silent no-op bug previously).
+- **Theme classes & styling** — apply real ThemeClass values (`themeClass`, `buttonClass`, `groupThemeClass`, `cellThemeClass`, etc) so generated screens use the KB's design system. Discover the available classes with `genexus_list_objects --typeFilter ThemeClass --nameFilter <Button|TextBlock|Title>` and apply them in the pattern XML.
 
 > **Multi-KB (v2.3.0+):** every non-meta tool takes an optional `kb` argument (alias or absolute path). The gateway can hold up to `Server.MaxOpenKbs` (default 3) KBs open at once, each in its own Worker process — calls to different KBs run truly in parallel. See [Advanced Configuration](#advanced-configuration) for the `KBs[]` schema.
 
-**Edit modes** (`genexus_edit`): `xml` (full replacement, default), `ops` (typed semantic ops like `set_attribute`, `add_rule`), `patch` (JSON-Patch RFC 6902).
+**Edit modes** (`genexus_edit`): `full` (whole-part replacement, default), `patch` (Replace/Insert_After/Append over a context anchor — works on source code AND pattern XML), `ops` (typed semantic ops like `set_attribute`, `add_rule` for source-bearing parts).
+
+**Pattern XML auto-reconcile**: WorkWithPlus encodes IDE rendering order in a per-parent `childrenOrderedList` attribute. The MCP now rebuilds (and **creates if missing**) every list from the actual XML child order on each write — callers only describe *where* an element goes in the tree and the MCP makes the IDE render it there. The response includes a `childrenOrderedListReconciliation` block listing each (re)written parent plus any structural elements that couldn't be inferred safely.
 
 **Safe by default**: all write tools accept `dryRun: true` (returns a preview without mutating the KB) and `idempotencyKey` (safe retries; concurrent calls coalesce, results cached 15 min).
+
+---
+
+## WorkWithPlus pattern editing — what you can actually do
+
+WorkWithPlus patterns are XML documents that drive Transaction-and-Selection screens. The MCP exposes the entire surface so an agent can design or restructure a screen without opening the IDE:
+
+| Capability | Tool / pattern | Status |
+|---|---|---|
+| Read `PatternInstance` / `PatternVirtual` XML | `genexus_read --part PatternInstance` | ✅ |
+| Replace whole pattern (`mode: full`) | `genexus_edit --mode full --part PatternInstance` | ✅ verified live |
+| Find/replace text-style patches (`mode: patch`) | `genexus_edit --mode patch --part PatternInstance --operation Replace` | ✅ verified live |
+| Add / remove / reorder structural elements (textBlock, attribute, standardAction, table-as-group, order, filterAttribute, gridAttribute, eventBlock…) | XML edit + auto-reconcile | ✅ verified live |
+| Theme classes (`themeClass`, `buttonClass`, `groupThemeClass`, `cellThemeClass`, `format="HTML"`) | XML attribute on the element | ✅ verified live |
+| Reorganize Transaction view (form layout, action row) | edit under `/instance/transaction/...` | ✅ verified live |
+| Reorganize Selection view (list/grid, filters, orders) | edit under `/instance/level/selection/...` | ✅ verified live |
+| Auto-rebuild `childrenOrderedList` from XML order | done implicitly on every write; report under `childrenOrderedListReconciliation` | ✅ verified live |
+
+**Recommended workflow for a screen redesign:**
+
+1. `genexus_list_objects --typeFilter ThemeClass --nameFilter Button` — discover the actual button classes available in this KB (`ButtonGreen`, `ButtonBlue`, `ButtonRed`, etc — names vary per KB).
+2. `genexus_read --name WorkWithPlus<Object> --part PatternInstance` — get the current XML.
+3. Edit the XML in memory (LLM): wrap attributes in a `<table isGroup="True" title="…" groupThemeClass="GroupTelaResp">`, reorder buttons, add a new `<standardAction>`, attach `buttonClass="btn ButtonGreen"`, etc.
+4. `genexus_edit --mode full --part PatternInstance --content "<new xml>"` — the MCP rewrites the part, reconciles `childrenOrderedList` on every container, and verifies the round-trip.
+5. Read back to confirm; refresh the GeneXus IDE to see the result.
+
+**Custom buttons use `<userAction>`, not `<standardAction>`.** `Trn_Enter` / `Trn_Cancel` / `Trn_Delete` are the only registered standard actions on a WorkWithPlus transaction; any custom button (Duplicate, Audit, Export, etc.) must be a `<userAction caption="…" name="…" buttonClass="btn ButtonGreen" confirm="False" />`. The MCP's reconciler treats `<userAction>` as a peer of `<standardAction>` (same typeCode 17/18 by context), so they coexist in the same `TableActions` row and the IDE renders them side-by-side.
+
+**Things to know (orientation, not gotchas):**
+
+- **WorkWithPlus normalizes some attributes after every save.** Certain fields are bound to the underlying transaction (e.g., `title` on top-level groups derives from the transaction's friendly name). When `"Apply this pattern on save"` is enabled on the WorkWithPlus object, the engine recomputes those fields — same behavior whether you edit in the IDE or via MCP. To make a hard override stick, toggle that flag via MCP:
+  ```jsonc
+  { "tool": "genexus_properties",
+    "arguments": { "action": "set", "name": "WorkWithPlus<Object>",
+                   "propertyName": "SDPlus_Editor_Apply_On_Save", "value": "False" } }
+  ```
+  Accepts `"True" | "False" | "Default"` (Default inherits the KB-level setting). Set back to `"Default"` to re-enable engine recomputation. Validated live in this repo.
+- **Structural safety is enforced by the SDK.** If you submit XML that violates pattern invariants (e.g., a `<transaction>` without a `<level>`, or a `<standardAction>` whose `name` isn't a registered action), the SDK rejects the save and the MCP returns the exact error so you can fix the input. The KB never ends up half-written.
+- **The IDE Pattern preview is a structural mockup, not a styled render.** Theme CSS (`buttonClass`, `themeClass`, fonts, colors) is resolved at runtime, not in the preview canvas — so even after a successful MCP write the preview pane will look generic. To verify styling: open the element in the IDE tree and check the right-hand **Properties panel** (the applied classes show there), or hit **Run / Live Editing** to see the real CSS. This is GeneXus IDE behavior, independent of how the pattern was edited.
 
 ---
 

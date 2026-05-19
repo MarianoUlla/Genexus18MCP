@@ -2002,9 +2002,30 @@ namespace GxMcp.Worker.Services
         private string WritePatternPart(global::Artech.Architecture.Common.Objects.KBObject obj, string target, string partName, string xml, bool dryRun = false)
         {
             string normalizedInput;
+            GxMcp.Worker.Helpers.PatternChildOrderReconciler.Report reconcileReport;
             try
             {
-                normalizedInput = XDocument.Parse(xml, LoadOptions.PreserveWhitespace).ToString();
+                var doc = XDocument.Parse(xml, LoadOptions.PreserveWhitespace);
+                // Auto-reconcile childrenOrderedList so callers (LLMs) can add/remove/reorder
+                // children purely by editing XML — the helper rebuilds each parent's
+                // ordering attribute from the live child tree. Without this, an LLM that
+                // adds a <textBlock> but forgets to update childrenOrderedList ships a
+                // technically-valid XML that the IDE renders incorrectly. See
+                // src/GxMcp.Worker/Helpers/PatternChildOrderReconciler.cs for the rules.
+                reconcileReport = GxMcp.Worker.Helpers.PatternChildOrderReconciler.Reconcile(doc);
+                if (reconcileReport.ParentsUpdated > 0)
+                {
+                    Logger.Info("[PATTERN-WRITE] Auto-reconciled childrenOrderedList on " + reconcileReport.ParentsUpdated + " parent(s).");
+                    foreach (var change in reconcileReport.Changes)
+                    {
+                        Logger.Info("[PATTERN-WRITE]   " + change);
+                    }
+                }
+                foreach (var skip in reconcileReport.Skips)
+                {
+                    Logger.Warn("[PATTERN-WRITE]   skipped: " + skip);
+                }
+                normalizedInput = doc.ToString();
             }
             catch (Exception ex)
             {
@@ -2084,7 +2105,12 @@ namespace GxMcp.Worker.Services
                 try
                 {
                     LogPatternValidationState("before apply", resolvedObject);
-                    ApplyPatternEnvelope(resolvedPart, normalizedInput);
+                    // The SDK round-trip is: SerializeToXml() -> <Part><Data><![CDATA[<instance>...]]></Data></Part>.
+                    // DeserializeFromXml expects the same wrapper. Passing the bare <instance>...</instance>
+                    // (innerXml / normalizedInput) caused the SDK to ignore the payload, leaving the part
+                    // unchanged in memory — Save() was a no-op and persistedHash kept matching the pre-write
+                    // value. BuildPatternPartEnvelope already produced the wrapped form; route it through.
+                    ApplyPatternEnvelope(resolvedPart, envelope, normalizedInput);
                     LogPatternInMemoryStateIfEnabled(obj, resolvedPart, partName, normalizedInput);
                     LogPatternValidationState("after apply before presave", resolvedObject);
                     RunPatternPreSaveExperimentIfEnabled(resolvedObject, resolvedPart, normalizedInput);
@@ -2097,12 +2123,44 @@ namespace GxMcp.Worker.Services
                     {
                     }
 
+                    // KBObjectManager.PrepareSave silently skips persistence when kbObject.Mode == Mode.Unchanged.
+                    // DeserializeFromXml mutates internal state but does NOT propagate to obj.Mode in the
+                    // headless worker, so EnsureSave(true) was a no-op (persistedHash stayed identical across
+                    // runs). Mirror the WriteVisualPart fix (line ~1924): invalidate the part's last-modification
+                    // snapshot so dirty tracking notices, then call obj.Save(ForceSave=true) which bypasses the
+                    // Mode.Unchanged short-circuit — same path the SDK uses for generated objects.
+                    InvalidatePartLastModification(resolvedPart);
+
                     if (!TryPatternDirectSaveExperiment(resolvedObject))
                     {
-                        resolvedObject.EnsureSave(true);
+                        bool forceSaved = false;
+                        try
+                        {
+                            var prefs = new global::Artech.Architecture.Common.Objects.KBObjectSavePreferences
+                            {
+                                ForceSave = true,
+                                ForceSaveDefaultParts = true,
+                                SkipValidation = true
+                            };
+                            resolvedObject.Save(prefs);
+                            forceSaved = true;
+                            Logger.Info("[PATTERN-WRITE] resolvedObject.Save(KBObjectSavePreferences{ForceSave=true}) completed.");
+                        }
+                        catch (Exception fsEx)
+                        {
+                            var inner = fsEx.InnerException ?? fsEx;
+                            Logger.Info("[PATTERN-WRITE] ForceSave threw: " + inner.GetType().Name + ": " + inner.Message + " — falling back to EnsureSave(true).");
+                        }
+
+                        if (!forceSaved)
+                        {
+                            resolvedObject.EnsureSave(true);
+                        }
                     }
                     transaction.Commit();
-                    ScheduleFlush();
+                    // Force synchronous flush so the bytes hit disk before the verification read; the default
+                    // timer-based ScheduleFlush() can lose writes if the worker is recycled before it fires.
+                    ScheduleFlush(force: true);
 
                     string persistedXml = _patternAnalysisService.ReadPatternPartXml(obj, partName, out var refreshedObject, out _);
 
@@ -2129,6 +2187,31 @@ namespace GxMcp.Worker.Services
                         success["resolvedType"] = resolvedObject.TypeDescriptor?.Name;
                     }
 
+                    // Echo the auto-reconcile report so LLM callers can see exactly
+                    // which childrenOrderedList values the MCP rewrote and why. The IDE
+                    // hides children that aren't listed; if a caller forgot to update
+                    // the attribute by hand, this block tells them the MCP did it for
+                    // them (or, with `skips`, that it could NOT and the layout may not
+                    // render — that's an actionable signal).
+                    if (reconcileReport.HasContent)
+                    {
+                        var ordering = new JObject
+                        {
+                            ["parentsUpdated"] = reconcileReport.ParentsUpdated,
+                            ["explanation"] = "WorkWithPlus uses `childrenOrderedList` on each container element to drive IDE rendering order. The MCP rebuilds it from the XML's actual child order so callers only need to place elements where they want them in the tree."
+                        };
+                        if (reconcileReport.Changes.Count > 0)
+                        {
+                            ordering["changes"] = new JArray(reconcileReport.Changes);
+                        }
+                        if (reconcileReport.Skips.Count > 0)
+                        {
+                            ordering["skipped"] = new JArray(reconcileReport.Skips);
+                            ordering["skipNote"] = "These parents were left untouched because their childrenOrderedList could not be inferred safely; the affected children may not render in the IDE until the list is corrected manually.";
+                        }
+                        success["childrenOrderedListReconciliation"] = ordering;
+                    }
+
                     return Models.McpResponse.Success("Write", target, success);
                 }
                 catch (Exception ex)
@@ -2139,13 +2222,127 @@ namespace GxMcp.Worker.Services
             }
         }
 
-        private void ApplyPatternEnvelope(global::Artech.Architecture.Common.Objects.KBObjectPart resolvedPart, string innerXml)
+        private static void InvalidatePartLastModification(global::Artech.Architecture.Common.Objects.KBObjectPart part)
         {
+            if (part == null) return;
+
+            // PatternInstancePart does not implement InvalidateLastModification (the WebForm
+            // dirty-tracking hook) and does not expose any string setter ("Source",
+            // "EditableContent", "InstanceXml") — only DeserializeFromXml(string), which
+            // mutates internal state but leaves the part's Mode = Unchanged. Without setting
+            // Dirty/Mode the SDK's KBObjectManager.PrepareSave short-circuits even under
+            // KBObjectSavePreferences.ForceSave because the entity-level dirty check on the
+            // PART (not the object) wins. Force both flags explicitly.
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            try
+            {
+                var invalidate = part.GetType().GetMethod("InvalidateLastModification", flags, null, Type.EmptyTypes, null);
+                if (invalidate != null)
+                {
+                    invalidate.Invoke(part, null);
+                    Logger.Info("[PATTERN-WRITE] Invoked InvalidateLastModification on pattern part.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("[PATTERN-WRITE] InvalidateLastModification skipped: " + ex.Message);
+            }
+
+            try
+            {
+                var dirtyProp = part.GetType().GetProperty("Dirty", flags);
+                if (dirtyProp != null && dirtyProp.CanWrite && dirtyProp.PropertyType == typeof(bool))
+                {
+                    dirtyProp.SetValue(part, true);
+                    Logger.Info("[PATTERN-WRITE] Forced part.Dirty = true.");
+                }
+            }
+            catch (Exception ex) { Logger.Info("[PATTERN-WRITE] Set Dirty=true skipped: " + ex.Message); }
+
+            try
+            {
+                var modeProp = part.GetType().GetProperty("Mode", flags);
+                if (modeProp != null && modeProp.CanWrite)
+                {
+                    // Mode is an enum: Unchanged | Added | Modified | Deleted. Lift to Modified.
+                    var modified = Enum.Parse(modeProp.PropertyType, "Modified", ignoreCase: true);
+                    modeProp.SetValue(part, modified);
+                    Logger.Info("[PATTERN-WRITE] Forced part.Mode = Modified.");
+                }
+            }
+            catch (Exception ex) { Logger.Info("[PATTERN-WRITE] Set Mode=Modified skipped: " + ex.Message); }
+        }
+
+        private static bool TryApplyPatternDataFromXml(global::Artech.Architecture.Common.Objects.KBObjectPart resolvedPart, string innerXml)
+        {
+            if (resolvedPart == null || string.IsNullOrWhiteSpace(innerXml)) return false;
+
+            try
+            {
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                var method = resolvedPart.GetType()
+                    .GetMethods(flags)
+                    .FirstOrDefault(m =>
+                        string.Equals(m.Name, "DeserializeDataFrom", StringComparison.Ordinal) &&
+                        m.GetParameters().Length == 1 &&
+                        typeof(System.Xml.XmlElement).IsAssignableFrom(m.GetParameters()[0].ParameterType));
+                if (method == null)
+                {
+                    Logger.Info("[PATTERN-WRITE] DeserializeDataFrom(XmlElement) not found on " + resolvedPart.GetType().FullName);
+                    return false;
+                }
+
+                // SerializeDataTo(XmlElement target) writes the pattern data AS CHILDREN of target.
+                // The inverse, DeserializeDataFrom, reads from the same shape — i.e. expects to be
+                // passed the PARENT element whose first/only child is the <instance>. Passing
+                // <instance> directly causes the SDK to read its (non-existent) <instance> child
+                // and persist an empty <instance/>. Wrap the innerXml in a transient parent;
+                // use a temp doc for parsing then ImportNode (preserving whitespace would inject
+                // XmlWhitespace nodes that fail the SDK's strict XmlElement cast).
+                var sourceDoc = new System.Xml.XmlDocument { PreserveWhitespace = false };
+                sourceDoc.LoadXml(innerXml);
+
+                var hostDoc = new System.Xml.XmlDocument { PreserveWhitespace = false };
+                var parent = hostDoc.CreateElement("Data");
+                hostDoc.AppendChild(parent);
+                var imported = hostDoc.ImportNode(sourceDoc.DocumentElement, deep: true);
+                parent.AppendChild(imported);
+
+                method.Invoke(resolvedPart, new object[] { parent });
+                return true;
+            }
+            catch (Exception ex)
+            {
+                var inner = ex.InnerException ?? ex;
+                Logger.Warn("[PATTERN-WRITE] DeserializeDataFrom(XmlElement) threw: " + inner.GetType().Name + ": " + inner.Message);
+                return false;
+            }
+        }
+
+        private void ApplyPatternEnvelope(global::Artech.Architecture.Common.Objects.KBObjectPart resolvedPart, string envelopeXml, string innerXml)
+        {
+            // The canonical pattern-part data mutation is DeserializeDataFrom(XmlElement).
+            // SerializeToXml/DeserializeFromXml only round-trip the <Properties> bag (IsDefault etc),
+            // NOT the actual pattern XML. Discovered via runtime reflection — see
+            // src/GxMcp.Worker/Services/WriteService.cs commit history for the inspection trail.
+            if (TryApplyPatternDataFromXml(resolvedPart, innerXml))
+            {
+                Logger.Info("[PATTERN-WRITE] DeserializeDataFrom(XmlElement) applied with " + (innerXml?.Length ?? 0) + " chars.");
+                return;
+            }
+
             if (TryApplyNativePatternMutationExperiment(resolvedPart, innerXml))
             {
                 Logger.Info("[PATTERN-DEBUG] Native pattern mutation experiment applied.");
                 return;
             }
+
+            // SerializeToXml/DeserializeFromXml on KBObjectPart round-trip the wrapped envelope
+            // (<Part type="..."><Data><![CDATA[...]]></Data></Part>). Passing the bare inner XML
+            // is silently ignored, so prefer the envelope and fall back to innerXml only if
+            // envelope construction failed upstream.
+            string payload = !string.IsNullOrWhiteSpace(envelopeXml) ? envelopeXml : innerXml;
 
             var executeUpdateMethod = resolvedPart.GetType().GetMethod(
                 "ExecuteUpdate",
@@ -2156,12 +2353,12 @@ namespace GxMcp.Worker.Services
 
             if (executeUpdateMethod != null)
             {
-                Action updateAction = () => resolvedPart.DeserializeFromXml(innerXml);
+                Action updateAction = () => resolvedPart.DeserializeFromXml(payload);
                 executeUpdateMethod.Invoke(resolvedPart, new object[] { "MCP pattern update", updateAction });
                 return;
             }
 
-            resolvedPart.DeserializeFromXml(innerXml);
+            resolvedPart.DeserializeFromXml(payload);
         }
 
         private void LogPatternInMemoryStateIfEnabled(

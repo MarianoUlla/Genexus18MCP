@@ -1,8 +1,111 @@
 # Changelog
 
-## Unreleased
+## v2.5.0 — 2026-05-18
 
 ### Fixed
+
+- **`PatchService` reported `Failed` when the auto-reconciler legitimately rewrote
+  `childrenOrderedList` during a pattern write**: PatchService's
+  `VerifyPersistedSource` ran a byte-level comparison of `finalCode` (the
+  pre-reconciler input) vs the persisted XML (post-reconciler). When the
+  reconciler added/removed/reordered list entries — its whole purpose — the
+  verify flagged the difference as a divergence, triggered a fallback write,
+  and returned `error: "Patch write fallback failed after persistence
+  mismatch"` even though the save was correct. Pattern parts now skip the
+  redundant PatchService-level verify and trust WriteService's internal
+  `XmlEquivalence` check (which runs inside `WritePatternPart` after the SDK
+  save). Same fix would surface SDK attribute-reordering as a false negative.
+  Response now carries `persistedVerifyNote` explaining the routing.
+
+- **`<userAction>` was unknown to `PatternChildOrderReconciler`**: caused
+  every `TableActions` row that mixed standard and user actions to land in
+  `skipped` (no typeCode known), leaving the list out of sync. `<userAction>`
+  is a peer of `<standardAction>` — same row, same context-sensitive typeCode
+  (17 selection / 18 transaction). Reconciler now treats them identically.
+  Custom buttons like "Duplicate"/"Audit"/"Export" MUST be `<userAction>` (only
+  `Trn_Enter`/`Trn_Cancel`/`Trn_Delete` are registered standard actions on a
+  WorkWithPlus transaction; the SDK rejects unknown `<standardAction name>`
+  during validated operations like `genexus_properties set`).
+
+- **Singleton kinds (`<orders>`, `<grid>`) were incorrectly treated as
+  "missing identifier" by `PatternChildOrderReconciler`**: `GetIdentifier`
+  returned `string.Empty` for them (correct — their entry shape is
+  `{level};{typeCode};` with an empty id slot), but the caller's guard was
+  `string.IsNullOrWhiteSpace(identifier)` which lumped empty-string and null
+  together. Result: every `TableFiltrosFundo` and `TableGrid` landed in
+  `skipped` and never got a list, so the IDE could hide their children.
+  Changed the guard to `identifier == null` so the intentional empty slot
+  survives.
+
+### Added
+
+- **Auto-reconcile `childrenOrderedList` on pattern writes** (`PatternChildOrderReconciler`):
+  WorkWithPlus stores per-parent rendering order in a `childrenOrderedList`
+  attribute that the IDE follows blindly — children missing from the list are
+  hidden, stale entries leave ghost slots. Callers (LLMs in particular) that
+  add/remove/move pattern children would need to keep that attribute in sync
+  by hand. Now `WritePatternPart` walks the parsed XML, rebuilds every
+  `childrenOrderedList` from the actual child order, **invents the list when
+  the parent has none** (so new containers added by callers automatically
+  render in the IDE), and surfaces the diff in the response under
+  `childrenOrderedListReconciliation` with `(created)` / before-after entries
+  plus a skip list naming any parents where type-code or identifier could not
+  be inferred — actionable signal that those subtrees may not render until
+  the caller corrects the XML. Element-kind → typeCode table covers the
+  common WWP nodes (table 01/02 context-aware, textBlock 27, errorViewer 28,
+  attribute 22, gridAttribute 23, descriptionAttribute 25, standardAction
+  17/18 context-aware, filterAttribute 12, order 13, orders 30, rule 56, grid
+  31, eventBlock 75). Identifier extraction handles the composite shape
+  inside `<order>` children and the empty-identifier convention for singleton
+  kinds (`<orders>`, `<grid>`). Inherited area-code (level 2 vs 4) traverses
+  the ancestor chain so a newly-added container picks up the right value
+  even when its closest siblings don't have a list yet. Blocklist excludes
+  structural elements that don't participate in the ordering scheme
+  (`<instance>`, `<transaction>`, `<level>`, `<selection>`, `<WPRoot>`,
+  `<rules>`, `<events>`, `<steps>`, `<parameters>`, `<filterAttribute>`).
+  Covered by 11 unit tests in `PatternChildOrderReconcilerTests`.
+
+### Fixed
+
+- **Pattern (`PatternInstance` / `PatternVirtual`) writes silently no-op'd —
+  `WritePatternPart` reported `Success` but the KB never changed**:
+  Three root causes stacked:
+  1. `ApplyPatternEnvelope` called `KBObjectPart.DeserializeFromXml(string)`,
+     which on `Artech.Packages.Patterns.Objects.PatternInstancePart` only
+     round-trips the `<Properties>` bag (`IsDefault` etc) — *not* the pattern
+     data. Live SDK reflection showed the actual mutation entrypoint is
+     `DeserializeDataFrom(XmlElement)` (inverse of `SerializeDataTo(XmlElement)`).
+     The XmlElement must be the **parent** that *contains* the `<instance>`
+     child; passing `<instance>` directly persists an empty `<instance/>`.
+  2. After deserialize, the part still had `Mode == Unchanged` and
+     `Dirty == false`, so `KBObjectManager.PrepareSave` short-circuited even
+     under `KBObjectSavePreferences.ForceSave`. Mirrored the
+     `WriteVisualPart` fix (lines ~1921–1933): explicitly set `part.Dirty =
+     true` and `part.Mode = Modified` via reflection before save.
+  3. `resolvedObject.EnsureSave(true)` was a no-op for the same reason —
+     replaced with `resolvedObject.Save(KBObjectSavePreferences { ForceSave =
+     true, ForceSaveDefaultParts = true, SkipValidation = true })`. Also
+     promoted the post-save flush to synchronous (`ScheduleFlush(force: true)`)
+     so the verification read sees the bytes on disk.
+  Verified live against `WorkWithPlusAcao.PatternInstance` in
+  AcademicoHomolog1: `mode: full` and `mode: patch` both persist with
+  `persistedVerified: true` and round-trip cleanly via `genexus_read`.
+
+- **`genexus_edit` `mode: patch` rejected pattern parts (`PatternInstance` /
+  `PatternVirtual`)**:
+  `PatchService.ReadSourceFast` only handled `VariablesPart`, the virtual
+  `Structure` part, `WebFormXmlHelper.IsVisualPart`, `ISource`, and a reflective
+  `Source`/`Content` fallback. Pattern parts (WorkWithPlus and other patterns)
+  expose their editable XML through `PatternAnalysisService.ReadPatternPartXml`
+  on a resolved WWP instance, so `GetPart` on the source object returned `null`
+  or a non-source part and patch-mode failed with
+  `"Part does not expose text source"`. `mode: full` already worked because
+  `WriteService.WriteObject` routes pattern parts through `WritePatternPart`.
+  Wired `PatternAnalysisService` into `PatchService` and, when
+  `IsPatternPart(partName)` matches, route the read through
+  `ReadPatternPartXml`; the write side already dispatches correctly, so the
+  existing `WriteObject` call in `ApplyPatch` now persists pattern patches
+  end-to-end (verification reads reuse `ReadSourceFast`).
 
 - **`Documentation` / `Help` parts silently failed to persist via `genexus_edit`**:
   `DocumentationPart` and `HelpPart` do not implement `ISource`, and their `Content` /
