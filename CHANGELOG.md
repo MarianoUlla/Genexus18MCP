@@ -26,6 +26,21 @@
   the agent a stable handle to pass to `genexus_layout set_property`. Previously
   these entries had `name: null`.
 
+- **`VariableInjector.GetVariableInternalId` now resolves the real layout id**
+  (FR#3 fully fixed 2026-05-19): `Variable.Id` is the C# instance property the
+  SDK uses to back `AttID="var:N"` references in layout XML — confirmed via
+  live probe against ListaAtiCPAlunoUniGra (`TotalHorasCredito.Id=22` matches
+  `AttID="var:22"`, `SaldoHoras.Id=33` matches `var:33`, etc). The previous
+  implementation tried `GetPropertyValue("Id")` which queries the Properties
+  metadata bag and returns null — only C# reflection on the instance surfaces
+  the value. Helper now reflects `Id` first, falls back to bag keys, and only
+  drops to enumeration-position when both fail. System vars Today/Time/
+  Pgmname/Pgmdesc resolve to 1/2/3/4 (WWP creates them first); deleted
+  variables leave gaps in the sequence. Knock-on: every consumer of this
+  helper — `genexus_inspect.variables[].internalId`, `WebFormSchemaHints.
+  LookupVarNameById`, `LayoutGotchaScanner` shadow-detection — now returns
+  truthful values instead of position-based guesses.
+
 - **`genexus_inspect include=["variables"]` now returns `layoutGotchas`** (FR#1 +
   FR#2 2026-05-19): static analysis array warning about layout patterns that
   compile clean but break at runtime. Currently detects two gotchas — see

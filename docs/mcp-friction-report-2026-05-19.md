@@ -106,17 +106,13 @@ Cada um exige investigação dedicada do SDK Artech/GeneXus — não é refactor
 |---|---|---|
 | #1 OnClickEvent | **Detected (warning)** | Limitação do GeneXus HTML generator confirmada (não é gap do MCP). Scanner `LayoutGotchaScanner.cs` agora emite `GotchaGxButtonHtmlFormCustomEvent` em `genexus_inspect.layoutGotchas` quando o pattern é detectado, com workaround sugerido. Build+smoke cycle eliminado. |
 | #2 ReadOnly inheritance | **Detected (warning)** | Mesma estratégia — `GotchaGxAttributeShadowReadOnly` emitido quando `gxAttribute ControlType=Radio/Combo` binda a var local que sombra atributo de transação. Workaround: rename. |
-| #3 layoutAttId mapping | **Partial** | Exposto `layoutAttIdsInUse` em `genexus_inspect` (AnalyzeService.cs). Não resolve o mapping `var:N → variavel` (precisa reflexão profunda no SDK), mas elimina o trial-and-error de "qual var:N está livre". |
+| #3 layoutAttId mapping | **Fixed** | `Variable.Id` (C# instance property) é o `var:N` real do layout. Acessado via reflexão em `GetVariableInternalId` — `GetPropertyValue("Id")` retorna null porque consulta o Properties bag, não os props C#. Confirmado live: `TotalHorasCredito.Id=22` ↔ `var:22`, `SaldoHoras.Id=33` ↔ `var:33`, system vars=1-4. Fallbacks (bag, posição) mantidos por resiliência. |
 | #4 SDT em add_variable | **Fixed** | Resolver agora aceita bare names (`SdtFoo`, BC, Domain) e roteia via `ResolveTypeObject`. KB lookup ausente → `UnknownType` com mensagem clara. Tests: `VariableTypeResolverTests`. |
 | #5 name em gxAttribute | **Fixed** | Fallback sintético `gxAttribute@{dataBinding}` em `UIService.cs`. |
 
 Tests: `dotnet test src/GxMcp.Worker.Tests` 342/342 passa. Gateway 252/252 passa.
 
-### Caveat conhecido na detecção #2
-
-`GotchaGxAttributeShadowReadOnly` depende de `WebFormSchemaHints.LookupVarNameById` para
-resolver `var:N → nome de variável`. Esse helper usa `VariableInjector.GetVariableInternalId`
-que cai em fallback de enumeração posicional quando o SDK não expõe o `Variable.Id` real
-(maioria dos casos). Resultado: a detecção pode mapear pra variável errada ou perder a
-detecção em popups com WWP+ que adicionam vars system na frente. Resolução completa exige
-fix do gap #3 com a property SDK correta.
+Bônus do fix #3: o detector `GotchaGxAttributeShadowReadOnly` (gap #2) agora funciona
+corretamente em produção — ele depende de `WebFormSchemaHints.LookupVarNameById` que usa
+`GetVariableInternalId`. Antes, fallback posicional mapeava var errada; agora resolve
+o nome real e a detecção shadow-attribute fica precisa.

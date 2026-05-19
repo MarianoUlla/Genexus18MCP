@@ -167,18 +167,40 @@ namespace GxMcp.Worker.Helpers
             return v;
         }
 
-        // FR#1 + FR#13 (friction-report 2026-05-14): Layout XML uses AttID="var:N" but tools
-        // never expose the mapping. This helper tries every known SDK surface for the variable's
-        // internal id, falling back to the 1-based enumeration index used by GeneXus runtime.
+        // FR#1 + FR#13 (friction-report 2026-05-14) + FR#3 (2026-05-19): Layout XML uses
+        // AttID="var:N" — the SDK's stable layout id is the C# instance property
+        // Variable.Id. Accessed via reflection because the SDK assembly doesn't expose it
+        // as a typed interface member, and GetPropertyValue("Id") returns null (the
+        // Properties bag doesn't carry Id). Live-probe confirmed: TotalHorasCredito.Id=22
+        // matches AttID="var:22" in ListaAtiCPAlunoUniGra layout XML, SaldoHoras.Id=33
+        // matches "var:33", etc. System vars Today/Time/Pgmname/Pgmdesc get ids 1-4
+        // (WWP creates them first), and deleted variables leave gaps in the ID sequence
+        // — so enumeration-position fallback is wrong for any non-trivial object.
         public static int? GetVariableInternalId(global::Artech.Genexus.Common.Variable v, int fallbackIndex)
         {
             if (v == null) return null;
-            foreach (var prop in new[] { "Id", "InternalId", "VariableId", "VarId", "Index" })
+
+            // Primary: Variable.Id via C# reflection.
+            try
+            {
+                var idProp = v.GetType().GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
+                if (idProp != null && idProp.CanRead)
+                {
+                    object raw = idProp.GetValue(v);
+                    if (raw is int i && i > 0) return i;
+                    if (raw is short s && s > 0) return s;
+                    if (raw is long l && l > 0 && l <= int.MaxValue) return (int)l;
+                }
+            }
+            catch { }
+
+            // Fallback for resilience across SDK versions: try the Properties bag with names
+            // that might carry the id in builds where Variable.Id is renamed/missing.
+            foreach (var prop in new[] { "InternalId", "VariableId", "VarId", "Index", "AttId", "Number" })
             {
                 try
                 {
                     object raw = v.GetPropertyValue(prop);
-                    if (raw == null) continue;
                     if (raw is int i && i > 0) return i;
                     if (raw is short s && s > 0) return s;
                     if (raw is long l && l > 0 && l <= int.MaxValue) return (int)l;
@@ -186,8 +208,12 @@ namespace GxMcp.Worker.Helpers
                 }
                 catch { }
             }
+
+            // Last resort. Almost always WRONG for objects touched by WorkWithPlus patterns
+            // since those inject system vars early — kept only so behavior is defined.
             return fallbackIndex;
         }
+
 
         public static string GetVariablesAsText(KBObject obj)
         {
