@@ -627,18 +627,48 @@ namespace GxMcp.Worker.Services
                                     var xmlDoc = xmlDocProp?.GetValue(wfPart) as System.Xml.XmlDocument;
                                     if (xmlDoc?.DocumentElement != null)
                                     {
+                                        string layoutXml = xmlDoc.OuterXml;
                                         var idsInUse = new JArray();
                                         var seen = new HashSet<string>();
                                         var re = new System.Text.RegularExpressions.Regex(
                                             "AttID=\"((?:var|att):\\d+)\"",
                                             System.Text.RegularExpressions.RegexOptions.Compiled);
-                                        foreach (System.Text.RegularExpressions.Match m in re.Matches(xmlDoc.OuterXml))
+                                        foreach (System.Text.RegularExpressions.Match m in re.Matches(layoutXml))
                                         {
                                             string id = m.Groups[1].Value;
                                             if (seen.Add(id)) idsInUse.Add(id);
                                         }
                                         if (idsInUse.Count > 0)
                                             lock (result) result["layoutAttIdsInUse"] = idsInUse;
+
+                                        // FR#1 + FR#2 (friction-report 2026-05-19): surface static
+                                        // gotcha warnings so the agent learns at inspect time, not
+                                        // after build+browser smoke. Currently catches gxButton custom
+                                        // OnClickEvent in html forms and gxAttribute Radio/Combo bound
+                                        // to a var that shadows a transaction attribute.
+                                        try
+                                        {
+                                            var gotchas = LayoutGotchaScanner.Scan(layoutXml, obj);
+                                            if (gotchas != null && gotchas.Count > 0)
+                                            {
+                                                var arr = new JArray();
+                                                foreach (var g in gotchas)
+                                                {
+                                                    var entry = new JObject
+                                                    {
+                                                        ["code"] = g.Code,
+                                                        ["severity"] = g.Severity,
+                                                        ["element"] = g.Element,
+                                                        ["controlId"] = g.ControlId,
+                                                        ["message"] = g.Message,
+                                                        ["workaround"] = g.Workaround
+                                                    };
+                                                    arr.Add(entry);
+                                                }
+                                                lock (result) result["layoutGotchas"] = arr;
+                                            }
+                                        }
+                                        catch { /* scanner best-effort */ }
                                     }
                                 }
                             }

@@ -26,23 +26,23 @@
   the agent a stable handle to pass to `genexus_layout set_property`. Previously
   these entries had `name: null`.
 
-### Known limitations (documented, not fixed)
+- **`genexus_inspect include=["variables"]` now returns `layoutGotchas`** (FR#1 +
+  FR#2 2026-05-19): static analysis array warning about layout patterns that
+  compile clean but break at runtime. Currently detects two gotchas — see
+  `LayoutGotchaScanner.cs`:
+  - `GotchaGxButtonHtmlFormCustomEvent`: `gxButton OnClickEvent="'Custom'"` in
+    `<Form type="html">` will be ignored by the HTML generator (always wires
+    Enter regardless). Workaround suggestion points to `<gxBitmap eventGX="...">`
+    or moving to `<Form type="layout">` with `<action onClickEvent="...">`.
+  - `GotchaGxAttributeShadowReadOnly`: `gxAttribute ControlType="Radio Button"
+    | "Combo Box"` bound to a local variable that shadows a transaction
+    attribute renders disabled even with `ReadOnly="False"`. Workaround
+    suggestion: rename the local variable.
 
-- **`gxButton OnClickEvent` custom events ignored by HTML form generator**
-  (FR#1): in `<Form id="1" type="html">`, every `<gxButton>` renders with
-  `data-gx-evt="5"` (Enter) regardless of `OnClickEvent="'Foo'"` / `onClickEvent`
-  / `eventGX`. Workaround: use `<action onClickEvent="'Foo'">` in
-  `<Form type="layout">`, or wire OnClickEvent through the GeneXus IDE Properties
-  Panel. Root cause: SDK event-wiring API not exposed via raw XML — needs
-  dedicated SDK probe session.
-
-- **`gxAttribute ReadOnly="False"` ignored when local variable shadows a
-  same-name transaction attribute, specifically for `ControlType="Radio Button"`
-  / `"Combo Box"`** (FR#2): rendered with `disabled=""` `class="gx-disabled"`
-  `data-gx-readonly=""`. Text input variant (no `ControlType`) is editable.
-  Workaround: rename the local variable to avoid shadowing
-  (e.g. `&Alu2RegProf` → `&RespostaRegProf`). Tracked in
-  `docs/mcp-friction-report-2026-05-19.md`.
+  Both gotchas are not "MCP bugs" per se — they're GeneXus HTML generator
+  behaviors the agent can't change. But surfacing them at inspect time skips
+  the build+browser smoke cycle that previously revealed them. Tests:
+  `LayoutGotchaScannerTests` (7 new cases).
 
 ## v2.5.0 — 2026-05-18
 
