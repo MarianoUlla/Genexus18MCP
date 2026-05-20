@@ -169,21 +169,35 @@ namespace GxMcp.Gateway
 
             ["genexus_create_object"] =
                 "# genexus_create_object\n\n" +
-                "Create a new empty GeneXus object in the active KB. Supported types: `Procedure`, `Transaction`, `WebPanel`, `SDPanel`, `SDT`, `DataProvider`, `Attribute`, `Table`.\n\n" +
+                "Create a new empty GeneXus object in the active KB. The tool covers every KBObject the IDE can create — both objects with a typed wrapper (Transaction, Procedure, WebPanel, SDT, DataProvider, DataSelector, Domain, Attribute, Table, Index, ExternalObject, Theme, Image, Menu, Menubar, Stencil, UserControl, WorkPanel, Report, API, URLRewrite, MiniApp, SuperApp, DesignSystem, ColorPalette, OfflineDatabase, DataView, Group, Language) and Guid-only types (SDPanel, Dashboard, Query, QueryDashboard, WorkflowDiagram, ConversationalFlows, TestSuite, ThemeClass, ThemeColor, ThemeTransformation, DesignSystemClass, WorkWithDevices, WorkWithWeb, WikiPageKBObject, TranslationMessage, DataStoreCategory, GeneratorCategory, DeploymentUnitCategory).\n\n" +
+                "Aliases accepted: `StructuredDataType`→SDT, `BusinessProcessDiagram`/`BPD`→WorkflowDiagram, `PanelForSD`→SDPanel.\n\n" +
                 "## Defaults that get seeded\n" +
                 "- `Transaction` — gets a default `<Name>Id : Numeric(8,0) [Key]` attribute so the SDK accepts the empty save.\n" +
                 "- `SDT` — gets a default `Item1 : VARCHAR(40)` item.\n" +
-                "- `Procedure` / `DataProvider` — empty source with a `// Procedure: <Name>` header.\n\n" +
+                "- `Procedure` / `DataProvider` — empty source with a `// Procedure: <Name>` header.\n" +
+                "- `Domain` — defaults to `Character(20)` when no `dataType` is supplied.\n\n" +
                 "When the response carries `_meta.seeded`, the caller knows what's already there and can decide whether to overwrite (`genexus_edit part=Structure mode=full`).\n\n" +
+                "## Domain (new)\n" +
+                "Pass either a primitive shape (`dataType` + `length`/`decimals`/`signed`) or `basedOn=<existingDomain>`. For an **enumerated domain**, add `enumValues=[{name,value}...]`.\n" +
+                "- The `value` for a Character/VarChar domain must be a quoted literal — e.g. `\"\\\"A\\\"\"` (string `\"A\"`). For Numeric, pass the literal number as a string (`\"1\"`).\n" +
+                "- Response `_meta` echoes back `dataType`, `length`, `enumValues` (and `enumError`/`typeError` if any step failed best-effort).\n" +
+                "- Replace attributes by the new domain via `genexus_edit name=<Attr> part=Structure` setting `DomainBasedOn=<DomainName>`, then `genexus_delete_object` for the now-redundant attributes.\n\n" +
+                "Example — exactly the Edgar `UserStatus` case:\n" +
+                "```json\n" +
+                "{\n  \"type\": \"Domain\",\n  \"name\": \"UserStatus\",\n  \"dataType\": \"Character\",\n  \"length\": 10,\n  \"enumValues\": [\n    {\"name\":\"Active\",   \"value\":\"\\\"A\\\"\", \"description\":\"Cuenta Normal\"},\n    {\"name\":\"Inactive\", \"value\":\"\\\"I\\\"\", \"description\":\"Cuenta inactiva\"},\n    {\"name\":\"Blocked\",  \"value\":\"\\\"B\\\"\", \"description\":\"Bloqueada por exceso de intentos\"}\n  ]\n}\n```\n\n" +
                 "## WebPanel / SDPanel hint\n" +
                 "An empty WebPanel is just a blank page — it has **no WorkWithPlus pattern** by default. " +
                 "If the goal is a WWP-style screen (list with filters, actions, grid), the next call should be `genexus_apply_pattern name=<X> pattern=WorkWithPlus`, then shape via `genexus_edit part=PatternInstance`. " +
                 "The response surfaces this in `_meta.patternHint` so the agent doesn't drift into editing `WebForm` by hand.\n\n" +
                 "For popup-style WebPanels with structured inputs/buttons, prefer `genexus_create_popup` — it emits a fully-wired popup in one call.\n\n" +
-                "## Examples\n" +
+                "## More examples\n" +
                 "- `{ type: \"Transaction\", name: \"Invoice\" }`\n" +
                 "- `{ type: \"WebPanel\", name: \"InvoiceList\" }` — then call `genexus_apply_pattern` if WWP is wanted.\n" +
-                "- `{ type: \"Procedure\", name: \"BillingCalc\" }`\n",
+                "- `{ type: \"Procedure\", name: \"BillingCalc\" }`\n" +
+                "- `{ type: \"Domain\", name: \"Email\", dataType: \"VarChar\", length: 100 }`\n" +
+                "- `{ type: \"Domain\", name: \"Age\", basedOn: \"PositiveInt\" }`\n" +
+                "- `{ type: \"WorkflowDiagram\", name: \"ApprovalFlow\" }`\n" +
+                "- `{ type: \"Dashboard\", name: \"SalesKpis\" }`\n",
 
             ["genexus_edit_and_build"] =
                 "# genexus_edit_and_build\n\n" +

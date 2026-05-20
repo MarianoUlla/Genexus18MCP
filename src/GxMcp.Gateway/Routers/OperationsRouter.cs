@@ -16,7 +16,17 @@ namespace GxMcp.Gateway.Routers
                         module = "Object",
                         action = "Create",
                         target = args?["name"]?.ToString(),
-                        type = args?["type"]?.ToString()
+                        type = args?["type"]?.ToString(),
+                        // Domain-specific options (ignored for other types). Sent verbatim so the
+                        // worker's CreateObject(options) overload can pick them up without the
+                        // gateway having to know the schema of every future type.
+                        dataType = args?["dataType"]?.ToString(),
+                        length = args?["length"]?.ToObject<int?>(),
+                        decimals = args?["decimals"]?.ToObject<int?>(),
+                        signed = args?["signed"]?.ToObject<bool?>(),
+                        description = args?["description"]?.ToString(),
+                        basedOn = args?["basedOn"]?.ToString(),
+                        enumValues = args?["enumValues"]
                     };
 
                 case "genexus_delete_object":

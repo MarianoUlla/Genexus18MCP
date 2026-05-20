@@ -73,6 +73,11 @@ namespace GxMcp.Worker.Services
 
         public string CreateObject(string type, string name)
         {
+            return CreateObject(type, name, null);
+        }
+
+        public string CreateObject(string type, string name, JObject options)
+        {
             var sw = Stopwatch.StartNew();
             try
             {
@@ -81,18 +86,17 @@ namespace GxMcp.Worker.Services
 
                 Logger.Info(string.Format("Creating Object: {0} ({1})", name, type));
 
-                // Map string type to Guid
-                Guid typeGuid = Guid.Empty;
-                if (type.Equals("Procedure", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Procedure>().Id;
-                else if (type.Equals("Transaction", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Transaction>().Id;
-                else if (type.Equals("WebPanel", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.WebPanel>().Id;
-                else if (type.Equals("SDT", StringComparison.OrdinalIgnoreCase) || type.Equals("StructuredDataType", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.SDT>().Id;
-                else if (type.Equals("DataProvider", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.DataProvider>().Id;
-                else if (type.Equals("Attribute", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Attribute>().Id;
-                else if (type.Equals("Table", StringComparison.OrdinalIgnoreCase)) typeGuid = KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Table>().Id;
-                else if (type.Equals("SDPanel", StringComparison.OrdinalIgnoreCase)) typeGuid = Guid.Parse("702119eb-90e9-4e78-958b-96d5e182283a"); // SDPanel Guid
-
-                if (typeGuid == Guid.Empty) return "{\"status\":\"Error\", \"error\":\"Unsupported object type: " + type + "\"}";
+                // Map string type to Guid. First try the well-known descriptor table (covers
+                // every type with a concrete wrapper class), then fall back to ObjClass.<Name>
+                // reflection so types without a public wrapper (SDPanel, Dashboard, Query,
+                // WorkflowDiagram, ConversationalFlows, TestSuite, WikiPage, WorkWithWeb,
+                // WorkWithDevices, etc.) are still creatable by name.
+                Guid typeGuid = ResolveObjectTypeGuid(type);
+                if (typeGuid == Guid.Empty)
+                {
+                    return "{\"status\":\"Error\", \"error\":\"Unsupported object type: " + type +
+                        "\", \"hint\":\"Known types: Transaction, Procedure, WebPanel, SDPanel, SDT, DataProvider, DataSelector, Domain, Attribute, Table, Index, ExternalObject, Image, Theme, ThemeClass, DesignSystem, ColorPalette, Menu, Menubar, Stencil, UserControl, WorkPanel, Report, Dashboard, Query, WorkflowDiagram, ConversationalFlows, TestSuite, API, URLRewrite, MiniApp, SuperApp, OfflineDatabase, DataView, Group, Language, TranslationMessage, WorkWithDevices, WorkWithWeb.\"}";
+                }
 
                 // Pre-flight duplicate check: gives a clear, structured error before the SDK throws.
                 try
@@ -137,6 +141,7 @@ namespace GxMcp.Worker.Services
                     }
                 }
                 string seededDescription = null;
+                JObject domainMeta = null;
                 if (type.Equals("SDT", StringComparison.OrdinalIgnoreCase) || type.Equals("StructuredDataType", StringComparison.OrdinalIgnoreCase))
                 {
                     InitializeSDTWithDefaultItem(newObj, name);
@@ -146,6 +151,10 @@ namespace GxMcp.Worker.Services
                 {
                     InitializeTransactionWithDefaultKey(newTrn, name);
                     seededDescription = name + "Id : Numeric(8,0) [Key]";
+                }
+                else if (type.Equals("Domain", StringComparison.OrdinalIgnoreCase))
+                {
+                    domainMeta = InitializeDomain(newObj, name, options, kb);
                 }
 
                 newObj.Save();
@@ -170,6 +179,10 @@ namespace GxMcp.Worker.Services
                     ["id"] = idStr
                 };
                 JObject metaObj = null;
+                if (domainMeta != null)
+                {
+                    metaObj = domainMeta;
+                }
                 if (!string.IsNullOrEmpty(seededDescription))
                 {
                     // Surface the auto-seeded payload so the agent knows the object isn't empty
@@ -639,6 +652,223 @@ namespace GxMcp.Worker.Services
             {
                 Logger.Error("InitializeSDTWithDefaultItem failed: " + ex.Message);
             }
+        }
+
+        private static readonly ConcurrentDictionary<string, Guid> _typeGuidCache =
+            new ConcurrentDictionary<string, Guid>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Resolve a friendly object-type name (e.g. "WebPanel", "Dashboard", "WorkflowDiagram") to
+        /// the KBObject type Guid. First consults a static table of typed-wrapper descriptors;
+        /// then falls back to reading the matching static Guid field on
+        /// <c>Artech.Genexus.Common.ObjClass</c> via reflection. Returns Guid.Empty when unknown.
+        /// </summary>
+        private static Guid ResolveObjectTypeGuid(string type)
+        {
+            if (string.IsNullOrWhiteSpace(type)) return Guid.Empty;
+            string key = NormalizeTypeAlias(type);
+            if (_typeGuidCache.TryGetValue(key, out var cached)) return cached;
+
+            Guid g = ResolveFromTypedDescriptor(key);
+            if (g == Guid.Empty) g = ResolveFromObjClassField(key);
+            if (g != Guid.Empty) _typeGuidCache[key] = g;
+            return g;
+        }
+
+        private static string NormalizeTypeAlias(string type)
+        {
+            string t = type.Trim();
+            if (t.Equals("StructuredDataType", StringComparison.OrdinalIgnoreCase)) return "SDT";
+            if (t.Equals("BusinessProcessDiagram", StringComparison.OrdinalIgnoreCase)) return "WorkflowDiagram";
+            if (t.Equals("BPD", StringComparison.OrdinalIgnoreCase)) return "WorkflowDiagram";
+            if (t.Equals("PanelForSD", StringComparison.OrdinalIgnoreCase)) return "SDPanel";
+            return t;
+        }
+
+        private static Guid ResolveFromTypedDescriptor(string type)
+        {
+            try
+            {
+                if (type.Equals("Procedure", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Procedure>().Id;
+                if (type.Equals("Transaction", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Transaction>().Id;
+                if (type.Equals("WebPanel", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.WebPanel>().Id;
+                if (type.Equals("SDT", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.SDT>().Id;
+                if (type.Equals("DataProvider", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.DataProvider>().Id;
+                if (type.Equals("Attribute", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Attribute>().Id;
+                if (type.Equals("Table", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Table>().Id;
+                if (type.Equals("Domain", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Domain>().Id;
+                if (type.Equals("DataSelector", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.DataSelector>().Id;
+                if (type.Equals("DataView", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.DataView>().Id;
+                if (type.Equals("Index", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Index>().Id;
+                if (type.Equals("ExternalObject", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.ExternalObject>().Id;
+                if (type.Equals("Theme", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Theme>().Id;
+                if (type.Equals("Image", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Image>().Id;
+                if (type.Equals("Menu", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Menu>().Id;
+                if (type.Equals("Menubar", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Menubar>().Id;
+                if (type.Equals("Stencil", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Stencil>().Id;
+                if (type.Equals("UserControl", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.UserControl>().Id;
+                if (type.Equals("WorkPanel", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.WorkPanel>().Id;
+                if (type.Equals("Report", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Report>().Id;
+                if (type.Equals("API", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.API>().Id;
+                if (type.Equals("URLRewrite", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.URLRewrite>().Id;
+                if (type.Equals("MiniApp", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.MiniApp>().Id;
+                if (type.Equals("SuperApp", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.SuperApp>().Id;
+                if (type.Equals("DesignSystem", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.DesignSystem>().Id;
+                if (type.Equals("ColorPalette", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.ColorPalette>().Id;
+                if (type.Equals("OfflineDatabase", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.OfflineDatabase>().Id;
+                if (type.Equals("Group", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Group>().Id;
+                if (type.Equals("Language", StringComparison.OrdinalIgnoreCase)) return KBObjectDescriptor.Get<Artech.Genexus.Common.Objects.Language>().Id;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("ResolveFromTypedDescriptor failed for " + type + ": " + ex.Message);
+            }
+            return Guid.Empty;
+        }
+
+        private static Type _objClassType;
+
+        private static Guid ResolveFromObjClassField(string type)
+        {
+            // Static Guid fields on Artech.Genexus.Common.ObjClass cover Dashboard, SDPanel, Query,
+            // WorkflowDiagram, ConversationalFlows, TestSuite, ThemeClass, WorkWithDevices, etc. —
+            // anything the IDE creates that doesn't have its own typed wrapper.
+            Type t = _objClassType;
+            if (t == null)
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    var n = asm.GetName().Name;
+                    if (n == null || !n.StartsWith("Artech.Genexus.Common", StringComparison.Ordinal)) continue;
+                    try { t = asm.GetType("Artech.Genexus.Common.ObjClass", throwOnError: false); }
+                    catch { continue; }
+                    if (t != null) { _objClassType = t; break; }
+                }
+            }
+            if (t == null) return Guid.Empty;
+
+            var fi = t.GetField(type, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.IgnoreCase);
+            if (fi == null) return Guid.Empty;
+            try
+            {
+                return fi.GetValue(null) is Guid g ? g : Guid.Empty;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("ResolveFromObjClassField: read " + type + " failed: " + ex.Message);
+                return Guid.Empty;
+            }
+        }
+
+        /// <summary>
+        /// Initialize a freshly-created Domain with caller-supplied dataType/length/decimals/signed/enumValues/basedOn.
+        /// Defaults to Character(20) when no dataType is provided — matches the IDE's "new domain" default
+        /// and gives the SDK a valid type before Save.
+        /// </summary>
+        /// <returns>_meta JObject describing what was applied (echoed to caller), or null on hard error.</returns>
+        private static JObject InitializeDomain(KBObject domainObj, string domainName, JObject options, Artech.Architecture.Common.Objects.KnowledgeBase kb)
+        {
+            var meta = new JObject();
+            try
+            {
+                string dataType = options?["dataType"]?.ToString();
+                int? length = options?["length"]?.ToObject<int?>();
+                int? decimals = options?["decimals"]?.ToObject<int?>();
+                bool? signed = options?["signed"]?.ToObject<bool?>();
+                string description = options?["description"]?.ToString();
+                string basedOnName = options?["basedOn"]?.ToString();
+                var enumArr = options?["enumValues"] as JArray;
+
+                // basedOn short-circuits dataType: a domain-based-on-domain inherits its type.
+                bool basedOnApplied = false;
+                if (!string.IsNullOrEmpty(basedOnName))
+                {
+                    object basedOn = null;
+                    try
+                    {
+                        foreach (var obj in kb.DesignModel.Objects.GetByName(null, null, basedOnName))
+                        {
+                            if (obj is Artech.Genexus.Common.Objects.Domain d) { basedOn = d; break; }
+                        }
+                    }
+                    catch (Exception ex) { Logger.Error("InitializeDomain: basedOn lookup failed: " + ex.Message); }
+
+                    if (basedOn == null)
+                    {
+                        meta["basedOnError"] = "Domain '" + basedOnName + "' not found in KB. Created standalone Character(20) instead.";
+                    }
+                    else if (!DomainPropertyApplier.ApplyDomainBasedOn(domainObj, basedOn))
+                    {
+                        meta["basedOnError"] = "Failed to apply DomainBasedOn=" + basedOnName + ".";
+                    }
+                    else
+                    {
+                        meta["basedOn"] = basedOnName;
+                        basedOnApplied = true;
+                    }
+                }
+
+                if (!basedOnApplied)
+                {
+                    if (string.IsNullOrEmpty(dataType)) dataType = "Character";
+                    if (!length.HasValue && dataType.Equals("Character", StringComparison.OrdinalIgnoreCase)) length = 20;
+                    if (!length.HasValue && dataType.Equals("VarChar", StringComparison.OrdinalIgnoreCase)) length = 40;
+                    if (!length.HasValue && dataType.Equals("Numeric", StringComparison.OrdinalIgnoreCase)) length = 8;
+
+                    if (!DomainPropertyApplier.ApplyPrimitive(domainObj, dataType, length, decimals, signed))
+                    {
+                        Logger.Error("InitializeDomain: ApplyPrimitive failed for " + domainName + " (dataType=" + dataType + ")");
+                        meta["typeError"] = "Could not apply dataType='" + dataType + "'. Supported: Character, VarChar, Numeric, Date, DateTime, Time, Boolean, LongVarChar, Blob, Image, GUID.";
+                    }
+                    else
+                    {
+                        meta["dataType"] = dataType;
+                        if (length.HasValue) meta["length"] = length.Value;
+                        if (decimals.HasValue) meta["decimals"] = decimals.Value;
+                        if (signed.HasValue) meta["signed"] = signed.Value;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(description))
+                {
+                    try { domainObj.Description = description; } catch { /* best-effort */ }
+                }
+
+                if (enumArr != null && enumArr.Count > 0)
+                {
+                    var specs = new List<DomainEnumValueSpec>();
+                    foreach (var item in enumArr)
+                    {
+                        if (!(item is JObject jo)) continue;
+                        var ev = new DomainEnumValueSpec
+                        {
+                            Name = jo["name"]?.ToString(),
+                            Value = jo["value"]?.ToString(),
+                            Description = jo["description"]?.ToString()
+                        };
+                        if (!string.IsNullOrEmpty(ev.Name)) specs.Add(ev);
+                    }
+
+                    int applied = DomainPropertyApplier.ApplyEnumValues(domainObj, specs);
+                    if (applied < 0)
+                    {
+                        meta["enumError"] = "Could not write EnumValues — SDK helper not resolvable. Domain saved without enum values; set them via IDE.";
+                    }
+                    else if (applied > 0)
+                    {
+                        var arr = new JArray();
+                        foreach (var s in specs.Take(applied)) arr.Add(new JObject { ["name"] = s.Name, ["value"] = s.Value });
+                        meta["enumValues"] = arr;
+                        meta["enumHint"] = "Enum values applied. For Character domains the 'value' should be a quoted literal, e.g. \"\\\"A\\\"\". Verify via genexus_analyze name=" + domainName + " mode=summary.";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("InitializeDomain failed for " + domainName + ": " + ex.Message);
+                meta["initError"] = ex.Message;
+            }
+            return meta;
         }
 
         public KBObject FindObject(string target, string typeFilter = null)

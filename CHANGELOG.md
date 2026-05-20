@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.6.1 — 2026-05-20
+
+`genexus_create_object` now creates **any** object the GeneXus IDE can create, and it grew a real Domain path. Reported by Edgar: trying to create a `UserStatus` enumerated domain via the MCP failed with "MCP doesn't support domain creation"; this release closes that gap and the underlying gap that produced it — the tool only knew about a hardcoded list of types.
+
+### Added
+
+- **`genexus_create_object type=Domain` — full domain creation, including enumerated.** New optional fields: `dataType` (`Character` default, `VarChar`, `Numeric`, `Date`, `DateTime`, `Time`, `Boolean`, `LongVarChar`, `Blob`, `Image`, `GUID`), `length`, `decimals`, `signed`, `description`, `basedOn` (inherit from an existing domain), and `enumValues` (array of `{name, value, description?}` for enumerated domains). For Character/VarChar domains the `value` must be a quoted literal (e.g. `"\"A\""`). Response `_meta` echoes back what was applied plus an `enumHint` so the agent can verify via `genexus_analyze`. Tested live against the Edgar case: `UserStatus` with three enums (`Active="A"`, `Inactive="I"`, `Blocked="B"`) — round-trips through `genexus_analyze` / `genexus_inspect`.
+
+- **Generic type resolution covers every IDE-creatable object.** New `ResolveObjectTypeGuid` walks two paths: a typed-descriptor table (Transaction, Procedure, WebPanel, SDT, DataProvider, DataSelector, Domain, Attribute, Table, Index, ExternalObject, Theme, Image, Menu, Menubar, Stencil, UserControl, WorkPanel, Report, API, URLRewrite, MiniApp, SuperApp, DesignSystem, ColorPalette, OfflineDatabase, DataView, Group, Language) and a reflective fallback over `Artech.Genexus.Common.ObjClass` static Guid fields (Dashboard, SDPanel, Query, QueryDashboard, WorkflowDiagram, ConversationalFlows, TestSuite, ThemeClass, ThemeColor, ThemeTransformation, DesignSystemClass, WorkWithDevices, WorkWithWeb, WikiPageKBObject, TranslationMessage, DataStoreCategory, GeneratorCategory, DeploymentUnitCategory). Aliases recognised: `StructuredDataType` → SDT, `BusinessProcessDiagram` / `BPD` → WorkflowDiagram, `PanelForSD` → SDPanel. The previous hardcoded if/else chain covered eight types; the new resolver covers everything `ObjClass` exposes.
+
+- **`Helpers/DomainPropertyApplier.cs` — reflective Domain plumbing.** Applies `Type` / `Length` / `Decimals` / `Signed` (eDBType enum on real SDK, string on test fakes — both handled), `DomainBasedOn`, and `EnumValues` (built via `Artech.Genexus.Common.CustomTypes.EnumValue` / `EnumValues` + persisted via `Artech.Genexus.Common.Properties+ATT.SetEnumValues` on the IPropertyBag). The resolved `Type` and `MethodInfo` are cached statically so batch domain creation doesn't rescan loaded assemblies. Falls back to a direct `EnumValues` property setter if the SDK helper isn't resolvable.
+
+### Internal
+
+- Shared the canonical-name → `eDBType` table: `AttributeTypeApplier.CanonicalToEdb` is now `internal` (was private) and `DomainPropertyApplier.ApplyPrimitive` consumes it — one synonym table, two callers.
+- `ResolveType` and `ResolveFromObjClassField` prefer assemblies whose name starts with `Artech.Genexus.Common` before falling back to a full `AppDomain` scan; on a GeneXus host with 100+ loaded assemblies, that drops resolution from N-way to one. `_typeGuidCache` (object-class Guids), `_typeCache` (CustomTypes), `_setEnumValuesMethod`, and `_objClassType` cache the resolutions for batch calls.
+- `TrySetProperty` uses `Convert.ChangeType` against `Nullable.GetUnderlyingType(prop) ?? prop` instead of branching on boxed int / bool — naturally covers long, short, double if the SDK adds them.
+- `OperationsRouter.ConvertToolCall` forwards the new Domain options verbatim (`dataType`, `length`, `decimals`, `signed`, `description`, `basedOn`, `enumValues`); `CommandDispatcher` passes the full `args` JObject to `ObjectService.CreateObject(type, name, options)` so future option bags don't need to be threaded through the gateway-router schema.
+- Help catalog and `tool_definitions.json` reworked: Domain section with the exact Edgar `UserStatus` example, full type enumeration in the description, schema fields for the new options. Discovery golden fixture regenerated.
+- Tests: `DomainPropertyApplierTests.cs` covers the fake-SDK path (Type/Length/Decimals/Signed string fakes, ApplyDomainBasedOn, ApplyEnumValues hard-fail when SDK types aren't loadable, empty-list early return). Worker 388/388, gateway 252/252.
+
 ## v2.6.0 — 2026-05-20
 
 WorkWithPlus on a bare WebPanel now works end-to-end. Apply the pattern, get a host plus a real layout projected onto the WebPanel's WebForm. Edit the host's PatternInstance and the projection updates automatically. Plus a new SDK probe tool, honest no-op detection on unsupported target shapes, and a pile of fixes uncovered during the investigation.

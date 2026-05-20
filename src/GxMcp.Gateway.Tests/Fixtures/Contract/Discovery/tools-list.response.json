@@ -214,18 +214,41 @@
       "name": "genexus_bulk_edit"
     },
     {
-      "description": "Create a new GeneXus object in the active KB.",
+      "description": "Create any IDE-creatable GeneXus object (Transaction, Procedure, WebPanel, SDPanel, SDT, DataProvider, Domain, Dashboard, WorkflowDiagram, etc.). Domain takes dataType+length or enumValues. See genexus://kb/tool-help/genexus_create_object.",
       "inputSchema": {
         "properties": {
+          "basedOn": {
+            "type": "string"
+          },
+          "dataType": {
+            "type": "string"
+          },
+          "decimals": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "enumValues": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
           "kb": {
             "description": "Target KB. Required when 2+ open.",
             "type": "string"
           },
+          "length": {
+            "type": "integer"
+          },
           "name": {
             "type": "string"
           },
+          "signed": {
+            "type": "boolean"
+          },
           "type": {
-            "description": "e.g. Procedure, Transaction, WebPanel, SDT.",
             "type": "string"
           }
         },

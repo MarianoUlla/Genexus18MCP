@@ -94,11 +94,12 @@ namespace GxMcp.Worker.Helpers
         }
 
         // Maps canonical GeneXus type names → eDBType enum member names (uppercase).
-        private static readonly Dictionary<string, string> CanonicalToEdb =
+        internal static readonly Dictionary<string, string> CanonicalToEdb =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             { "Numeric",     "NUMERIC"      },
             { "Character",   "CHARACTER"    },
+            { "VarChar",     "VARCHAR"      },
             { "Date",        "DATE"         },
             { "DateTime",    "DATETIME"     },
             { "Time",        "TIME"         },
