@@ -125,6 +125,66 @@ namespace GxMcp.Gateway
                 "- `{ name: 'OrderTrn', parts: ['Rules'], offset: 0, limit: 200 }`\n" +
                 "- `{ targets: [{ name: 'A' }, { name: 'B' }], parts: ['Source'] }`\n",
 
+            ["genexus_apply_pattern"] =
+                "# genexus_apply_pattern\n\n" +
+                "Apply a GeneXus pattern to a KBObject — equivalent to the IDE's `Right-click → Apply Pattern` menu. " +
+                "Currently registered: `WorkWithPlus` (alias `WWP`).\n\n" +
+                "## When to use this — and when NOT to\n" +
+                "**Use this** any time the user asks for a WorkWithPlus / Work With Plus / WWP screen on a new or existing object. " +
+                "`apply_pattern` is the *only* path that creates a real `PatternInstance` — once that exists, `genexus_edit part=PatternInstance` can shape columns, actions, filters, orders, grids, themes, etc.\n\n" +
+                "**Do NOT** try to recreate a WWP screen by editing `WebForm` / `Layout` directly. The HTML generator will compile fine, but the result is a hand-built page that lacks WWP's grid/filter/action infrastructure. " +
+                "If a target object already has `PatternInstance`, edit *that* part instead of `WebForm` — see `EditingWebFormUnderPattern` warning surfaced by `genexus_edit`.\n\n" +
+                "## Two real target shapes — both work\n\n" +
+                "### A) Transaction target — generates the WW family\n" +
+                "Classic CRUD-around-an-entity flow. The engine emits:\n\n" +
+                "- `WorkWithPlus<Trn>` — pattern host (edit `PatternInstance` here to shape the screen)\n" +
+                "- `WW<Trn>` — Selection WebPanel (list view)\n" +
+                "- `View<Trn>` — detail WebPanel\n" +
+                "- `ExportWW<Trn>` / `ExportReportWW<Trn>` — export procedures\n\n" +
+                "```jsonc\n" +
+                "{ \"name\": \"Invoice\", \"pattern\": \"WorkWithPlus\" }\n" +
+                "// Generates: WorkWithPlusInvoice + WWInvoice + ViewInvoice + ExportWWInvoice + ExportReportWWInvoice\n" +
+                "```\n\n" +
+                "### B) WebPanel target — in-place attach + auto-project (SOTA path)\n" +
+                "For custom WWP screens that aren't pure CRUD (queries, dashboards, hybrid lists). The MCP attaches a `WorkWithPlus<WebPanelName>` host bound to the WebPanel via the SDK's `PatternInstancePackageInterface.CreatePatternInstanceWithTemplate`, then immediately runs `IPatternBuildProcess.UpdateParentObject` so the WebPanel's WebForm reflects the pattern projection. The original WebPanel **stays put** — no destruction, no rename.\n\n" +
+                "Required: `settings.template` matching a `WorkWithPlus for Web Template` object in your KB. Common names: `MatIsoTemplate`, `TransactionResp2`, `PopoverEmpty`, `TransactionPopUp`. The MCP auto-discovers one if you omit, but explicit is better.\n\n" +
+                "```jsonc\n" +
+                "{ \"name\": \"InvoiceQueryPanel\",\n" +
+                "  \"pattern\": \"WorkWithPlus\",\n" +
+                "  \"settings\": { \"template\": \"MatIsoTemplate\" } }\n" +
+                "// → status: Success, directAttach: true, template: \"MatIsoTemplate\"\n" +
+                "// → patternHost: \"WorkWithPlusInvoiceQueryPanel\" (host with editable PatternInstance)\n" +
+                "// → InvoiceQueryPanel.WebForm now contains the template-derived layout\n" +
+                "```\n\n" +
+                "**Auto-project on edit:** subsequent `genexus_edit name=WorkWithPlus<X> part=PatternInstance` calls automatically run UpdateParentObject too — every PatternInstance edit lands on the WebPanel's WebForm in the same call. The response's `projection.status` field reports the outcome.\n\n" +
+                "## Response\n" +
+                "- `{ status: \"Success\", wasFirstApply: true|false, generatedObjects: [...] }` on the happy path.\n" +
+                "- `{ status: \"pattern_unavailable\", message: ... }` if `Artech.Packages.Patterns.dll` / license is missing — the call is **non-fatal**, treat as \"feature unavailable on this install\" and surface the message.\n" +
+                "- `{ status: \"Error\", error: ... }` on SDK exceptions.\n\n" +
+                "## Re-apply\n" +
+                "Pass `reapply: true` to regenerate over an existing instance — equivalent to `Right-click → Apply Pattern` on an already-patterned object. If no instance exists, it falls back to first-time apply automatically.\n\n" +
+                "## Settings\n" +
+                "The `settings` JObject is **best-effort-projected** onto the SDK's `ApplySettings` instance on re-apply (case-insensitive property match, recursive on nested objects). Mismatched keys are silently dropped and logged — they don't fail the call.\n\n" +
+                "Caveats: (a) projection only fires on `reapply: true`; first-time apply uses the SDK's void overload which has no settings slot. (b) the canonical names of `ApplySettings` properties are pattern-internal; if your projection doesn't take effect, fall back to shaping the result via `genexus_edit part=PatternInstance` after apply.\n",
+
+            ["genexus_create_object"] =
+                "# genexus_create_object\n\n" +
+                "Create a new empty GeneXus object in the active KB. Supported types: `Procedure`, `Transaction`, `WebPanel`, `SDPanel`, `SDT`, `DataProvider`, `Attribute`, `Table`.\n\n" +
+                "## Defaults that get seeded\n" +
+                "- `Transaction` — gets a default `<Name>Id : Numeric(8,0) [Key]` attribute so the SDK accepts the empty save.\n" +
+                "- `SDT` — gets a default `Item1 : VARCHAR(40)` item.\n" +
+                "- `Procedure` / `DataProvider` — empty source with a `// Procedure: <Name>` header.\n\n" +
+                "When the response carries `_meta.seeded`, the caller knows what's already there and can decide whether to overwrite (`genexus_edit part=Structure mode=full`).\n\n" +
+                "## WebPanel / SDPanel hint\n" +
+                "An empty WebPanel is just a blank page — it has **no WorkWithPlus pattern** by default. " +
+                "If the goal is a WWP-style screen (list with filters, actions, grid), the next call should be `genexus_apply_pattern name=<X> pattern=WorkWithPlus`, then shape via `genexus_edit part=PatternInstance`. " +
+                "The response surfaces this in `_meta.patternHint` so the agent doesn't drift into editing `WebForm` by hand.\n\n" +
+                "For popup-style WebPanels with structured inputs/buttons, prefer `genexus_create_popup` — it emits a fully-wired popup in one call.\n\n" +
+                "## Examples\n" +
+                "- `{ type: \"Transaction\", name: \"Invoice\" }`\n" +
+                "- `{ type: \"WebPanel\", name: \"InvoiceList\" }` — then call `genexus_apply_pattern` if WWP is wanted.\n" +
+                "- `{ type: \"Procedure\", name: \"BillingCalc\" }`\n",
+
             ["genexus_edit_and_build"] =
                 "# genexus_edit_and_build\n\n" +
                 "Edit an object and rebuild its callers in one call.\n\n" +

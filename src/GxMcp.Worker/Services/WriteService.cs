@@ -1841,6 +1841,74 @@ namespace GxMcp.Worker.Services
             }
         }
 
+        // Detects the case where an agent is about to edit WebForm/Layout on an object
+        // that already has a populated PatternInstance (the canonical surface for that
+        // screen). On the next pattern apply/save, WWP regenerates the WebForm from the
+        // pattern, silently overwriting the agent's hand edits. The warning steers the
+        // agent toward `genexus_edit part=PatternInstance` without blocking the write —
+        // power users still need the WebForm escape hatch for non-WWP customizations.
+        private JArray BuildPatternShadowWarningsIfAny(
+            global::Artech.Architecture.Common.Objects.KBObject obj,
+            string partName)
+        {
+            try
+            {
+                if (obj == null) return null;
+                if (!WebFormXmlHelper.IsVisualPart(partName)) return null;
+
+                var resolved = _patternAnalysisService.ResolveWWPInstance(obj);
+                // Fallback for generated WW family (WW<Trn>, View<Trn>, etc.) whose host
+                // is `WorkWithPlus<TrnBaseName>` rather than `WorkWithPlus<obj.Name>`.
+                if (resolved == null && !string.IsNullOrEmpty(obj.Name))
+                {
+                    string[] candidatePrefixes = { "WW", "View", "ViewWW", "Prompt" };
+                    foreach (var pre in candidatePrefixes)
+                    {
+                        if (!obj.Name.StartsWith(pre, StringComparison.Ordinal)) continue;
+                        string baseName = obj.Name.Substring(pre.Length);
+                        if (string.IsNullOrEmpty(baseName)) continue;
+                        var host = _objectService.FindObject("WorkWithPlus" + baseName);
+                        if (host != null && string.Equals(host.TypeDescriptor?.Name, "WorkWithPlus", StringComparison.OrdinalIgnoreCase))
+                        {
+                            resolved = host;
+                            break;
+                        }
+                    }
+                }
+                if (resolved == null) return null;
+
+                var part = _patternAnalysisService.FindPatternPart(resolved, "PatternInstance");
+                if (part == null) return null;
+
+                return new JArray
+                {
+                    new JObject
+                    {
+                        ["code"] = "EditingWebFormUnderPattern",
+                        ["severity"] = "warning",
+                        ["message"] =
+                            "This object is covered by a WorkWithPlus PatternInstance ('" + resolved.Name +
+                            "'). Hand edits to " + partName + " can be overwritten on the next pattern apply/save. " +
+                            "Consider editing part=PatternInstance instead (genexus_edit name=" + resolved.Name +
+                            " part=PatternInstance ...). Toggle SDPlus_Editor_Apply_On_Save=False on " + resolved.Name +
+                            " if you must keep a hard override on the visual part.",
+                        ["patternInstance"] = resolved.Name
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("[WriteVisualPart] PatternShadow warning probe skipped: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static void AttachWarnings(JObject payload, JArray warnings)
+        {
+            if (payload == null || warnings == null || warnings.Count == 0) return;
+            payload["warnings"] = warnings;
+        }
+
         private string WriteVisualPart(global::Artech.Architecture.Common.Objects.KBObject obj, string target, string partName, string xml, bool dryRun = false)
         {
             var webFormPart = WebFormXmlHelper.GetWebFormPart(obj);
@@ -1853,6 +1921,10 @@ namespace GxMcp.Worker.Services
                     "The object does not expose a WebForm part for visual editing.",
                     obj);
             }
+
+            // Probe ONCE up front so every response branch (NoChange / DryRun / Success)
+            // can attach the same warning set without duplicating the resolution work.
+            JArray patternShadowWarnings = BuildPatternShadowWarningsIfAny(obj, partName);
 
             string normalizedInput;
             try
@@ -1869,12 +1941,14 @@ namespace GxMcp.Worker.Services
                 string currentXml = WebFormXmlHelper.ReadEditableXml(obj);
                 if (XmlEquivalence.AreEquivalent(currentXml, normalizedInput, out _))
                 {
-                    return Models.McpResponse.Success("Write", target, new JObject
+                    var noChangeResp = new JObject
                     {
                         ["status"] = "NoChange",
                         ["part"] = partName,
                         ["details"] = dryRun ? "Dry-run: no change would be applied." : "No change"
-                    });
+                    };
+                    AttachWarnings(noChangeResp, patternShadowWarnings);
+                    return Models.McpResponse.Success("Write", target, noChangeResp);
                 }
                 if (dryRun)
                 {
@@ -1884,6 +1958,7 @@ namespace GxMcp.Worker.Services
                         ["part"] = partName,
                         ["details"] = "Dry-run: input parsed and would update visual XML. Save skipped."
                     };
+                    AttachWarnings(dryResp, patternShadowWarnings);
                     var suspects = GxMcp.Worker.Helpers.WebFormSchemaHints.ScanForRejectedAttributes(normalizedInput);
                     if (suspects.Count > 0)
                     {
@@ -2000,11 +2075,13 @@ namespace GxMcp.Worker.Services
                             visualStructured);
                     }
 
-                    return Models.McpResponse.Success("Write", target, new JObject
+                    var okResp = new JObject
                     {
                         ["part"] = partName,
                         ["details"] = "Visual XML updated and verified."
-                    });
+                    };
+                    AttachWarnings(okResp, patternShadowWarnings);
+                    return Models.McpResponse.Success("Write", target, okResp);
                 }
                 catch (Exception ex)
                 {
@@ -2202,6 +2279,61 @@ namespace GxMcp.Worker.Services
                         success["resolvedType"] = resolvedObject.TypeDescriptor?.Name;
                     }
 
+                    // F18 (auto-project): when we just wrote a PatternInstance on a
+                    // WorkWithPlus host, run the IDE's projection step so the bound
+                    // parent's WebForm reflects the edit. Without this, the edit
+                    // persists but the WebPanel layout never updates until the next
+                    // explicit apply_pattern call. Best-effort — projection failures
+                    // don't roll back the edit (the part is already saved).
+                    if (string.Equals(resolvedObject.TypeDescriptor?.Name, "WorkWithPlus", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            var parentForProjection = WwpProjectionHelper.ResolveHostParent(resolvedObject, _objectService);
+                            if (parentForProjection != null)
+                            {
+                                bool projected = WwpProjectionHelper.TryProjectHostOntoParent(parentForProjection, resolvedObject);
+                                if (projected)
+                                {
+                                    success["projection"] = new JObject
+                                    {
+                                        ["status"] = "Projected",
+                                        ["parent"] = parentForProjection.Name,
+                                        ["parentType"] = parentForProjection.TypeDescriptor?.Name,
+                                        ["note"] = "PatternInstance edit was auto-projected onto the parent's WebForm via IPatternBuildProcess.UpdateParentObject."
+                                    };
+
+                                    // F21: refresh index cache so list_objects/inspect/query
+                                    // see the parent's new state immediately (avoid the
+                                    // stale-index window that bit us in F9). Best-effort.
+                                    try
+                                    {
+                                        var idx = _objectService?.GetKbService()?.GetIndexCache();
+                                        if (idx != null)
+                                        {
+                                            var refreshed = _objectService.FindObject(parentForProjection.Name);
+                                            if (refreshed != null) idx.UpdateEntry(refreshed);
+                                        }
+                                    }
+                                    catch (Exception idxEx) { Logger.Debug("[WWP-PROJECT] post-project index sync skipped: " + idxEx.Message); }
+                                }
+                                else
+                                {
+                                    success["projection"] = new JObject
+                                    {
+                                        ["status"] = "Skipped",
+                                        ["parent"] = parentForProjection.Name,
+                                        ["note"] = "Projection helper declined — see worker log for details. Edit was persisted; WebForm may need a manual apply_pattern to refresh."
+                                    };
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Debug("[WWP-PROJECT] auto-project on edit skipped: " + ex.Message);
+                        }
+                    }
+
                     // Echo the auto-reconcile report so LLM callers can see exactly
                     // which childrenOrderedList values the MCP rewrote and why. The IDE
                     // hides children that aren't listed; if a caller forgot to update
@@ -2236,6 +2368,15 @@ namespace GxMcp.Worker.Services
                 }
             }
         }
+
+        // Public so PatternApplyService.TryDirectAttachPatternInstance can reuse the
+        // same Dirty/Mode bookkeeping when seeding a freshly-constructed PatternInstance.
+        public static void ForcePatternPartDirty(global::Artech.Architecture.Common.Objects.KBObjectPart part) => InvalidatePartLastModification(part);
+
+        // Public for the same reason — direct-attach needs to seed the pattern data
+        // via the same DeserializeDataFrom(XmlElement) path used by the regular write.
+        public static bool ApplyPatternDataFromXml(global::Artech.Architecture.Common.Objects.KBObjectPart resolvedPart, string innerXml) =>
+            TryApplyPatternDataFromXml(resolvedPart, innerXml);
 
         private static void InvalidatePartLastModification(global::Artech.Architecture.Common.Objects.KBObjectPart part)
         {

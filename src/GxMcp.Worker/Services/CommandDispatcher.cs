@@ -181,6 +181,24 @@ namespace GxMcp.Worker.Services
                 string target = request["target"]?.ToString();
                 var payload = request["payload"]?.ToString();
                 var args = request["params"] as JObject;
+                // OperationsRouter cases that pass-through original tool args via
+                // `@params = args` (apply_pattern, apply_template, bulk_edit, diff)
+                // produce a doubly-nested params shape on the RPC envelope:
+                //   rpc.params = { module, action, target, params: { <original tool args> } }
+                // Action handlers below read tool args off `args` directly (e.g.
+                // args["pattern"]), so unwrap once when the inner params object exists.
+                // Inner keys win on collision; outer routing keys (module/action/target)
+                // are preserved as top-level fallback.
+                if (args != null && args["params"] is JObject innerArgs)
+                {
+                    var merged = (JObject)innerArgs.DeepClone();
+                    foreach (var prop in args.Properties())
+                    {
+                        if (prop.Name == "params") continue;
+                        if (merged[prop.Name] == null) merged[prop.Name] = prop.Value?.DeepClone();
+                    }
+                    args = merged;
+                }
 
                 string progressToken = request["_meta"] != null
                     ? request["_meta"]["progressToken"]?.ToString()
@@ -527,6 +545,33 @@ namespace GxMcp.Worker.Services
                             string patKey = args?["pattern"]?.ToString();
                             if (reapply) return _patternApplyService.ReapplyPattern(target, patSettings);
                             return _patternApplyService.ApplyPattern(target, patKey, patSettings);
+                        }
+                        break;
+                    case "sdkprobe":
+                        if (action == "Run")
+                        {
+                            try
+                            {
+                                var probe = Services.SdkSurfaceProbe.Run(args?["outputDir"]?.ToString());
+                                var resp = new JObject
+                                {
+                                    ["status"] = "Success",
+                                    ["rawJsonPath"] = probe.RawJsonPath,
+                                    ["indexMdPath"] = probe.IndexMdPath,
+                                    ["generatorsMdPath"] = probe.GeneratorsMdPath,
+                                    ["rawSizeBytes"] = probe.RawSizeBytes,
+                                    ["assembliesScanned"] = probe.AssembliesScanned,
+                                    ["typesScanned"] = probe.TypesScanned,
+                                    ["generatorCandidates"] = probe.GeneratorCandidates,
+                                    ["warnings"] = new JArray(probe.Warnings),
+                                    ["note"] = "Inspect rawJsonPath with jq, or read INDEX.md / generators.md for navigable views. See docs/sdk-probe/README.md."
+                                };
+                                return resp.ToString(Newtonsoft.Json.Formatting.None);
+                            }
+                            catch (Exception ex)
+                            {
+                                return "{\"status\":\"Error\",\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
+                            }
                         }
                         break;
                     case "ui":

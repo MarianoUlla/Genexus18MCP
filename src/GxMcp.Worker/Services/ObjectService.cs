@@ -169,18 +169,61 @@ namespace GxMcp.Worker.Services
                     ["name"] = name,
                     ["id"] = idStr
                 };
+                JObject metaObj = null;
                 if (!string.IsNullOrEmpty(seededDescription))
                 {
                     // Surface the auto-seeded payload so the agent knows the object isn't empty
                     // before calling read/edit. Agents that immediately overwrite Structure
                     // need this signal to avoid being surprised by the seed item appearing in
                     // round-trip reads.
-                    response["_meta"] = new JObject
+                    metaObj = new JObject
                     {
                         ["seeded"] = new JArray { seededDescription },
                         ["seededHint"] = "An initial item was auto-added so the SDK accepts the empty Save. Overwrite via genexus_edit part=Structure (full mode) to replace it."
                     };
                 }
+                // WebPanel / SDPanel get a hint pointing at apply_pattern. Agents asked for
+                // "a WebPanel with WorkWithPlus" otherwise tend to hand-build the layout via
+                // WebForm edits, which compiles but produces a page with none of WWP's
+                // grid/filter/action infrastructure. The hint short-circuits that drift.
+                bool isWebPanel = type.Equals("WebPanel", StringComparison.OrdinalIgnoreCase)
+                    || type.Equals("SDPanel", StringComparison.OrdinalIgnoreCase);
+                if (isWebPanel)
+                {
+                    if (metaObj == null) metaObj = new JObject();
+                    metaObj["patternHint"] =
+                        "Empty " + type + " created. Two real paths to WorkWithPlus: " +
+                        "(A) Apply WWP directly on this " + type + " — call genexus_apply_pattern name=" + name +
+                        " pattern=WorkWithPlus settings={template:'<TemplateName>'} to attach a 'WorkWithPlus" + name +
+                        "' host. The MCP runs the SDK's IPatternBuildProcess.UpdateParentObject so the projection " +
+                        "lands on this " + type + "'s WebForm immediately. Subsequent genexus_edit on the host's " +
+                        "PatternInstance auto-projects too. " +
+                        "(B) Apply WWP to a Transaction — generates the full 'WW<Trn>' family (Selection list + " +
+                        "View detail + exports). Pick (A) for custom WebPanel-based screens (queries, dashboards), " +
+                        "(B) for CRUD-around-a-Transaction. " +
+                        "Available templates: list via `genexus_list_objects typeFilter=\"WorkWithPlus for Web Template\"` " +
+                        "(common: MatIsoTemplate, TransactionResp2, PopoverEmpty).";
+                    metaObj["nextStep"] = new JObject
+                    {
+                        ["forWwpOnThisWebPanel"] = new JObject
+                        {
+                            ["tool"] = "genexus_apply_pattern",
+                            ["arguments"] = new JObject
+                            {
+                                ["name"] = name,
+                                ["pattern"] = "WorkWithPlus",
+                                ["settings"] = new JObject { ["template"] = "<TemplateName>" }
+                            }
+                        },
+                        ["forWwpFromTransaction"] = new JObject
+                        {
+                            ["step1"] = new JObject { ["tool"] = "genexus_create_object", ["arguments"] = new JObject { ["type"] = "Transaction", ["name"] = "<TrnName>" } },
+                            ["step2"] = new JObject { ["tool"] = "genexus_apply_pattern", ["arguments"] = new JObject { ["name"] = "<TrnName>", ["pattern"] = "WorkWithPlus" } },
+                            ["step3"] = new JObject { ["tool"] = "genexus_edit", ["arguments"] = new JObject { ["name"] = "WorkWithPlus<TrnName>", ["part"] = "PatternInstance" } }
+                        }
+                    };
+                }
+                if (metaObj != null) response["_meta"] = metaObj;
                 return response.ToString(Newtonsoft.Json.Formatting.None);
             }
             catch (Exception ex)
@@ -261,13 +304,46 @@ namespace GxMcp.Worker.Services
 
                 // Spawn a detached PowerShell helper that:
                 //   1) waits for THIS worker pid to exit (releases the .exe lock)
-                //   2) copies sourceDir/* → publishDir/*
-                //   3) exits, leaving the gateway to auto-respawn the worker (gateway has a 2s grace).
+                //   2) copies sourceDir/* → publishDir/* with retries (the gateway can
+                //      respawn the worker faster than we copy, re-locking the .exe — we
+                //      then kill the respawned worker so the next gateway respawn picks
+                //      up the new bits)
+                //   3) writes worker_reload.last_result.json next to publishDir so
+                //      callers can diagnose silent failures
+                //
+                // Previous version used `-ErrorAction SilentlyContinue` on a single
+                // Copy-Item, which masked the lock race entirely — the reload returned
+                // Success while the binary on disk was unchanged.
+                string src = sourceDir.Replace("'", "''");
+                string dst = publishDir.Replace("'", "''");
                 string ps =
                     "$pid_target=" + currentPid + "; " +
-                    "try { Wait-Process -Id $pid_target -Timeout 30 -ErrorAction SilentlyContinue } catch {}; " +
-                    "Start-Sleep -Milliseconds 300; " +
-                    "Copy-Item '" + sourceDir.Replace("'", "''") + "\\*' '" + publishDir.Replace("'", "''") + "\\' -Recurse -Force -ErrorAction SilentlyContinue; ";
+                    "$src='" + src + "'; $dst='" + dst + "'; " +
+                    "$log = Join-Path $dst 'worker_reload.last_result.json'; " +
+                    "function Write-Status($status, $detail) { " +
+                    "  @{ status = $status; detail = $detail; timestamp = (Get-Date).ToString('o'); src = $src; dst = $dst } | " +
+                    "  ConvertTo-Json | Set-Content -Path $log -Encoding utf8 -ErrorAction SilentlyContinue " +
+                    "} " +
+                    "try { Wait-Process -Id $pid_target -Timeout 30 -ErrorAction SilentlyContinue } catch {} " +
+                    "$copied=$false; $lastErr=''; " +
+                    "for ($i=0; $i -lt 20 -and -not $copied; $i++) { " +
+                    "  try { " +
+                    "    Copy-Item \\\"$src\\*\\\" \\\"$dst\\\" -Recurse -Force -ErrorAction Stop; " +
+                    "    $copied=$true " +
+                    "  } catch { " +
+                    "    $lastErr = $_.Exception.Message; " +
+                    "    $w = Get-Process -Name GxMcp.Worker -ErrorAction SilentlyContinue; " +
+                    "    if ($w) { try { $w | Stop-Process -Force -ErrorAction SilentlyContinue } catch {} } " +
+                    "    Start-Sleep -Milliseconds 500 " +
+                    "  } " +
+                    "} " +
+                    "if ($copied) { " +
+                    "  $w = Get-Process -Name GxMcp.Worker -ErrorAction SilentlyContinue; " +
+                    "  if ($w) { try { $w | Stop-Process -Force -ErrorAction SilentlyContinue } catch {} } " +
+                    "  Write-Status 'Success' 'Binaries copied; respawned worker (if any) killed so gateway brings up a fresh one with new bits.' " +
+                    "} else { " +
+                    "  Write-Status 'Error' \\\"Copy failed after retries. Last error: $lastErr\\\" " +
+                    "}; ";
 
                 var psi = new ProcessStartInfo
                 {
@@ -285,7 +361,7 @@ namespace GxMcp.Worker.Services
                     Logger.Info("WorkerReload: exiting now for respawn.");
                     Environment.Exit(0);
                 });
-                return "{\"status\":\"Success\", \"sourceDir\":\"" + CommandDispatcher.EscapeJsonString(sourceDir) + "\", \"publishDir\":\"" + CommandDispatcher.EscapeJsonString(publishDir) + "\", \"note\":\"Worker exits in 1s; helper copies new binaries; gateway auto-respawns. Next MCP call may take a few seconds.\"}";
+                return "{\"status\":\"Accepted\", \"sourceDir\":\"" + CommandDispatcher.EscapeJsonString(sourceDir) + "\", \"publishDir\":\"" + CommandDispatcher.EscapeJsonString(publishDir) + "\", \"note\":\"Worker exits in 1s; detached helper copies binaries with retries and kills any worker that respawned mid-copy so the gateway brings up a fresh one. Inspect '" + CommandDispatcher.EscapeJsonString(System.IO.Path.Combine(publishDir, "worker_reload.last_result.json")) + "' for the copy outcome.\"}";
             }
             catch (Exception ex)
             {
@@ -318,6 +394,17 @@ namespace GxMcp.Worker.Services
                 obj.Delete();
 
                 Logger.Info(string.Format("Object deleted: {0} ({1})", objName, objType));
+
+                // Keep the search index honest: without this, list_objects keeps returning
+                // the deleted object for several minutes until a full reindex. Same
+                // mechanism CreateObject uses, but in reverse.
+                try
+                {
+                    var idx = _kbService?.GetIndexCache();
+                    if (idx != null) idx.RemoveEntry(objType, objName);
+                }
+                catch (Exception ex) { Logger.Error("DeleteObject: index RemoveEntry failed for " + objName + ": " + ex.Message); }
+
                 return "{\"status\":\"Success\", \"deleted\":\"" + CommandDispatcher.EscapeJsonString(objName) + "\", \"type\":\"" + CommandDispatcher.EscapeJsonString(objType) + "\"}";
             }
             catch (Exception ex)

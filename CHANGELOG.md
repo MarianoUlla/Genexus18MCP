@@ -1,29 +1,58 @@
 # Changelog
 
-## Unreleased
+## v2.6.0 — 2026-05-20
+
+WorkWithPlus on a bare WebPanel now works end-to-end. Apply the pattern, get a host plus a real layout projected onto the WebPanel's WebForm. Edit the host's PatternInstance and the projection updates automatically. Plus a new SDK probe tool, honest no-op detection on unsupported target shapes, and a pile of fixes uncovered during the investigation.
 
 ### Added
 
-- **`genexus_whoami` now reports update availability as structured data.**
-  The response includes an `update` block with `currentVersion`,
-  `latestVersion`, `updateAvailable`, `checkedAt`, `releaseUrl`, `command`,
-  and `restartRequired`. AI agents can detect a pending upgrade in the
-  same call where they read the KB context, then proactively offer the
-  upgrade command — no longer have to rely on the stderr-style
-  `notifications/message` the user might miss.
+- **`genexus_apply_pattern` on a WebPanel target — full direct-attach + projection.** Apply WorkWithPlus to an empty WebPanel and the MCP attaches a `WorkWithPlus<X>` host with a real PatternInstance derived from a registered KB template, then runs the SDK's `IPatternBuildProcess.UpdateParentObject` so the WebPanel's WebForm reflects the projected layout immediately. The original WebPanel stays in place — no rename, no destruction. Pass `settings.template` matching a `WorkWithPlus for Web Template` object in your KB (common names: `MatIsoTemplate`, `TransactionResp2`, `PopoverEmpty`). When omitted, an available template is auto-discovered. The response includes `availableTemplates` so the agent can switch templates on a second call without guessing.
 
-  The data comes from the 24h-cached GitHub release check the gateway
-  already runs in the background on `initialize`. Reading it is
-  zero-latency; the LLM never blocks on a network round-trip.
+- **Auto-project on `genexus_edit` of a host's PatternInstance.** Every successful pattern-part edit on a `WorkWithPlus<X>` host automatically re-runs the projection step against its parent WebPanel — agents shape the screen via PatternInstance XML and the WebPanel updates in the same call. The response carries a `projection` block (`status`, `parent`, `parentType`, `note`) so callers can confirm the layout reflects the edit. The index cache for the affected parent is refreshed in the same code path, so a follow-up `list_objects` / `inspect` / `query` sees the new state without waiting for reindex.
 
-  Set `GENEXUS_MCP_NO_UPDATE_CHECK=1` to disable the background check
-  (corporate networks that block GitHub API). When disabled, `update`
-  reports `updateAvailable: false` with a `note` so the LLM knows not to
-  pester.
+- **`genexus_sdk_probe` — first-class scanner of loaded GeneXus SDK assemblies.** Dumps every public type, method, property, constructor, and field across `Artech.*`, `Genexus.*`, `DVelop.*`, and `GeneXus.*` assemblies to `docs/sdk-probe/`: `raw.json` (full structured tree), `INDEX.md` (per-namespace navigation), `generators.md` (filtered to types whose name suggests they participate in code generation — `Generator`, `Builder`, `Apply`, `Refresh`, `Update`, `Project`, `Engine`, `Helper`, `Service`, `Resolver`, …). Built for SDK exploration: investigators can grep the JSON or read the markdown without writing one-off reflection code. Picks output via `GX_MCP_SDK_PROBE_DIR`, the repo's `docs/sdk-probe/` if found, or `%TEMP%/gxmcp_sdk_probe/`.
 
-  Documented as the "Self-update protocol (LLM-facing)" section in
-  `AGENTS.md` so contributing agents know to surface available upgrades
-  without auto-installing.
+- **`genexus_apply_pattern` returns `generatedObjects` honestly.** Previously empty on Transaction targets even when the engine had created the full WW family. Now resolves the canonical family (`WorkWithPlus<X>`, `WW<X>`, `View<X>`, `ExportWW<X>`, `ExportReportWW<X>`, `Prompt<X>`) via name lookup and surfaces what's actually present. The host is also exposed as a top-level `patternHost` field for quick navigation to the editable PatternInstance.
+
+- **`apply_pattern` projects `settings` JObject onto SDK `ApplySettings` on re-apply.** Best-effort property mapping: case-insensitive name match, recursive on nested objects, type coercion for primitives and enums (string or numeric). Unmapped keys are logged, not thrown. Lets agents pass partial settings without knowing the full SDK schema.
+
+- **`genexus_create_object type=WebPanel` includes a structured `_meta.patternHint` and `nextStep`.** Tells the agent both real paths to a WorkWithPlus screen — direct WebPanel attach with a template, or Transaction-driven family generation — with ready-to-issue tool call shapes inline. The hint is generated for `WebPanel` and `SDPanel` types; other types continue to receive only `_meta.seeded`.
+
+- **`genexus_edit` surfaces `EditingWebFormUnderPattern` warning.** When the agent edits the `WebForm` / `Layout` of an object covered by a WorkWithPlus PatternInstance, the response includes a warning identifying the pattern host. The edit still completes — this is advisory so the agent realises the next pattern apply may overwrite the visual edit and can choose to edit `PatternInstance` instead.
+
+- **`genexus_apply_pattern` returns `status: "NoOp"` with an actionable recommendation when the SDK engine no-ops on a target.** Used to silently report `Success` while doing nothing on Procedure/SDPanel targets (and on WebPanel pre-fix). Now carries `noOpReason` explaining the SDK's behaviour and `recommendation` pointing at the Transaction path, plus an optional `sdkProbePath` when `GX_MCP_PATTERN_PROBE=1` is set.
+
+- **`genexus_whoami` reports update availability as structured data.** The response includes an `update` block with `currentVersion`, `latestVersion`, `updateAvailable`, `checkedAt`, `releaseUrl`, `command`, and `restartRequired`. AI agents can detect a pending upgrade in the same call where they read the KB context, then proactively offer the upgrade command — no longer have to rely on the stderr-style `notifications/message` the user might miss. The data comes from a 24h-cached GitHub release check the gateway runs in the background on `initialize`; reading it is zero-latency. Set `GENEXUS_MCP_NO_UPDATE_CHECK=1` to disable the background check (corporate networks that block the GitHub API). Documented as the "Self-update protocol (LLM-facing)" section in `AGENTS.md`.
+
+### Fixed
+
+- **`genexus_apply_pattern` no longer drops `pattern` and `settings`.** The gateway's `OperationsRouter` wrapped the original arguments under `@params` for `apply_pattern`, `apply_template`, `bulk_edit`, and `diff`, but the worker dispatcher read fields at the top level — so `args["pattern"]` was always null and the tool returned `"Pattern key is required."` even when the caller had passed one. The dispatcher now unwraps the nested params object once, preserving any outer routing fields as a fallback.
+
+- **`genexus_apply_pattern reapply=true` works on installs that lack the `ApplyPattern(PatternInstance, ApplySettings)` overload.** Previous logic threw `InvalidOperationException` because the reflection probe disambiguated overloads using `IsAssignableFrom(KBObject)` — but `PatternInstance` inherits from `KBObject`, so both overloads bound to the same field and the reapply slot stayed null. Disambiguation now uses exact-type matching, and `TryReapplyWithFallback` replays the void overload (which the SDK treats as a re-apply when an instance already exists) when the typed overload is missing.
+
+- **`genexus_delete_object` removes the entry from the search index.** Previously the deleted object stayed visible to `list_objects` / `query` for several minutes until a full reindex caught up. The index cache's `RemoveEntry(type, name)` is now called inline after a successful SDK delete; results from index-backed tools reflect the deletion immediately.
+
+- **`genexus_apply_pattern` updates the index cache for every generated family object.** Same gap as delete — after a Transaction-driven apply, the freshly generated `WorkWithPlus<X>`, `WW<X>`, `View<X>`, and export procedures were invisible to `list_objects` until a reindex. Each generated object is now `UpdateEntry`'d via the index cache before the apply response returns.
+
+- **`genexus_worker_reload` reliably copies new binaries.** Previous helper used a single `Copy-Item -ErrorAction SilentlyContinue` that masked a real race — the gateway respawned the worker faster than the helper could copy, re-locking the .exe, and the silent failure went unnoticed. The PowerShell helper now retries up to 20 times at 500 ms intervals, kills any worker that respawned mid-copy so the gateway brings a clean one up with the new bits, and writes `worker_reload.last_result.json` next to the published binaries so callers can diagnose silent failures. The response is now `"Accepted"` (was misleading `"Success"`) and points at that status file.
+
+### Changed
+
+- **`apply_pattern` on existing-instance targets skips the engine reapply call.** The void `ApplyPattern(PatternInstance, ApplySettings)` overload throws `NullReferenceException` on the GeneXus 18.0.7 SDK whenever the IDE service container isn't around. The MCP now goes directly to `IPatternBuildProcess.UpdateParentObject` (the projection step), which works headlessly. The behavioural surface is identical from the caller's perspective: the host's PatternInstance is re-applied onto the bound parent. Engine `ReapplyCalls` are no longer made on this path.
+
+- **`genexus_apply_pattern` tool description and `genexus_create_object` patternHint rewritten.** Both now document the two real target shapes (Transaction-driven family generation and direct WebPanel attach with template), with concrete `settings.template` examples. Previously the documentation either over-promised (`Pattern attaches in-place to any WebPanel`) or under-promised (`apply WWP only on Transaction`). The new copy matches the actual SDK behaviour after the fix.
+
+### Internal
+
+- New helpers, no public-API impact: `Services/WwpProjectionHelper.cs` (shared `TryProjectHostOntoParent` + parent resolution), `Services/SdkSurfaceProbe.cs` (reusable SDK scanner), `Tests/LiveKbFactAttribute.cs` (xunit `[Fact]` subclass that env-gates on `GXMCP_TEST_KB` / `GXMCP_REQUIRE_WWP` for integration smokes).
+- `docs/sdk-probe/` directory carries the SDK map plus a `wwp-projection-discovery.md` narrative of dead ends and the working path. `raw.json` is gitignored (~17 MB, regenerated each apply); `INDEX.md`, `generators.md`, and `README.md` are tracked.
+- Pattern-write path now exposes `WriteService.ForcePatternPartDirty` and `WriteService.ApplyPatternDataFromXml` publicly so `WwpProjectionHelper` can reuse the same Dirty/Mode bookkeeping the regular pattern write uses.
+- New `Microsoft.Build.Framework` reference in the worker csproj so the MSBuild-style `WWP_ApplyTemplate` task's `IBuildEngine` contract resolves (the task's ctor still fails headlessly; we keep the route as a fallback in case future SDK versions relax the requirement).
+- Tests: worker 379 → 382 (3 new `ApplySettings` projection tests, integration smokes env-gated via `LiveKbFact`), gateway 252 → 252 (golden discovery fixture regenerated for the new `genexus_sdk_probe` tool). All green; 2 worker tests skipped by design when `GXMCP_TEST_KB` is unset.
+
+## Unreleased
+
+(none)
 
 ## v2.5.3 — 2026-05-19
 

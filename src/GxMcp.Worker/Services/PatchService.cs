@@ -58,10 +58,108 @@ namespace GxMcp.Worker.Services
             return (false, source, "NoMatch");
         }
 
+        // Returns a warning if the agent is editing a visual part (WebForm/Layout) on
+        // an object whose WorkWithPlus host has a PatternInstance — hand edits there
+        // can be overwritten on next pattern apply/save.
+        //
+        // Resolution covers three target shapes:
+        //   (1) The WWP host itself (`WorkWithPlus<X>`) — direct match.
+        //   (2) The Transaction the host is built on — ResolveWWPInstance("WorkWithPlus"+name).
+        //   (3) A generated WW WebPanel (`WW<X>`, `View<X>`, `Export*`, etc.) — these
+        //       don't follow the `WorkWithPlus<X>` naming rule, so we resolve the host
+        //       by checking GetParent() up to 3 levels, looking for a WWP-typed ancestor.
+        private JArray BuildPatternShadowWarningsIfAny(string target, string partName, string typeFilter)
+        {
+            try
+            {
+                if (_patternAnalysisService == null || _objectService == null) return null;
+                if (!GxMcp.Worker.Helpers.WebFormXmlHelper.IsVisualPart(partName)) return null;
+
+                var obj = _objectService.FindObject(target, typeFilter);
+                if (obj == null) return null;
+
+                var resolved = _patternAnalysisService.ResolveWWPInstance(obj);
+
+                // Fallback for generated WW family (WW<Trn>, View<Trn>, etc.): WWP host
+                // for `WWX` is named `WorkWithPlusX`. We try a few common prefixes; the
+                // ResolveWWPInstance also walks Children, so a hit here closes the gap
+                // for the generated WebPanel case that motivated F6.
+                if (resolved == null && !string.IsNullOrEmpty(obj.Name))
+                {
+                    string[] candidatePrefixes = { "WW", "View", "ViewWW", "Prompt" };
+                    foreach (var pre in candidatePrefixes)
+                    {
+                        if (!obj.Name.StartsWith(pre, StringComparison.Ordinal)) continue;
+                        string baseName = obj.Name.Substring(pre.Length);
+                        if (string.IsNullOrEmpty(baseName)) continue;
+                        var hostName = "WorkWithPlus" + baseName;
+                        try
+                        {
+                            var host = _objectService.FindObject(hostName);
+                            if (host != null && string.Equals(host.TypeDescriptor?.Name, "WorkWithPlus", StringComparison.OrdinalIgnoreCase))
+                            {
+                                resolved = host;
+                                break;
+                            }
+                        }
+                        catch { /* lookup best-effort */ }
+                    }
+                }
+
+                if (resolved == null) return null;
+
+                var part = _patternAnalysisService.FindPatternPart(resolved, "PatternInstance");
+                if (part == null) return null;
+
+                return new JArray
+                {
+                    new JObject
+                    {
+                        ["code"] = "EditingWebFormUnderPattern",
+                        ["severity"] = "warning",
+                        ["message"] =
+                            "This object is covered by a WorkWithPlus PatternInstance ('" + resolved.Name +
+                            "'). Hand edits to " + partName + " can be overwritten on the next pattern apply/save. " +
+                            "Consider editing part=PatternInstance on '" + resolved.Name + "' instead. " +
+                            "Toggle SDPlus_Editor_Apply_On_Save=False on " + resolved.Name +
+                            " if you must keep a hard override on the visual part.",
+                        ["patternInstance"] = resolved.Name
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("[PatchService] PatternShadow warning probe skipped: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static string AttachWarningsToJson(string json, JArray warnings)
+        {
+            if (warnings == null || warnings.Count == 0 || string.IsNullOrEmpty(json)) return json;
+            try
+            {
+                var obj = JObject.Parse(json);
+                obj["warnings"] = warnings;
+                return obj.ToString();
+            }
+            catch
+            {
+                return json;
+            }
+        }
+
         public string ApplyPatch(string target, string partName, string operation, string content, string context = null, int expectedCount = 1, string typeFilter = null, bool dryRun = false, bool verifyRollback = false, bool returnPostState = true, bool verbose = false)
         {
             try
             {
+                // Probe pattern-shadow warning ONCE before doing any work. If the agent
+                // is patching a WebForm/Layout on an object whose WorkWithPlus host has
+                // a populated PatternInstance, attach a warning to the terminal response
+                // so they know hand edits to the visual XML can be overwritten by the
+                // next pattern apply/save. Mirrors the same probe in WriteService.WriteVisualPart.
+                JArray patternShadowWarnings = BuildPatternShadowWarningsIfAny(target, partName, typeFilter);
+
                 string cacheKey = BuildCacheKey(target, partName, typeFilter);
                 bool sourceFromCache = false;
                 long readMs = 0;
@@ -267,6 +365,7 @@ namespace GxMcp.Worker.Services
                 if (dryRun)
                 {
                     string dryRunResult = BuildPatchResult("Applied", partName, normalizedOperation, expectedCount, matchCount, "Dry-run succeeded. Write skipped.");
+                    dryRunResult = AttachWarningsToJson(dryRunResult, patternShadowWarnings);
                     return AttachTimings(dryRunResult, readMs, patchMs, 0, sourceFromCache);
                 }
 
@@ -465,6 +564,8 @@ namespace GxMcp.Worker.Services
                 };
                 if (returnPostState && finalSuccess && updatedSource != null)
                     writePayload["post_state"] = GxMcp.Worker.Services.JsonPatchService.BuildPostState(originalSource, updatedSource, verbose);
+                if (patternShadowWarnings != null && patternShadowWarnings.Count > 0)
+                    writePayload["warnings"] = patternShadowWarnings;
                 return writePayload.ToString();
             }
             catch (Exception ex)

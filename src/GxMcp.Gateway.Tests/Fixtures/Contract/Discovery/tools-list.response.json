@@ -1392,6 +1392,19 @@
       "name": "genexus_refactor"
     },
     {
+      "description": "Scan loaded GeneXus SDK assemblies and dump a structured map of every public type, method, property to docs/sdk-probe/. Use when investigating new SDK surface or hunting for an entry point. Outputs raw.json + INDEX.md + generators.md.",
+      "inputSchema": {
+        "properties": {
+          "outputDir": {
+            "description": "Optional absolute path. Defaults to <repo>/docs/sdk-probe/ or %TEMP%/gxmcp_sdk_probe/.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "genexus_sdk_probe"
+    },
+    {
       "description": "Regex/semantic search across Procedure/DataProvider/WebPanel/Transaction source.",
       "inputSchema": {
         "properties": {

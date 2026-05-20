@@ -64,7 +64,7 @@ Remaining validation before `DONE`:
 Goal:
 edit captions, visibility, and column metadata for WebPanel grids and WorkWithPlus-generated controls without relying on fragile XML patching.
 
-Status: `IN_PROGRESS`
+Status: `VALIDATING`
 
 Scope:
 
@@ -72,6 +72,7 @@ Scope:
 - expose control tree introspection for UI controls
 - support updates to grid columns by control identity
 - support title and visibility updates for columns
+- create a fresh `PatternInstance` on a Transaction or WebPanel (apply pattern)
 
 Validation:
 
@@ -86,11 +87,15 @@ Validated so far:
 - `genexus_read(part='PatternInstance')` on `ControleExtensaoHoras` now resolves to `WorkWithPlusControleExtensaoHoras`
 - the resolved `PatternInstance` returns the real WorkWithPlus XML instance instead of the previous `<Properties />` stub
 - the gateway now preserves `PatternInstance` XML without injecting truncation markers into the editable payload
-- `genexus_edit(part='PatternInstance')` now completes over HTTP for a no-op roundtrip on `ControleExtensaoHoras`
+- `genexus_edit(part='PatternInstance')` round-trips real mutations on `ControleExtensaoHoras` (v2.5.0: `DeserializeDataFrom(XmlElement)` + `ForceSave`)
+- `PatternChildOrderReconciler` rebuilds `childrenOrderedList` on every write
+- `genexus_apply_pattern` (v2.5.2) creates a fresh `PatternInstance` via `PatternEngine.ApplyPattern`
+- `genexus_create_object type=WebPanel` now hints toward `apply_pattern` via `_meta.patternHint`, and `genexus_edit part=WebForm|Layout` on a pattern-covered object surfaces an `EditingWebFormUnderPattern` warning (post-v2.5.3)
+- `ApplySettings` is best-effort projected from the JObject on re-apply (post-v2.5.3)
 
-Open blocker:
+Remaining before `DONE`:
 
-- a real business mutation of the WorkWithPlus grid columns is still pending validation against the authoritative `PatternInstance`
+- live end-to-end smoke against a WorkWithPlus-licensed KB (the `LiveKbFact` integration scaffolding is in place — opt-in via `GXMCP_TEST_KB` + `GXMCP_REQUIRE_WWP=1`)
 
 ### 3. Verified persistence after writes
 

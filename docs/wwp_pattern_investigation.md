@@ -1,5 +1,30 @@
 # Investigacao WWP PatternInstance
 
+> **STATUS: HISTORICAL — resolved in v2.5.0 (commit `e0a73d9`, 2026-05-18).**
+>
+> The core blocker described below (`DeserializeFromXml` only round-trips the
+> `<Properties>` bag, never the actual pattern data) was fixed by switching the
+> write path to `DeserializeDataFrom(XmlElement)` wrapped in a transient `<Data>`
+> parent, plus forcing `part.Dirty=true`, `part.Mode=Modified`, and
+> `KBObjectSavePreferences { ForceSave = true }`. `PatternChildOrderReconciler`
+> rebuilds `childrenOrderedList` automatically on every write. The current
+> active surface is documented in:
+>
+> - `README.md` → "WorkWithPlus pattern editing — what you can actually do"
+> - `genexus://kb/tool-help/genexus_edit` (Pattern section)
+> - `genexus://kb/tool-help/genexus_apply_pattern` (v2.5.2)
+>
+> v2.5.2 (commit `7390ae7`) added `genexus_apply_pattern` so callers can also
+> create a fresh PatternInstance on a Transaction or WebPanel via the SDK's
+> `PatternEngine.ApplyPattern` — not just edit an existing one.
+>
+> v2.6 (post-release) added best-effort `ApplySettings` projection from the
+> caller's JObject in `ReflectionPatternEngineAdapter.TryBuildApplySettings`.
+>
+> The notes below are kept as a research log — they describe trails that were
+> tried and discarded (raw XML overwrite, attribute-bag mutation, EditorHelper
+> via missing host service). Do not treat them as current limitations.
+
 ## Objetivo
 
 Documentar, com o maximo de precisao possivel, o comportamento observado ao tentar editar `PatternInstance` de objetos WorkWithPlus via MCP, usando o caso real de `ControleExtensaoHoras`.

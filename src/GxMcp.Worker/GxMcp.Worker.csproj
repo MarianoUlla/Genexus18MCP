@@ -21,6 +21,12 @@
       <HintPath>$(GX_PATH)\Artech.Architecture.Common.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="Microsoft.Build.Framework" />
+    <Reference Include="Microsoft.Build.Utilities.v4.0" />
+    <Reference Include="Microsoft.Build.Utilities.Core">
+      <HintPath>$(GX_PATH)\Microsoft.Build.Utilities.Core.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="Artech.Genexus.Common">
       <HintPath>$(GX_PATH)\Artech.Genexus.Common.dll</HintPath>
       <Private>False</Private>

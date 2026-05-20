@@ -118,6 +118,15 @@ namespace GxMcp.Gateway.Routers
                         @params = args
                     };
 
+                case "genexus_sdk_probe":
+                    return new
+                    {
+                        module = "SdkProbe",
+                        action = "Run",
+                        target = "_self",
+                        outputDir = args?["outputDir"]?.ToString()
+                    };
+
                 case "genexus_diff":
                     return new
                     {
