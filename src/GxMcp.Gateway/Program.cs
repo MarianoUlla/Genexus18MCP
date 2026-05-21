@@ -586,8 +586,120 @@ namespace GxMcp.Gateway
             };
         }
 
+        private static async Task RunSelfTestAndExitAsync()
+        {
+            var result = new JObject();
+            var checks = new JArray();
+            int failCount = 0;
+            int warnCount = 0;
+
+            void AddCheck(string id, string status, string detail)
+            {
+                if (status == "fail") failCount++;
+                else if (status == "warn") warnCount++;
+                checks.Add(new JObject { ["id"] = id, ["status"] = status, ["detail"] = detail });
+            }
+
+            // 1. Gateway exe location (so callers see where the test ran from).
+            string gatewayExe;
+            try { gatewayExe = Process.GetCurrentProcess().MainModule?.FileName ?? AppContext.BaseDirectory; }
+            catch { gatewayExe = AppContext.BaseDirectory; }
+            result["gatewayExe"] = gatewayExe;
+
+            // 2. Config load — surfaces missing GX_CONFIG_PATH and JSON parse errors.
+            Configuration? config = null;
+            try
+            {
+                config = Configuration.Load();
+                AddCheck("config_load", "pass", $"config.json loaded from {Configuration.CurrentConfigPath ?? "<unknown>"}");
+            }
+            catch (Exception ex)
+            {
+                AddCheck("config_load", "fail", $"config.json load failed: {ex.Message}");
+            }
+
+            // 3. GeneXus installation.
+            string? gxPath = config?.GeneXus?.InstallationPath;
+            if (string.IsNullOrWhiteSpace(gxPath))
+            {
+                AddCheck("gx_installation", "fail", "GeneXus.InstallationPath is not set in config.json");
+            }
+            else
+            {
+                string exe = Path.Combine(gxPath, "genexus.exe");
+                if (File.Exists(exe))
+                    AddCheck("gx_installation", "pass", $"genexus.exe present at {gxPath}");
+                else
+                    AddCheck("gx_installation", "fail", $"genexus.exe NOT found at {gxPath} (config points here but it is missing)");
+            }
+
+            // 4. In-process build assembly — loadable means Stream D's build daemon works.
+            if (!string.IsNullOrWhiteSpace(gxPath))
+            {
+                string dll = Path.Combine(gxPath, "Genexus.MsBuild.Tasks.dll");
+                if (File.Exists(dll))
+                    AddCheck("in_process_build_assembly", "pass", $"Genexus.MsBuild.Tasks.dll present ({new FileInfo(dll).Length / 1024} KB)");
+                else
+                    AddCheck("in_process_build_assembly", "warn", $"Genexus.MsBuild.Tasks.dll missing — build will fall back to MSBuild.exe spawn");
+            }
+
+            // 5. KB path(s).
+            string? kbPath = config?.Environment?.KBPath;
+            if (string.IsNullOrWhiteSpace(kbPath))
+            {
+                AddCheck("kb_path", "warn", "No KB path configured");
+            }
+            else if (!Directory.Exists(kbPath))
+            {
+                AddCheck("kb_path", "fail", $"Configured KB path does not exist: {kbPath}");
+            }
+            else
+            {
+                bool looksLikeKb = false;
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(kbPath))
+                    {
+                        var name = Path.GetFileName(f).ToLowerInvariant();
+                        if (name.EndsWith(".gxw") || name == "knowledgebase.connection") { looksLikeKb = true; break; }
+                    }
+                }
+                catch { }
+                AddCheck("kb_path", looksLikeKb ? "pass" : "warn",
+                    looksLikeKb ? $"KB folder shape OK at {kbPath}" : $"KB path exists but no .gxw / KnowledgeBase.Connection found: {kbPath}");
+            }
+
+            result["checks"] = checks;
+            result["summary"] = new JObject
+            {
+                ["pass"] = checks.Count - failCount - warnCount,
+                ["warn"] = warnCount,
+                ["fail"] = failCount,
+                ["total"] = checks.Count
+            };
+            result["ok"] = failCount == 0;
+            result["schemaVersion"] = "gateway-selftest/1";
+
+            // Single JSON line on stdout so the PowerShell installer can ConvertFrom-Json it.
+            await Console.Out.WriteLineAsync(result.ToString(Formatting.None));
+            await Console.Out.FlushAsync();
+            Environment.Exit(failCount == 0 ? 0 : 1);
+        }
+
         public static async Task Main(string[] args)
         {
+            // Short-circuit self-test before any I/O setup. The CLI installer calls this
+            // to validate the install: it loads config, checks GeneXus install + KB
+            // existence + the in-process build dll, and prints a single JSON line to
+            // stdout. No worker is started, no HTTP listener is opened, no logs file
+            // is created. Replaces the no-op `--axi-spawn-probe` flag the installer
+            // used to call (which only verified that the exe could be launched).
+            if (args != null && args.Length > 0 && (args[0] == "--self-test" || args[0] == "--axi-self-test"))
+            {
+                await RunSelfTestAndExitAsync();
+                return;
+            }
+
             AppDomain.CurrentDomain.UnhandledException += async (s, e) => {
                 string msg = $"[{DateTime.Now}] FATAL UNHANDLED: {e.ExceptionObject}\n";
                 var errorObj = new { jsonrpc = "2.0", method = "notifications/message", @params = new { level = "error", logger = "gateway", data = msg } };

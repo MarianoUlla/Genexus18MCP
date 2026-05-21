@@ -40,6 +40,17 @@ namespace GxMcp.Worker.Services
         private readonly Action<string, string, DateTime> _onObjectChanged;
         private readonly HashSet<Guid> _notifiedInLastTick = new HashSet<Guid>();
 
+        // v2.6.6 Stream H (FR#26) — fires when the active environment changes
+        // so the gateway can invalidate its cached KbHandle.ActiveEnvironment
+        // value. Carries (envName, envVersion); both may be null when the SDK
+        // round-trip fails. Subscribers must be allocation-light: this is on
+        // the watcher poll path.
+        public event Action<string, string> OnEnvironmentChanged;
+
+        private string _lastObservedEnv;
+        private string _lastObservedEnvVersion;
+        private bool _hasObservedEnv;
+
         public KbWatcherService(KbService kbService, Action<string, string, DateTime> onObjectChanged)
         {
             _kbService = kbService;
@@ -90,6 +101,7 @@ namespace GxMcp.Worker.Services
                         if (kb != null)
                         {
                             CheckForChanges(kb);
+                            CheckForEnvironmentChange();
                         }
                     }
                 }
@@ -101,6 +113,58 @@ namespace GxMcp.Worker.Services
                 // Poll interval: 5 seconds (standard for metadata checks)
                 Thread.Sleep(5000);
             }
+        }
+
+        /// <summary>
+        /// v2.6.6 Stream H (FR#26) — detect environment switches.
+        ///
+        /// The SDK exposes environment-change as a property mutation rather
+        /// than a stable event in some versions, so we poll cheaply (string
+        /// compare on the same tick as the object-change scan) and only
+        /// raise <see cref="OnEnvironmentChanged"/> when the value flips.
+        /// First observation seeds the baseline silently.
+        /// </summary>
+        public void CheckForEnvironmentChange()
+        {
+            try
+            {
+                string env = _kbService.GetActiveEnvironment();
+                string version = _kbService.GetActiveEnvironmentVersion();
+
+                if (!_hasObservedEnv)
+                {
+                    _lastObservedEnv = env;
+                    _lastObservedEnvVersion = version;
+                    _hasObservedEnv = true;
+                    return;
+                }
+
+                bool envFlipped = !string.Equals(env, _lastObservedEnv, StringComparison.Ordinal);
+                bool versionFlipped = !string.Equals(version, _lastObservedEnvVersion, StringComparison.Ordinal);
+                if (!envFlipped && !versionFlipped) return;
+
+                _lastObservedEnv = env;
+                _lastObservedEnvVersion = version;
+                Logger.Info($"[KB-WATCHER] Environment change observed: env='{env}' version='{version}'");
+
+                var handler = OnEnvironmentChanged;
+                if (handler != null)
+                {
+                    try { handler(env, version); }
+                    catch (Exception ex) { Logger.Warn("OnEnvironmentChanged subscriber threw: " + ex.Message); }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("CheckForEnvironmentChange error: " + ex.Message);
+            }
+        }
+
+        // Test-only hook: lets tests fire the event without spinning the watcher thread.
+        internal void RaiseEnvironmentChangedForTest(string env, string version)
+        {
+            var handler = OnEnvironmentChanged;
+            handler?.Invoke(env, version);
         }
 
         private void CheckForChanges(dynamic kb)

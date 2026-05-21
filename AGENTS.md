@@ -58,6 +58,15 @@ The check is performed by the gateway in the background on `initialize`, cached 
 
 Set environment variable `GENEXUS_MCP_NO_UPDATE_CHECK=1` to disable the background check entirely. Some corporate networks block GitHub API; in those cases `update` returns `{currentVersion, updateAvailable: false, note: "no update-check yet ..."}` and the LLM should respect the absence and not pester.
 
+## Tool playbook — v2.6.6 additions
+
+Discoverable via `tools/list`; full schema in `src/GxMcp.Gateway/tool_definitions.json`. Each entry below is a 2-3 line orientation for the LLM agent.
+
+- **`genexus_lifecycle action=status wait=<sec> since=<baseline>`** — event-driven progress. Worker blocks on the task's `ManualResetEventSlim` and returns the moment the state transitions out of `baseline` (or `wait` seconds elapse). Replaces 1-2s polling loops.
+- **`genexus_history action=restore discard=true target=<obj>`** — IDE-parity Discard-changes. Restores the part bytes from the most recent `EditSnapshotStore` entry under `.gx/snapshots/`; no commit / rollback / VCS round-trip. Envelope surfaces `restoredFrom` (timestamp + snapshot path).
+- **`genexus_preview action=run`** — F5 launcher. Resolves the KB's startup object via `KbService.GetLauncherObjectName` (`StartupObject` env property → `DefaultObject` fallback) and opens it in the headless bridge. No `target` argument required.
+- **`genexus_analyze mode=parent_context target=<webpanel>`** — popup-vs-standalone classification. Returns `{ openedAs: "popup"|"standalone", hint }` so the agent knows whether the panel was generated for `genexus_create_popup` or as a top-level screen. The same `popupHint` is inlined into the create_popup response so both sides agree on the first call.
+
 ## Release discipline
 
 - Before any release (`scripts/release.ps1`, tag, or GitHub Release), update

@@ -134,6 +134,77 @@ function discoverKnowledgeBase(cwd) {
     return null;
 }
 
+// Broader KB discovery: walk up the cwd ancestry, then scan a small set of common
+// roots where developers stash KBs. Returns deduped candidates with a `source` tag
+// so the caller can explain its pick. Bounded so we never recurse into giant trees.
+function discoverKnowledgeBases(cwd, { maxResults = 25, scanDepth = 2 } = {}) {
+    const results = [];
+    const seen = new Set();
+    const push = (dir, source) => {
+        if (!dir) return;
+        const key = path.resolve(dir).toLowerCase();
+        if (seen.has(key)) return;
+        if (results.length >= maxResults) return;
+        if (directoryLooksLikeKnowledgeBase(dir)) {
+            seen.add(key);
+            results.push({ path: path.resolve(dir), source });
+        }
+    };
+
+    // 1. cwd and ancestors (a developer running `npx init` from a KB subdirectory
+    //    almost certainly meant that KB).
+    if (cwd) {
+        let current = path.resolve(cwd);
+        let lastParent = null;
+        while (current && current !== lastParent && results.length < maxResults) {
+            push(current, 'cwd-ancestor');
+            lastParent = current;
+            current = path.dirname(current);
+            if (current === lastParent) break;
+        }
+    }
+
+    // 2. Common KB roots — drives + user folders. Scan a shallow depth only.
+    const roots = [];
+    for (const drive of ['C', 'D', 'E']) {
+        roots.push(`${drive}:\\KBs`);
+        roots.push(`${drive}:\\KB`);
+        roots.push(`${drive}:\\GeneXus`);
+    }
+    if (process.env.USERPROFILE) {
+        roots.push(path.join(process.env.USERPROFILE, 'Documents', 'GeneXus'));
+        roots.push(path.join(process.env.USERPROFILE, 'KBs'));
+        roots.push(path.join(process.env.USERPROFILE, 'source', 'repos'));
+    }
+
+    const scanRoot = (root, depth) => {
+        if (depth < 0) return;
+        if (results.length >= maxResults) return;
+        let entries;
+        try {
+            entries = fs.readdirSync(root, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const entry of entries) {
+            if (results.length >= maxResults) return;
+            if (!entry.isDirectory()) continue;
+            const full = path.join(root, entry.name);
+            push(full, 'common-root');
+            if (depth > 0) scanRoot(full, depth - 1);
+        }
+    };
+
+    for (const root of roots) {
+        try {
+            if (fs.existsSync(root)) scanRoot(root, scanDepth);
+        } catch {
+        }
+    }
+
+    return results;
+}
+
 function directoryLooksLikeKnowledgeBase(dir) {
     try {
         const files = fs.readdirSync(dir);
@@ -684,6 +755,7 @@ module.exports = {
     discoverGeneXusInstallation,
     discoverGeneXusFromRegistry,
     discoverKnowledgeBase,
+    discoverKnowledgeBases,
     directoryLooksLikeKnowledgeBase,
     readJsonFileSafe,
     resolveConfigPathNoMutate,

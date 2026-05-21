@@ -57,6 +57,10 @@ namespace GxMcp.Worker.Services
                 bool dryRun = req["dryRun"]?.ToObject<bool?>() ?? false;
                 bool returnPostState = req["return_post_state"]?.ToObject<bool?>() ?? true;
                 bool verbose = req["verbose"]?.ToObject<bool?>() ?? false;
+                // v2.6.6 FR#13 — validate mode plumbing. Default "strict" preserves
+                // the v2.6.5 abort-on-first-failure semantics so existing callers are
+                // unaffected.
+                string validate = req["validate"]?.ToString();
 
                 if (string.IsNullOrEmpty(target))
                     throw new UsageException("usage_error", "target required");
@@ -69,7 +73,7 @@ namespace GxMcp.Worker.Services
                 if (!_objectService.GetKbService().IsOpen)
                     throw new UsageException("usage_error", "object '" + target + "' not found");
 
-                return ApplySemanticOpsCore(target, partName, opsRaw, dryRun, returnPostState, verbose);
+                return ApplySemanticOpsCore(target, partName, opsRaw, dryRun, returnPostState, verbose, validate);
             }
             catch (UsageException ux)
             {
@@ -98,7 +102,7 @@ namespace GxMcp.Worker.Services
         }
 
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        private string ApplySemanticOpsCore(string target, string partName, JArray opsRaw, bool dryRun, bool returnPostState = true, bool verbose = false)
+        private string ApplySemanticOpsCore(string target, string partName, JArray opsRaw, bool dryRun, bool returnPostState = true, bool verbose = false, string validate = null)
         {
             var obj = _objectService.FindObject(target, null);
             if (obj == null)
@@ -118,15 +122,66 @@ namespace GxMcp.Worker.Services
 
             var ops = opsRaw.OfType<JObject>().Select(SemanticOp.From).ToList();
 
-            string newXml = new SemanticOpsService().Apply(currentXml, kind, ops);
+            // v2.6.6 FR#13 — validate mode dispatch. The legacy Apply() path is
+            // preserved when validate is unset (or "strict") AND every op succeeds,
+            // so the resulting XML is byte-identical to v2.6.5.
+            string mode = SemanticOpsService.NormalizeMode(validate);
+            SemanticOpsService.OpsApplyOutcome outcome;
+            try
+            {
+                outcome = new SemanticOpsService().ApplyWithResults(currentXml, kind, ops, mode);
+            }
+            catch (UsageException) when (mode != "strict")
+            {
+                outcome = new SemanticOpsService.OpsApplyOutcome
+                {
+                    Xml = currentXml,
+                    Results = new System.Collections.Generic.List<SemanticOpsService.OpResult>(),
+                    Aborted = true,
+                    Mode = mode
+                };
+            }
+            string newXml = outcome.Xml;
+            int okCount = outcome.Results.Count(r => r.Ok);
 
-            if (dryRun)
-                return DryRunPlanBuilder.BuildEnvelope(target, currentXml, newXml, "ops").ToString(Newtonsoft.Json.Formatting.None);
+            // strict + aborted → bubble the original failure for backwards compat.
+            if (mode == "strict" && outcome.Aborted)
+            {
+                var failed = outcome.Results.FirstOrDefault(r => !r.Ok);
+                throw new UsageException(failed?.Code ?? "usage_error",
+                    failed?.Reason ?? "op failed");
+            }
+
+            var opResultsJson = new JArray();
+            foreach (var r in outcome.Results) opResultsJson.Add(r.ToJson());
+
+            // validate=only → never persist; return diagnostics only.
+            if (mode == "only" || dryRun)
+            {
+                var envelope = DryRunPlanBuilder.BuildEnvelope(target, currentXml, newXml, "ops");
+                JObject env;
+                try { env = JObject.Parse(envelope.ToString()); }
+                catch { env = new JObject { ["raw"] = envelope.ToString() }; }
+                env["validate"] = mode;
+                env["opResults"] = opResultsJson;
+                env["opsApplied"] = okCount;
+                env["opsTotal"] = ops.Count;
+                if (returnPostState)
+                    env["post_state"] = JsonPatchService.BuildPostState(currentXml, newXml, verbose);
+                return env.ToString(Newtonsoft.Json.Formatting.None);
+            }
 
             string writeResult = WriteObject(target, partName, newXml, null, false, false, false, false);
             JObject writeJson;
             try { writeJson = JObject.Parse(writeResult); }
             catch { writeJson = new JObject { ["raw"] = writeResult }; }
+
+            // v2.6.6 FR#12 — re-read persisted bytes AFTER the SDK commits so
+            // return_post_state slices reflect on-disk reality, not the
+            // in-memory write buffer that the v2.6.4 regression captured.
+            bool writeOk = string.Equals(writeJson["status"]?.ToString(), "Success", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(writeJson["status"]?.ToString(), "Ok", StringComparison.OrdinalIgnoreCase);
+            string persistedAfter = writeOk ? ReadPersistedPartSafely(target, partName) : null;
 
             var resp = new JObject
             {
@@ -134,11 +189,14 @@ namespace GxMcp.Worker.Services
                 ["target"] = target,
                 ["part"] = partName,
                 ["mode"] = "ops",
-                ["opsApplied"] = ops.Count,
+                ["validate"] = mode,
+                ["opsApplied"] = okCount,
+                ["opsTotal"] = ops.Count,
+                ["opResults"] = opResultsJson,
                 ["write"] = writeJson
             };
             if (returnPostState)
-                resp["post_state"] = JsonPatchService.BuildPostState(currentXml, newXml, verbose);
+                resp["post_state"] = JsonPatchService.BuildPostState(currentXml, newXml, verbose, persistedAfter);
             return resp.ToString(Newtonsoft.Json.Formatting.None);
         }
 
@@ -234,6 +292,11 @@ namespace GxMcp.Worker.Services
             try { writeJson = JObject.Parse(writeResult); }
             catch { writeJson = new JObject { ["raw"] = writeResult }; }
 
+            // v2.6.6 FR#12 — see ApplySemanticOpsCore for the rationale.
+            bool writeOk = string.Equals(writeJson["status"]?.ToString(), "Success", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(writeJson["status"]?.ToString(), "Ok", StringComparison.OrdinalIgnoreCase);
+            string persistedAfter = writeOk ? ReadPersistedPartSafely(target, partName) : null;
+
             var resp = new JObject
             {
                 ["isError"] = false,
@@ -244,8 +307,34 @@ namespace GxMcp.Worker.Services
                 ["write"] = writeJson
             };
             if (returnPostState)
-                resp["post_state"] = JsonPatchService.BuildPostState(currentXml, newXml, verbose);
+                resp["post_state"] = JsonPatchService.BuildPostState(currentXml, newXml, verbose, persistedAfter);
             return resp.ToString(Newtonsoft.Json.Formatting.None);
+        }
+
+        /// <summary>
+        /// v2.6.6 FR#12 — read the persisted part bytes from the SDK with cache
+        /// drop so callers see post-commit reality. Returns null on any failure
+        /// (logged); callers fall back to the in-memory <c>after</c> value.
+        /// </summary>
+        private string ReadPersistedPartSafely(string target, string partName)
+        {
+            if (string.IsNullOrWhiteSpace(target)) return null;
+            try
+            {
+                var obj = _objectService.FindObject(target, null);
+                if (obj != null) _objectService.MarkReadCacheDirty(obj, partName);
+                string readJson = _objectService.ReadObjectSource(target, partName, null, null, "mcp", true, null);
+                if (string.IsNullOrWhiteSpace(readJson)) return null;
+                var parsed = JObject.Parse(readJson);
+                return parsed["source"]?.ToString()
+                    ?? parsed["content"]?.ToString()
+                    ?? parsed["parts"]?[partName ?? "Source"]?.ToString();
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("[POST-STATE] persisted re-read failed for " + target + " (" + partName + "): " + ex.Message);
+                return null;
+            }
         }
 
         private void InitializeFlushTimer()
@@ -653,6 +742,17 @@ namespace GxMcp.Worker.Services
             // worker_debug.log. Threshold 250ms matches user-perceived friction: anything over that
             // is worth diagnosing.
             var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // v2.6.6 FR#11 — pre-write snapshot. Capture prior persisted content
+            // BEFORE WriteObjectInternal mutates SDK state. Snapshot is best-effort:
+            // any failure logs at warn and DOES NOT block the write (the caller still
+            // gets persistedHash + persistedSnippet on the response envelope).
+            GxMcp.Worker.Helpers.EditSnapshotStore.SnapshotInfo snapshot = null;
+            if (!dryRun)
+            {
+                snapshot = TryCapturePreWriteSnapshot(target, partName, typeFilter);
+            }
+
             string raw;
             try
             {
@@ -670,7 +770,81 @@ namespace GxMcp.Worker.Services
             // (success, no-change, dry-run, rollback, or error).
             // Default sdkPath = typed-sdk; deeper writers (LayoutService raw-XML) tag their own
             // sdkPath first and WrapWithPersistedState is idempotent so it preserves that.
-            return WrapWithPersistedState(raw, target, string.IsNullOrWhiteSpace(partName) ? "Source" : partName, GxMcp.Worker.Helpers.WriteResultMeta.TypedSdk);
+            string wrapped = WrapWithPersistedState(raw, target, string.IsNullOrWhiteSpace(partName) ? "Source" : partName, GxMcp.Worker.Helpers.WriteResultMeta.TypedSdk);
+
+            // Attach snapshot envelope to the response so callers can restore.
+            if (snapshot != null)
+            {
+                try
+                {
+                    var parsed = JObject.Parse(wrapped);
+                    parsed["snapshot"] = new JObject
+                    {
+                        ["path"] = snapshot.Path,
+                        ["timestamp"] = snapshot.Timestamp,
+                        ["guid"] = snapshot.Guid,
+                        ["part"] = snapshot.Part,
+                        ["compressed"] = snapshot.Compressed,
+                        ["bytes"] = snapshot.Bytes
+                    };
+                    wrapped = parsed.ToString(Newtonsoft.Json.Formatting.None);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug("[SNAPSHOT] envelope attach failed: " + ex.Message);
+                }
+            }
+            return wrapped;
+        }
+
+        /// <summary>
+        /// v2.6.6 FR#11 — capture the on-disk content of <paramref name="partName"/>
+        /// to <c>&lt;kbPath&gt;/.gx/snapshots/&lt;guid&gt;-&lt;part&gt;-&lt;utc-iso&gt;.bak</c>
+        /// before any destructive WriteObject. Returns the snapshot descriptor or
+        /// <c>null</c> when the prior content could not be retrieved (no KB open,
+        /// object missing, part has no textual representation, etc.).
+        /// </summary>
+        private GxMcp.Worker.Helpers.EditSnapshotStore.SnapshotInfo TryCapturePreWriteSnapshot(string target, string partName, string typeFilter)
+        {
+            if (string.IsNullOrWhiteSpace(target)) return null;
+            try
+            {
+                var obj = _objectService.FindObject(target, typeFilter);
+                if (obj == null) return null;
+                string guid = null;
+                try { guid = obj.Guid.ToString(); } catch { }
+                if (string.IsNullOrEmpty(guid)) return null;
+
+                string resolvedPart = string.IsNullOrWhiteSpace(partName) ? "Source" : partName;
+                string priorContent = null;
+                try
+                {
+                    string readJson = _objectService.ReadObjectSource(target, resolvedPart, null, null, "mcp", true, null);
+                    if (!string.IsNullOrWhiteSpace(readJson))
+                    {
+                        var parsed = JObject.Parse(readJson);
+                        priorContent = parsed["source"]?.ToString()
+                            ?? parsed["content"]?.ToString();
+                    }
+                }
+                catch (Exception readEx)
+                {
+                    Logger.Debug("[SNAPSHOT] prior-read failed for " + target + "/" + resolvedPart + ": " + readEx.Message);
+                    return null;
+                }
+                if (priorContent == null) return null;
+
+                string kbPath = null;
+                try { kbPath = _objectService.GetKbService().GetKbPath(); } catch { }
+                string snapshotRoot = GxMcp.Worker.Helpers.EditSnapshotStore.ResolveRoot(kbPath);
+
+                return GxMcp.Worker.Helpers.EditSnapshotStore.SaveSnapshot(snapshotRoot, guid, resolvedPart, priorContent);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("[SNAPSHOT] capture skipped for " + target + "/" + partName + ": " + ex.Message);
+                return null;
+            }
         }
 
         private string WriteObjectInternal(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)
@@ -5143,6 +5317,51 @@ namespace GxMcp.Worker.Services
         // on-disk source plus a ~10-line snippet, so callers can confirm
         // post-write state without a follow-up read. Applies uniformly to
         // success, no-change, dry-run, rollback, and error responses.
+
+        // ----------------------------------------------------------------------
+        // v2.6.6 FR#10 — patch safety guard.
+        // ----------------------------------------------------------------------
+        /// <summary>
+        /// Reject suspicious writes that would silently nuke an object part. A
+        /// patch find-string mismatch (CRLF/LF, encoding drift) used to surface
+        /// as an empty result string; the unguarded SDK save then persisted the
+        /// empty payload and the sha256 of the lost part was e3b0c44... (empty).
+        ///
+        /// Returns <c>true</c> when the proposed write looks safe. When it
+        /// returns <c>false</c>, <paramref name="reason"/> carries a stable
+        /// machine-readable code (<c>patch_no_match</c> / <c>suspicious_shrink</c>)
+        /// the gateway promotes to an <c>isError</c> envelope.
+        /// </summary>
+        public static bool IsPatchWriteSafe(string originalContent, string proposedContent, bool anyOpApplied, out string reason)
+        {
+            reason = null;
+            if (proposedContent == null)
+            {
+                reason = "patch_no_match";
+                return false;
+            }
+
+            int origLen = originalContent?.Length ?? 0;
+            int newLen = proposedContent.Length;
+
+            // Empty proposal with non-empty original is always a patch failure;
+            // never let an empty payload reach the SDK save path.
+            if (origLen > 0 && newLen == 0)
+            {
+                reason = "patch_no_match";
+                return false;
+            }
+
+            // Severe shrink with no recorded op == NoMatch fall-through. The
+            // 0.5 ratio matches the brief; tune via tests rather than ad-hoc.
+            if (!anyOpApplied && origLen > 0 && newLen < origLen / 2)
+            {
+                reason = "suspicious_shrink";
+                return false;
+            }
+
+            return true;
+        }
 
         internal static string ComputeSha256(string content)
         {

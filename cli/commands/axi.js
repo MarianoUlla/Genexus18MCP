@@ -18,6 +18,7 @@ const {
     readGeneXusVersionFromInstall,
     discoverGeneXusInstallation,
     discoverKnowledgeBase,
+    discoverKnowledgeBases,
     readKbCatalog,
     addKbToConfig,
     removeKbFromConfig,
@@ -419,6 +420,234 @@ function buildClientExeCrossCheck(packageExePath) {
     };
 }
 
+// v2.6.6 — probe Stream B's per-KB worker lock. The worker writes
+// `.worker-<hash>.lock` into TempPath (or the configured lockDir); the file
+// holds the live PID. We list every matching file, classify it as live /
+// stale, and surface stale ones so the user can clean them up.
+function buildWorkerSingleInstanceLockCheck() {
+    const tempDir = require('os').tmpdir();
+    let entries;
+    try {
+        entries = fs.readdirSync(tempDir).filter((n) => /^\.worker-[0-9a-f]{16}\.lock$/i.test(n));
+    } catch (err) {
+        return { status: 'warn', detail: `Unable to scan ${tempDir} for worker lock files: ${err.message || err}` };
+    }
+
+    if (!entries || entries.length === 0) {
+        return { status: 'pass', detail: 'No worker single-instance lock files found (no worker currently registered).' };
+    }
+
+    const live = [];
+    const stale = [];
+    for (const name of entries) {
+        const full = path.join(tempDir, name);
+        let pid = null;
+        try {
+            const txt = fs.readFileSync(full, 'utf8').trim();
+            const parsed = Number.parseInt(txt, 10);
+            if (Number.isFinite(parsed) && parsed > 0) pid = parsed;
+        } catch {
+            // Lock file holds a delete-on-close handle on the owning worker —
+            // if reading fails with EBUSY/EACCES it's almost certainly live.
+            live.push({ name, pid: null, note: 'file is locked (owner alive)' });
+            continue;
+        }
+
+        if (pid === null) {
+            stale.push({ name, pid: null, note: 'pid file unreadable / empty' });
+            continue;
+        }
+
+        let alive = false;
+        try {
+            process.kill(pid, 0);
+            alive = true;
+        } catch (err) {
+            alive = err.code === 'EPERM'; // EPERM => process exists but we can't signal it
+        }
+
+        if (alive) live.push({ name, pid, note: null });
+        else stale.push({ name, pid, note: 'pid not running' });
+    }
+
+    if (stale.length === 0) {
+        const desc = live.map((l) => l.pid ? `pid=${l.pid}` : (l.note || 'locked')).join(', ');
+        return {
+            status: 'pass',
+            detail: `Worker single-instance lock healthy (${live.length} live owner${live.length === 1 ? '' : 's'}: ${desc}).`
+        };
+    }
+
+    const livePart = live.length ? `live: ${live.map((l) => l.pid || '?').join(', ')}` : 'no live owners';
+    const stalePart = `stale: ${stale.map((s) => path.join(tempDir, s.name)).join('; ')}`;
+    return {
+        status: 'warn',
+        detail: `Worker lock files include ${stale.length} stale entr${stale.length === 1 ? 'y' : 'ies'} (${livePart}; ${stalePart}). Delete the stale .lock file(s) to clear; Stream B's lock will recreate on next worker start.`
+    };
+}
+
+// v2.6.6 — probe Stream D's in-process build path. Confirms
+// `Genexus.MsBuild.Tasks.dll` is reachable under GX_PROGRAM_DIR / configured
+// GeneXus install. If missing, the worker falls back to spawning MSBuild.exe
+// (the slow path) — that still works but loses the IDE-parity build daemon.
+function buildInProcessBuildAssemblyLoadCheck(gxPath) {
+    const dllName = 'Genexus.MsBuild.Tasks.dll';
+    const candidates = [];
+    if (process.env.GX_PROGRAM_DIR) candidates.push(path.join(process.env.GX_PROGRAM_DIR, dllName));
+    if (gxPath) candidates.push(path.join(gxPath, dllName));
+
+    if (candidates.length === 0) {
+        return {
+            status: 'warn',
+            detail: `In-process build assembly check skipped: GX_PROGRAM_DIR not set and no configured GeneXus path. Build will fall back to MSBuild.exe spawn (the slow path).`
+        };
+    }
+
+    for (const candidate of candidates) {
+        try {
+            const stat = fs.statSync(candidate);
+            if (stat && stat.isFile() && stat.size > 0) {
+                return {
+                    status: 'pass',
+                    detail: `In-process build assembly is loadable from ${candidate} (${Math.round(stat.size / 1024)} KB). Stream D's build daemon is ready.`
+                };
+            }
+        } catch {
+            // try next candidate
+        }
+    }
+
+    return {
+        status: 'warn',
+        detail: `In-process build assembly ${dllName} not found at: ${candidates.join('; ')}. The worker will fall back to spawning MSBuild.exe (the slow path) — set GXMCP_INPROCESS_BUILD=0 to silence, or install/repair GeneXus.`
+    };
+}
+
+function redactConfig(cfg) {
+    // Replace absolute paths with `<redacted:hash8>` so the structure is preserved
+    // but filesystem layout, usernames, and KB names are not leaked. Hash is stable
+    // across the dump so the support engineer can still correlate "this redacted KB
+    // is the same as that one in worker logs."
+    if (!cfg || typeof cfg !== 'object') return cfg;
+    const crypto = require('crypto');
+    const hash = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 8);
+    const looksLikePath = (s) => typeof s === 'string' && /[\\/]/.test(s) && (s.length > 3);
+    const walk = (node) => {
+        if (Array.isArray(node)) return node.map(walk);
+        if (node && typeof node === 'object') {
+            const out = {};
+            for (const k of Object.keys(node)) out[k] = walk(node[k]);
+            return out;
+        }
+        if (looksLikePath(node)) return `<redacted:${hash(node)}>`;
+        return node;
+    };
+    return walk(cfg);
+}
+
+async function buildSupportDump({ checks, summary, data, gatewayExePath, ctx }) {
+    const os = require('os');
+    const crypto = require('crypto');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const tmpBase = path.join(os.tmpdir(), `genexus-mcp-dump-${stamp}`);
+    fs.mkdirSync(tmpBase, { recursive: true });
+
+    const entries = [];
+
+    const writeEntry = (relPath, content) => {
+        const full = path.join(tmpBase, relPath);
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, typeof content === 'string' ? content : JSON.stringify(content, null, 2));
+        entries.push(relPath);
+    };
+
+    writeEntry('doctor.json', { summary, checks, generatedAt: new Date().toISOString() });
+
+    if (data.configPath && fs.existsSync(data.configPath)) {
+        const cfg = readJsonFileSafe(data.configPath);
+        writeEntry('config.redacted.json', redactConfig(cfg));
+    }
+
+    let gxVersion = null;
+    try { gxVersion = readGeneXusVersionFromInstall(data.gxPath); } catch { }
+
+    writeEntry('environment.json', {
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        osRelease: os.release(),
+        cwdHash: crypto.createHash('sha256').update(ctx.cwd || '').digest('hex').slice(0, 8),
+        gatewayExePath,
+        gatewayExeExists: fs.existsSync(gatewayExePath),
+        configSource: data.configSource,
+        kbConfigured: !!data.kbPath,
+        gxConfigured: !!data.gxPath,
+        gxVersion,
+        envFlags: {
+            GX_CONFIG_PATH: !!process.env.GX_CONFIG_PATH,
+            GENEXUS_MCP_GATEWAY_EXE: !!process.env.GENEXUS_MCP_GATEWAY_EXE,
+            GXMCP_INPROCESS_BUILD: process.env.GXMCP_INPROCESS_BUILD || null,
+            HTTPS_PROXY: !!process.env.HTTPS_PROXY,
+            HTTP_PROXY: !!process.env.HTTP_PROXY
+        }
+    });
+
+    // Worker logs: scan the standard log dir (LocalAppData) for recent worker logs,
+    // grab the tail of each. Keep it bounded so the zip stays small.
+    const logRoots = [];
+    if (process.env.LOCALAPPDATA) logRoots.push(path.join(process.env.LOCALAPPDATA, 'GenexusMCP', 'logs'));
+    logRoots.push(path.join(os.tmpdir(), 'GenexusMCP', 'logs'));
+
+    let logCount = 0;
+    for (const root of logRoots) {
+        if (logCount >= 5) break;
+        try {
+            if (!fs.existsSync(root)) continue;
+            const files = fs.readdirSync(root)
+                .filter((f) => /\.log$/i.test(f))
+                .map((f) => ({ f, full: path.join(root, f), mtime: fs.statSync(path.join(root, f)).mtimeMs }))
+                .sort((a, b) => b.mtime - a.mtime)
+                .slice(0, 5 - logCount);
+            for (const entry of files) {
+                try {
+                    const stat = fs.statSync(entry.full);
+                    const tailBytes = 64 * 1024;
+                    const start = Math.max(0, stat.size - tailBytes);
+                    const fd = fs.openSync(entry.full, 'r');
+                    try {
+                        const buf = Buffer.alloc(stat.size - start);
+                        fs.readSync(fd, buf, 0, buf.length, start);
+                        writeEntry(`logs/${entry.f}.tail.txt`, buf.toString('utf8'));
+                    } finally {
+                        fs.closeSync(fd);
+                    }
+                    logCount += 1;
+                } catch { }
+            }
+        } catch { }
+    }
+
+    // Zip via PowerShell's built-in Compress-Archive on Windows; tar elsewhere.
+    const { execFileSync } = require('child_process');
+    let zipPath;
+    if (process.platform === 'win32') {
+        zipPath = `${tmpBase}.zip`;
+        execFileSync('powershell.exe', ['-NoProfile', '-Command', `Compress-Archive -Path '${tmpBase}\\*' -DestinationPath '${zipPath}' -Force`], { windowsHide: true });
+    } else {
+        zipPath = `${tmpBase}.tar.gz`;
+        execFileSync('tar', ['-czf', zipPath, '-C', path.dirname(tmpBase), path.basename(tmpBase)]);
+    }
+
+    // Clean up the staging dir; the zip is the artifact.
+    try { fs.rmSync(tmpBase, { recursive: true, force: true }); } catch { }
+
+    return {
+        zipPath,
+        sizeBytes: fs.statSync(zipPath).size,
+        entries
+    };
+}
+
 async function handleDoctor(options, ctx) {
     const data = buildStatusData(ctx.cwd);
     const toolDefPath = getToolDefinitionsPath();
@@ -453,13 +682,24 @@ async function handleDoctor(options, ctx) {
                 ? `Gateway exe is under %${riskyZone}%, which is commonly blocked by AppLocker/SRP in Windows domains. If clients show "Failed to connect" / "Access denied", reinstall to a whitelisted path via scripts/install.ps1 (defaults to C:\\Tools\\GenexusMCP or %LOCALAPPDATA%\\Programs\\GenexusMCP).`
                 : 'Gateway exe is in a path unlikely to be blocked by AppLocker/SRP.'
         },
-        { id: 'kb_path_exists', status: kbExists ? 'pass' : 'warn', detail: kbExists ? 'Configured KB path exists.' : 'Configured KB path does not exist.' },
+        // A KB path configured but absent on disk is fatal — the worker can't open a KB
+        // that doesn't exist. Only when no KB is configured at all do we soften to warn.
+        { id: 'kb_path_exists', status: kbExists ? 'pass' : (kbPath ? 'fail' : 'warn'), detail: kbExists ? 'Configured KB path exists.' : (kbPath ? `Configured KB path does not exist: ${kbPath}` : 'No KB path is configured.') },
         { id: 'kb_shape', status: data.kbLooksValid ? 'pass' : 'warn', detail: data.kbLooksValid ? 'KB folder shape looks valid.' : 'KB markers were not found in configured KB path.' },
-        { id: 'gx_installation', status: gxExeExists ? 'pass' : 'warn', detail: gxExeExists ? 'GeneXus installation has genexus.exe.' : 'Configured GeneXus installation is missing genexus.exe.' },
+        // Same logic for the GeneXus install: missing genexus.exe at a configured path
+        // guarantees a worker crash on first MCP call. Promote from warn to fail so init
+        // exits non-zero and the caller (install.ps1, AI client) actually sees the problem.
+        { id: 'gx_installation', status: gxExeExists ? 'pass' : (gxPath ? 'fail' : 'warn'), detail: gxExeExists ? 'GeneXus installation has genexus.exe.' : (gxPath ? `Configured GeneXus installation is missing genexus.exe at: ${gxPath}` : 'No GeneXus installation path is configured.') },
         { id: 'tool_definitions', status: toolDefsExists ? 'pass' : 'warn', detail: toolDefsExists ? `Tool definition file found (${toolCount} tools).` : 'tool_definitions.json is missing.' },
         { id: 'gx_env', status: process.env.GX_CONFIG_PATH ? 'pass' : 'warn', detail: process.env.GX_CONFIG_PATH ? 'GX_CONFIG_PATH env var is set.' : 'GX_CONFIG_PATH env var is not set for this process.' },
         { id: 'client_config_sync', status: clientCrossCheck.status, detail: clientCrossCheck.detail }
     ];
+
+    // v2.6.6 — Stream B / Stream D doctor checks.
+    const lockCheck = buildWorkerSingleInstanceLockCheck();
+    checks.push({ id: 'worker_single_instance_lock', status: lockCheck.status, detail: lockCheck.detail });
+    const inProcessLoad = buildInProcessBuildAssemblyLoadCheck(gxPath);
+    checks.push({ id: 'in_process_build_assembly_load', status: inProcessLoad.status, detail: inProcessLoad.detail });
 
     if (data.gatewayExeFound) {
         const probe = await probeGatewaySpawn();
@@ -477,6 +717,34 @@ async function handleDoctor(options, ctx) {
         acc[row.status] = (acc[row.status] || 0) + 1;
         return acc;
     }, { pass: 0, warn: 0, fail: 0 });
+
+    // Support bundle for handing off to support: doctor output + config (with paths
+    // anonymized by hash so we don't leak filesystem layout) + recent worker logs +
+    // version info, all zipped under TempPath. Far simpler than asking the operator
+    // to send 5 separate things over chat.
+    if (options.dump) {
+        try {
+            const dumpResult = await buildSupportDump({ checks, summary, data, gatewayExePath, ctx });
+            return {
+                exitCode: ctx.EXIT_CODES.OK,
+                envelope: {
+                    ok: {
+                        action: 'doctor.dump',
+                        zipPath: dumpResult.zipPath,
+                        sizeBytes: dumpResult.sizeBytes,
+                        entries: dumpResult.entries,
+                        summary
+                    },
+                    help: ['Attach the zip to your support ticket. Paths inside config.json have been redacted; sensitive values may still appear in worker logs — review before sharing if needed.']
+                }
+            };
+        } catch (err) {
+            return {
+                exitCode: ctx.EXIT_CODES.ERROR,
+                envelope: operationalErrorEnvelope(`Failed to build doctor dump: ${err && err.message ? err.message : 'unknown error'}`, ctx.EXIT_CODES.ERROR)
+            };
+        }
+    }
 
     const defaultFields = ['id', 'status', 'detail'];
     const allowedFields = ['id', 'status', 'detail'];
@@ -890,6 +1158,34 @@ async function runInteractiveInit(ctx) {
         const gxAnswer = await question(`\n2) GeneXus installation path (default: ${defaultGx}):\n> `);
         const finalGx = String(gxAnswer || '').trim() || defaultGx;
 
+        if (!fs.existsSync(path.join(finalGx, 'genexus.exe'))) {
+            const suggested = discoverGeneXusInstallation();
+            const help = [`Path checked: ${finalGx}`];
+            if (suggested && suggested.toLowerCase() !== finalGx.toLowerCase()) {
+                help.push(`Detected a working GeneXus install at: ${suggested}`);
+                help.push('Re-run `genexus-mcp init --interactive` and accept the detected path, or pass --gx explicitly.');
+            }
+            return {
+                exitCode: ctx.EXIT_CODES.ERROR,
+                envelope: operationalErrorEnvelope(
+                    `GeneXus path does not contain genexus.exe. Aborted before writing config to avoid silent worker crashes.`,
+                    ctx.EXIT_CODES.ERROR,
+                    help
+                )
+            };
+        }
+
+        if (!fs.existsSync(finalKb)) {
+            return {
+                exitCode: ctx.EXIT_CODES.ERROR,
+                envelope: operationalErrorEnvelope(
+                    `KB path does not exist on disk. Aborted before writing config.`,
+                    ctx.EXIT_CODES.ERROR,
+                    [`Path checked: ${finalKb}`, 'Create the KB in GeneXus first, then re-run init.']
+                )
+            };
+        }
+
         const allTargets = getClientConfigTargets();
         const platformTargets = filterClientTargets(allTargets, { platform: process.platform });
         ctx.stderr.write('\n3) Select AI agents to register (y/N per agent; Enter accepts default):\n');
@@ -971,6 +1267,18 @@ async function handleInit(options, ctx) {
         }
     }
 
+    // Broaden the search: walk-up from cwd and scan common KB roots. If exactly one
+    // candidate exists, use it; if many, surface them so the operator can pass --kb
+    // explicitly instead of seeing the bare "missing --kb" error.
+    let kbCandidates = null;
+    if (!resolution.kb.value) {
+        kbCandidates = discoverKnowledgeBases(ctx.cwd);
+        if (kbCandidates.length === 1) {
+            resolution.kb.value = kbCandidates[0].path;
+            resolution.kb.source = `auto-discovery:${kbCandidates[0].source}`;
+        }
+    }
+
     if (!resolution.gx.value) {
         const fromDisco = discoverGeneXusInstallation();
         if (fromDisco) {
@@ -981,13 +1289,69 @@ async function handleInit(options, ctx) {
 
     if (!resolution.kb.value || !resolution.gx.value) {
         const missing = [];
-        if (!resolution.kb.value) missing.push('--kb (and current directory is not a GeneXus KB)');
+        const help = [];
+        if (!resolution.kb.value) {
+            missing.push('--kb (and current directory is not a GeneXus KB)');
+            if (kbCandidates && kbCandidates.length > 1) {
+                help.push(`Found ${kbCandidates.length} candidate KB folder${kbCandidates.length === 1 ? '' : 's'}. Pick one and pass it as --kb:`);
+                for (const c of kbCandidates.slice(0, 10)) {
+                    help.push(`  --kb "${c.path}"   (${c.source})`);
+                }
+                if (kbCandidates.length > 10) {
+                    help.push(`  ... and ${kbCandidates.length - 10} more.`);
+                }
+            }
+        }
         if (!resolution.gx.value) missing.push('--gx (and no GeneXus installation was auto-discovered)');
         return {
             exitCode: ctx.EXIT_CODES.USAGE,
-            envelope: usageEnvelope(
-                `Cannot resolve required paths: ${missing.join('; ')}. Pass flags explicitly or run from inside a KB folder.`,
-                ctx.EXIT_CODES.USAGE
+            envelope: {
+                error: { code: 'usage_error', message: `Cannot resolve required paths: ${missing.join('; ')}. Pass flags explicitly or run from inside a KB folder.` },
+                help: help.length ? help : [
+                    'Run `genexus-mcp help` for command reference.',
+                    'Run `genexus-mcp init --kb "<kbPath>" --gx "<geneXusPath>"` for non-interactive setup.'
+                ],
+                meta: { exitCode: ctx.EXIT_CODES.USAGE }
+            }
+        };
+    }
+
+    // Validate the supplied GeneXus path before we commit it to disk. A non-default
+    // install (e.g. C:\...\GeneXus18u7 vs the GeneXus18 default) used to slip through
+    // — init wrote the config, then the worker crashed on first MCP call with no
+    // useful signal back to the operator.
+    if (!fs.existsSync(path.join(resolution.gx.value, 'genexus.exe'))) {
+        const help = [
+            `Path checked: ${resolution.gx.value}`,
+            `Source: --${resolution.gx.source === 'flag' ? 'gx flag' : resolution.gx.source}`
+        ];
+        const suggested = resolution.gx.source === 'flag' ? discoverGeneXusInstallation() : null;
+        if (suggested && suggested.toLowerCase() !== resolution.gx.value.toLowerCase()) {
+            help.push(`Detected a working GeneXus install at: ${suggested}`);
+            help.push(`Re-run: genexus-mcp init --kb "${resolution.kb.value}" --gx "${suggested}"`);
+        } else {
+            help.push('Omit --gx to let init auto-discover via registry / Program Files (matches GeneXus18, GeneXus18u7, etc.).');
+        }
+        return {
+            exitCode: ctx.EXIT_CODES.ERROR,
+            envelope: operationalErrorEnvelope(
+                `Configured GeneXus path does not contain genexus.exe. Init aborted before writing config to avoid silent worker crashes.`,
+                ctx.EXIT_CODES.ERROR,
+                help
+            )
+        };
+    }
+
+    if (!fs.existsSync(resolution.kb.value)) {
+        return {
+            exitCode: ctx.EXIT_CODES.ERROR,
+            envelope: operationalErrorEnvelope(
+                `Configured KB path does not exist on disk. Init aborted.`,
+                ctx.EXIT_CODES.ERROR,
+                [
+                    `Path checked: ${resolution.kb.value}`,
+                    'Create the KB in GeneXus first, then re-run init pointing at its folder.'
+                ]
             )
         };
     }
@@ -1014,7 +1378,8 @@ async function handleInit(options, ctx) {
         }
 
         const verification = await runPostInitVerification({
-            cwd: ctx.cwd,
+            cwd: resolution.kb.value,
+            configPath: created.targetConfigPath,
             includeSmoke: !options.noSmoke,
             ctx
         });
@@ -1031,15 +1396,27 @@ async function handleInit(options, ctx) {
         if (patchResult.patched.length > 0 && process.platform === 'win32' && !process.env.GENEXUS_MCP_GATEWAY_EXE) {
             help.push('Windows + corporate AppLocker: the npx launcher resolves the gateway from %LOCALAPPDATA%\\npm-cache, which is commonly blocked. If clients fail with "Failed to connect" / Access denied, reinstall to a whitelisted path via scripts/install.ps1.');
         }
-        if (verification.summary.fail > 0 || verification.summary.warn > 0) {
-            help.push('Some verification checks did not pass. Run `genexus-mcp doctor --mcp-smoke` for details.');
+        if (verification.summary.fail > 0) {
+            const failedIds = verification.checks
+                .filter((c) => c.status === 'fail')
+                .map((c) => c.id)
+                .join(', ');
+            help.push(`Verification failed (${verification.summary.fail} check${verification.summary.fail === 1 ? '' : 's'}: ${failedIds}). The config was written but the MCP will not work until these are fixed.`);
+            help.push('Run `genexus-mcp doctor --mcp-smoke` for full details.');
+        } else if (verification.summary.warn > 0) {
+            help.push('Some verification checks emitted warnings. Run `genexus-mcp doctor --mcp-smoke` for details.');
         }
         if (options.noSmoke) {
             help.push('MCP protocol smoke was skipped (--no-smoke). Re-run `genexus-mcp doctor --mcp-smoke` to validate end-to-end.');
         }
 
+        // A non-zero exit when any critical check failed gives the caller (install.ps1,
+        // CI, AI client) something to react to. Previously init always returned OK and
+        // the failure surfaced later as a generic worker crash.
+        const initExitCode = verification.summary.fail > 0 ? ctx.EXIT_CODES.ERROR : ctx.EXIT_CODES.OK;
+
         return {
-            exitCode: ctx.EXIT_CODES.OK,
+            exitCode: initExitCode,
             envelope: {
                 ok: {
                     action: 'init',
@@ -1103,14 +1480,95 @@ async function warmGateway({ configPath }) {
     });
 }
 
-async function runPostInitVerification({ cwd, includeSmoke, ctx }) {
-    const doctorResult = await handleDoctor(
-        { full: false, mcpSmoke: !!includeSmoke, fields: null, limit: 100 },
-        { cwd, EXIT_CODES: ctx.EXIT_CODES }
-    );
+async function runPostInitVerification({ cwd, configPath, includeSmoke, ctx }) {
+    // Doctor inspects buildStatusData(cwd), which only finds config.json if it sits
+    // at cwd or if GX_CONFIG_PATH is exported. Init runs from wherever the operator
+    // typed `npx genexus-mcp init` (often C:\windows\system32) — so we point doctor
+    // at the freshly-written config explicitly.
+    const priorEnv = process.env.GX_CONFIG_PATH;
+    if (configPath) process.env.GX_CONFIG_PATH = configPath;
+    try {
+        const doctorResult = await handleDoctor(
+            { full: false, mcpSmoke: !!includeSmoke, fields: null, limit: 100 },
+            { cwd, EXIT_CODES: ctx.EXIT_CODES }
+        );
 
-    const { checks, summary } = doctorResult.envelope.ok;
-    return { checks, summary };
+        const { checks, summary } = doctorResult.envelope.ok;
+
+        let workerSmoke = null;
+        if (includeSmoke && configPath) {
+            workerSmoke = await probeWorkerStartup({ configPath });
+            checks.push({ id: 'worker_startup_smoke', status: workerSmoke.status, detail: workerSmoke.detail });
+            summary[workerSmoke.status] = (summary[workerSmoke.status] || 0) + 1;
+        }
+
+        return { checks, summary };
+    } finally {
+        if (priorEnv === undefined) delete process.env.GX_CONFIG_PATH;
+        else process.env.GX_CONFIG_PATH = priorEnv;
+    }
+}
+
+// Spawn the gateway with the resolved config and watch for an early crash.
+// If the worker can't load the KB (bad GX path, missing genexus.exe, KB lock,
+// AppLocker block, etc.), the process exits fast with a non-zero code. Without
+// this probe init prints "ok" and the failure only surfaces later on the first
+// MCP call, with a generic "Worker crashed/exited" — exactly what bit the user
+// who had GeneXus18u7 instead of GeneXus18.
+async function probeWorkerStartup({ configPath, observeMs = 2500 }) {
+    const gatewayExePath = getGatewayExePath();
+    if (!fs.existsSync(gatewayExePath)) {
+        return { status: 'warn', detail: 'Worker smoke skipped: gateway exe not found.' };
+    }
+
+    return await new Promise((resolve) => {
+        let stderr = '';
+        let stdout = '';
+        let resolved = false;
+        const finish = (payload) => {
+            if (resolved) return;
+            resolved = true;
+            resolve(payload);
+        };
+
+        let child;
+        try {
+            child = spawn(gatewayExePath, [], {
+                stdio: ['ignore', 'pipe', 'pipe'],
+                windowsHide: true,
+                env: { ...process.env, GX_CONFIG_PATH: configPath }
+            });
+        } catch (err) {
+            return finish({ status: 'fail', detail: `Worker smoke: failed to launch gateway: ${err.message}` });
+        }
+
+        child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+        child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+        child.once('error', (err) => {
+            finish({ status: 'fail', detail: `Worker smoke: gateway spawn error: ${err.message}` });
+        });
+
+        child.once('exit', (code) => {
+            if (code === 0) {
+                finish({ status: 'pass', detail: 'Worker smoke: gateway exited cleanly during observation window.' });
+            } else {
+                const preview = sanitizeOperationalMessage((stderr || stdout || '').trim(), '');
+                finish({
+                    status: 'fail',
+                    detail: preview
+                        ? `Worker smoke: gateway crashed (exit ${code}): ${preview}`
+                        : `Worker smoke: gateway crashed (exit ${code}) with no stderr. Run \`genexus-mcp doctor --mcp-smoke\` for details.`
+                });
+            }
+        });
+
+        setTimeout(() => {
+            try { child.kill(); } catch { }
+            // Still alive after observeMs → worker bootstrapped without crashing.
+            finish({ status: 'pass', detail: `Worker smoke: gateway stayed alive for ${observeMs}ms with KB and GX configured.` });
+        }, observeMs);
+    });
 }
 
 async function handleWhoami(options, ctx) {
@@ -1403,8 +1861,8 @@ function commandHelpMap() {
             examples: ['genexus-mcp status', 'genexus-mcp status --full --format json']
         },
         doctor: {
-            usage: 'genexus-mcp doctor [--full] [--mcp-smoke] [--fields f1,f2] [--limit N] [--format toon|json|text]',
-            examples: ['genexus-mcp doctor', 'genexus-mcp doctor --full --mcp-smoke --format json']
+            usage: 'genexus-mcp doctor [--full] [--mcp-smoke] [--dump] [--fields f1,f2] [--limit N] [--format toon|json|text]',
+            examples: ['genexus-mcp doctor', 'genexus-mcp doctor --full --mcp-smoke --format json', 'genexus-mcp doctor --dump   # build a support bundle zip']
         },
         tools: {
             usage: 'genexus-mcp tools list [--query text] [--fields f1,f2] [--limit N] [--full] [--format ...]',

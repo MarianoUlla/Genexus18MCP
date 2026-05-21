@@ -19,19 +19,37 @@ namespace GxMcp.Worker.Services
             _writeService = writeService;
         }
 
-        public string Execute(string target, string action, int versionId = 0)
+        /// <summary>
+        /// History dispatch. <paramref name="partName"/> + <paramref name="snapshotToken"/>
+        /// drive the edit-snapshot <c>restore</c> action: <c>snapshot=latest</c> or
+        /// a timestamp substring resolves to <c>&lt;kbPath&gt;/.gx/snapshots/&lt;guid&gt;-&lt;part&gt;-*.bak</c>
+        /// and the prior bytes are routed back through <see cref="WriteService.WriteObject(string, string, string, string, bool, bool, bool, bool)"/>.
+        /// When <paramref name="discard"/> is <c>true</c> and no snapshot token is
+        /// supplied, the most recent EditSnapshotStore entry is restored — IDE
+        /// <i>History | Restore</i> / <i>Discard changes</i> parity. Missing
+        /// snapshots return a <c>NoSnapshot</c> envelope rather than an error.
+        /// </summary>
+        public string Execute(string target, string action, int versionId = 0,
+                              string partName = null, string snapshotToken = null,
+                              bool discard = false)
         {
             try
             {
                 switch (action?.ToLower())
                 {
                     case "list":
+                        if (!string.IsNullOrWhiteSpace(snapshotToken) || !string.IsNullOrWhiteSpace(partName))
+                            return ListEditSnapshots(target, partName);
                         return ListRevisions(target);
                     case "get_source":
                         return GetVersionSource(target, versionId);
                     case "save":
                         return SaveSnapshot(target);
                     case "restore":
+                        if (!string.IsNullOrWhiteSpace(snapshotToken))
+                            return RestoreEditSnapshot(target, partName, snapshotToken);
+                        if (discard)
+                            return DiscardLatestEditSnapshot(target, partName);
                         return RestoreSnapshot(target);
                     default:
                         return Models.McpResponse.Error("Unknown history action", target, action, "Supported actions are list, get_source, save and restore.");
@@ -40,6 +58,157 @@ namespace GxMcp.Worker.Services
             catch (Exception ex)
             {
                 return "{\"error\": \"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
+            }
+        }
+
+        private string ListEditSnapshots(string target, string partName)
+        {
+            var obj = _objectService.FindObject(target);
+            if (obj == null) return Models.McpResponse.Error("Object not found", target);
+            string guid;
+            try { guid = obj.Guid.ToString(); }
+            catch (Exception ex) { return Models.McpResponse.Error("Snapshot list failed", target, partName, ex.Message); }
+
+            string kbPath = null;
+            try { kbPath = _objectService.GetKbService().GetKbPath(); } catch { }
+            string root = EditSnapshotStore.ResolveRoot(kbPath);
+            string part = string.IsNullOrWhiteSpace(partName) ? "Source" : partName;
+            var files = EditSnapshotStore.List(root, guid, part);
+            var arr = new JArray();
+            foreach (var f in files)
+            {
+                arr.Add(new JObject
+                {
+                    ["path"] = f,
+                    ["fileName"] = System.IO.Path.GetFileName(f)
+                });
+            }
+            return new JObject
+            {
+                ["status"] = "Success",
+                ["target"] = target,
+                ["part"] = part,
+                ["count"] = files.Count,
+                ["snapshots"] = arr
+            }.ToString();
+        }
+
+        /// <summary>
+        /// v2.6.6 Stream H (FR#28) — IDE "Discard changes" parity. Resolves
+        /// the most recent pre-edit snapshot for (target, part) and restores
+        /// it through WriteService (the same persistence boundary the IDE
+        /// uses). Returns the snapshot token used so the caller has an
+        /// audit trail. NoSnapshot is a soft outcome — the agent may ask
+        /// for discard before any edit was captured and that should not be
+        /// treated as an error.
+        /// </summary>
+        private string DiscardLatestEditSnapshot(string target, string partName)
+        {
+            var obj = _objectService.FindObject(target);
+            if (obj == null) return Models.McpResponse.Error("Object not found", target);
+            string guid;
+            try { guid = obj.Guid.ToString(); }
+            catch (Exception ex) { return Models.McpResponse.Error("Discard failed", target, partName, ex.Message); }
+
+            string kbPath = null;
+            try { kbPath = _objectService.GetKbService().GetKbPath(); } catch { }
+
+            return DiscardLatestEditSnapshotCore(
+                target, partName, guid, kbPath,
+                (t, p, content) => _writeService.WriteObject(t, p, content));
+        }
+
+        /// <summary>
+        /// v2.6.6 Stream H (FR#28) — pure helper, no SDK reads. Splits out the
+        /// snapshot lookup + restoration so it can be unit-tested without a live
+        /// KB. <paramref name="writer"/> is the persistence hook (WriteService
+        /// in production; a recording delegate in tests).
+        /// </summary>
+        internal static string DiscardLatestEditSnapshotCore(
+            string target,
+            string partName,
+            string objectGuid,
+            string kbPath,
+            Func<string, string, string, string> writer)
+        {
+            string root = EditSnapshotStore.ResolveRoot(kbPath);
+            string part = string.IsNullOrWhiteSpace(partName) ? "Source" : partName;
+            var files = EditSnapshotStore.List(root, objectGuid, part);
+            if (files.Count == 0)
+            {
+                return new JObject
+                {
+                    ["status"] = "NoSnapshot",
+                    ["target"] = target,
+                    ["part"] = part,
+                    ["hint"] = "Edit this object first to capture a baseline; discard restores the pre-edit state."
+                }.ToString();
+            }
+
+            string path = files[0]; // newest
+            string content = EditSnapshotStore.ReadSnapshot(path);
+            if (content == null)
+            {
+                return Models.McpResponse.Error("Snapshot read failed", target, part, "File exists but could not be decoded: " + path);
+            }
+
+            string snapshotToken;
+            try { snapshotToken = System.IO.Path.GetFileName(path); } catch { snapshotToken = path; }
+
+            string writeResult = writer(target, part, content) ?? "{}";
+            try
+            {
+                var json = JObject.Parse(writeResult);
+                json["discarded"] = true;
+                json["restoredFrom"] = path;
+                json["restoredSnapshot"] = snapshotToken;
+                return json.ToString();
+            }
+            catch
+            {
+                return writeResult;
+            }
+        }
+
+        private string RestoreEditSnapshot(string target, string partName, string snapshotToken)
+        {
+            var obj = _objectService.FindObject(target);
+            if (obj == null) return Models.McpResponse.Error("Object not found", target);
+            string guid;
+            try { guid = obj.Guid.ToString(); }
+            catch (Exception ex) { return Models.McpResponse.Error("Snapshot restore failed", target, partName, ex.Message); }
+
+            string kbPath = null;
+            try { kbPath = _objectService.GetKbService().GetKbPath(); } catch { }
+            string root = EditSnapshotStore.ResolveRoot(kbPath);
+            string part = string.IsNullOrWhiteSpace(partName) ? "Source" : partName;
+            string path = EditSnapshotStore.ResolveByTimestamp(root, guid, part, snapshotToken);
+            if (string.IsNullOrEmpty(path))
+            {
+                return Models.McpResponse.Error(
+                    "Snapshot not found",
+                    target,
+                    part,
+                    "No snapshot matched token '" + snapshotToken + "'. Use action=list with part=" + part + " to enumerate available snapshots.");
+            }
+
+            string content = EditSnapshotStore.ReadSnapshot(path);
+            if (content == null)
+            {
+                return Models.McpResponse.Error("Snapshot read failed", target, part, "File exists but could not be decoded: " + path);
+            }
+
+            string writeResult = _writeService.WriteObject(target, part, content);
+            try
+            {
+                var json = JObject.Parse(writeResult);
+                json["restoredFrom"] = path;
+                json["restoredSnapshot"] = System.IO.Path.GetFileName(path);
+                return json.ToString();
+            }
+            catch
+            {
+                return writeResult;
             }
         }
 

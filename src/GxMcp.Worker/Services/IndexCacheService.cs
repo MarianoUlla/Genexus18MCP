@@ -167,6 +167,75 @@ namespace GxMcp.Worker.Services
         public void SetBuildService(BuildService bs) { _buildService = bs; }
         public KbService KbService => _buildService?.KbService;
 
+        // Name-keyed projection of the index, rebuilt lazily when the underlying
+        // _index reference changes. Lookups are O(1); previously each call
+        // iterated up to 38k entries (review-finding: build with 100 error lines
+        // hammered the index ~3.8M times). _byNameIndex is invalidated by
+        // setting _byNameIndexFor = null whenever _index is replaced.
+        private Dictionary<string, SearchIndex.IndexEntry> _byNameIndex;
+        private SearchIndex _byNameIndexFor;
+        private readonly object _byNameLock = new object();
+
+        private Dictionary<string, SearchIndex.IndexEntry> GetByNameIndex()
+        {
+            var idx = GetIndex();
+            if (idx?.Objects == null) return null;
+            lock (_byNameLock)
+            {
+                if (!ReferenceEquals(idx, _byNameIndexFor) || _byNameIndex == null)
+                {
+                    var built = new Dictionary<string, SearchIndex.IndexEntry>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var v in idx.Objects.Values)
+                    {
+                        if (v == null || string.IsNullOrEmpty(v.Name)) continue;
+                        // Last-write-wins on name collision (rare; storage key
+                        // is Type:Name so two objects can share a bare Name).
+                        built[v.Name] = v;
+                    }
+                    _byNameIndex = built;
+                    _byNameIndexFor = idx;
+                }
+                return _byNameIndex;
+            }
+        }
+
+        // v2.6.6 Stream E (FR#7): index-aware verification used by the normalizer
+        // (BuildService.NormalizeMissingObjectName) and by the orphan-sweep /
+        // CS2001-demotion paths.
+        public bool IsObjectKnown(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            try
+            {
+                var byName = GetByNameIndex();
+                return byName != null && byName.ContainsKey(name);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("[IsObjectKnown] lookup failed for '" + name + "': " + ex.Message);
+                return false;
+            }
+        }
+
+        // v2.6.6 Stream E (FR#3/#9): companion to IsObjectKnown — returns the
+        // first index entry matching the case-insensitive Name, or null.
+        public SearchIndex.IndexEntry TryGetEntryByName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            try
+            {
+                var byName = GetByNameIndex();
+                if (byName == null) return null;
+                byName.TryGetValue(name, out var entry);
+                return entry;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("[TryGetEntryByName] lookup failed for '" + name + "': " + ex.Message);
+                return null;
+            }
+        }
+
          public bool IsIndexMissing
          {
              get

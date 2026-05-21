@@ -1,3 +1,4 @@
+using System;
 using Newtonsoft.Json.Linq;
 
 namespace GxMcp.Gateway.Routers
@@ -40,12 +41,16 @@ namespace GxMcp.Gateway.Routers
                     };
 
                 case "genexus_worker_reload":
+                    // FR#20 (v2.6.6 Stream B): mode=soft|hard, default soft. Forwarded
+                    // verbatim — the worker's CommandDispatcher negotiates default when null.
                     return new
                     {
                         module = "Object",
                         action = "WorkerReload",
                         target = "_self",
-                        sourceDir = args?["sourceDir"]?.ToString()
+                        sourceDir = args?["sourceDir"]?.ToString(),
+                        mode = args?["mode"]?.ToString(),
+                        drainTimeoutMs = args?["drainTimeoutMs"]?.ToObject<int?>()
                     };
 
                 case "genexus_logs":
@@ -173,9 +178,13 @@ namespace GxMcp.Gateway.Routers
                     return new
                     {
                         module = "History",
-                        action = args?["action"]?.ToString(),
-                        target = args?["name"]?.ToString(),
-                        versionId = args?["versionId"]?.ToObject<int?>()
+                        action = RouterArgs.Str(args, "action"),
+                        target = RouterArgs.Str(args, "name"),
+                        versionId = RouterArgs.Int(args, "versionId"),
+                        // v2.6.6 Stream H (FR#28) — IDE "Discard changes" parity.
+                        part = RouterArgs.Str(args, "part"),
+                        snapshot = RouterArgs.Str(args, "snapshot"),
+                        discard = RouterArgs.Bool(args, "discard")
                     };
 
                 case "genexus_structure":
@@ -197,7 +206,11 @@ namespace GxMcp.Gateway.Routers
                     return new
                     {
                         module = "Preview",
-                        action = "Render",
+                        // v2.6.6 Stream H (FR#25) — action=run picks the KB launcher
+                        // object when name is omitted; default 'render' preserves prior behaviour.
+                        action = string.Equals(args?["action"]?.ToString(), "run", StringComparison.OrdinalIgnoreCase)
+                            ? "Run"
+                            : "Render",
                         target = args?["name"]?.ToString(),
                         name = args?["name"]?.ToString(),
                         parms = args?["parms"],
@@ -206,7 +219,11 @@ namespace GxMcp.Gateway.Routers
                         waitMs = args?["waitMs"]?.ToObject<int?>() ?? 3000,
                         capture = args?["capture"],
                         diffBaseline = args?["diffBaseline"]?.ToObject<bool?>() ?? false,
-                        updateBaseline = args?["updateBaseline"]?.ToObject<bool?>() ?? false
+                        updateBaseline = args?["updateBaseline"]?.ToObject<bool?>() ?? false,
+                        // Stream G (v2.6.6): GX-aware fill / click and GAM auth.
+                        fill = args?["fill"],
+                        click = args?["click"]?.ToString(),
+                        auth = args?["auth"]
                     };
 
                 default:

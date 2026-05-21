@@ -369,6 +369,31 @@ namespace GxMcp.Worker.Services
                     return AttachTimings(dryRunResult, readMs, patchMs, 0, sourceFromCache);
                 }
 
+                // v2.6.6 FR#10 — invariant: never persist a payload that looks like
+                // a NoMatch fall-through. Belt-and-braces against the v2.6.5 Events-part
+                // friction where an empty/near-empty result reached the SDK save path
+                // and the on-disk source was lost with sha256 = e3b0c44... (empty).
+                bool anyOpApplied = string.Equals(status, "Applied", StringComparison.OrdinalIgnoreCase)
+                                    || matchCount > 0;
+                if (!WriteService.IsPatchWriteSafe(workSource, updatedSource, anyOpApplied, out string safetyReason))
+                {
+                    Logger.Error($"[PATCH] Refusing unsafe write for {target}/{partName}: reason={safetyReason} origLen={workSource?.Length ?? 0} newLen={updatedSource?.Length ?? 0}");
+                    var safety = BuildPatchResult("NoMatch", partName, normalizedOperation, expectedCount, matchCount,
+                        "Refused to persist suspected NoMatch payload (" + safetyReason + "). No write was attempted; on-disk source unchanged.");
+                    try
+                    {
+                        var safetyJson = JObject.Parse(safety);
+                        safetyJson["code"] = "patch_no_match";
+                        safetyJson["safetyReason"] = safetyReason;
+                        safety = safetyJson.ToString();
+                    }
+                    catch (Exception jsonEx)
+                    {
+                        Logger.Debug("[PATCH] safety envelope augmentation failed: " + jsonEx.Message);
+                    }
+                    return AttachTimings(safety, readMs, patchMs, 0, sourceFromCache);
+                }
+
                 // 3. Write Back (re-normalize to CRLF for GeneXus)
                 string finalCode = updatedSource.Replace("\n", Environment.NewLine);
                 var writeStopwatch = Stopwatch.StartNew();

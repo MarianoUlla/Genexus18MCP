@@ -183,7 +183,12 @@ namespace GxMcp.Gateway.Routers
                             dryRun = args?["dryRun"]?.ToObject<bool?>() ?? false,
                             verifyRollback = args?["verifyRollback"]?.ToObject<bool?>() ?? false,
                             return_post_state = returnPostState,
-                            verbose = verbose
+                            verbose = verbose,
+                            // v2.6.6 FR#13 follow-up: forward `validate` so the worker's
+                            // CommandDispatcher.patch.Apply branch can honor validate=only
+                            // (mapped to dryRun=true). Without this the gateway silently
+                            // stripped the flag and the schema lied to the LLM.
+                            validate = args?["validate"]?.ToString()
                         };
                     }
                     else

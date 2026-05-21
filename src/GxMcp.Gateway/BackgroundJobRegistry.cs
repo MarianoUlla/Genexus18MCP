@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace GxMcp.Gateway
@@ -116,6 +118,66 @@ namespace GxMcp.Gateway
         }
 
         public int Count => _jobs.Count;
+
+        // FR#20 (v2.6.6 Stream B): persist JobEntry list across worker soft-reloads.
+        // We intentionally snapshot only the value side — _seenBySession is a UI-state
+        // concern bound to a session lifetime, not a job, so it's recomputed lazily.
+        // Per-job CancellationTokenSources are NOT serialized (they reference live
+        // pollers that wouldn't survive a restart anyway).
+        public void SaveTo(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("path required", nameof(path));
+            try
+            {
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                var list = _jobs.Values.ToList();
+                string json = JsonConvert.SerializeObject(list, Formatting.Indented);
+                // Atomic-ish write: dump to .tmp then move so a crash mid-write never
+                // leaves a corrupted jobs.json that the next worker would refuse to parse.
+                string tmp = path + ".tmp";
+                File.WriteAllText(tmp, json, System.Text.Encoding.UTF8);
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(tmp, path);
+            }
+            catch (Exception ex)
+            {
+                // Caller (gateway shutdown path) logs; rethrow so soft-reload metrics see it.
+                throw new IOException("Failed to persist BackgroundJobRegistry to " + path + ": " + ex.Message, ex);
+            }
+        }
+
+        public int LoadFrom(string path, bool deleteAfterRead = true)
+        {
+            if (!File.Exists(path)) return 0;
+            int loaded = 0;
+            try
+            {
+                string json = File.ReadAllText(path, System.Text.Encoding.UTF8);
+                var list = JsonConvert.DeserializeObject<List<JobEntry>>(json) ?? new List<JobEntry>();
+                foreach (var j in list)
+                {
+                    if (string.IsNullOrWhiteSpace(j?.Id)) continue;
+                    _jobs[j.Id] = j;
+                    loaded++;
+                }
+                if (deleteAfterRead)
+                {
+                    try { File.Delete(path); }
+                    catch (Exception delEx)
+                    {
+                        // Non-fatal: leaving the file means a subsequent restart re-loads
+                        // (idempotent — same IDs overwrite the same entries).
+                        System.Diagnostics.Debug.WriteLine("[BackgroundJobRegistry] delete after load failed: " + delEx.Message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new IOException("Failed to rehydrate BackgroundJobRegistry from " + path + ": " + ex.Message, ex);
+            }
+            return loaded;
+        }
     }
 
     public sealed class JobEntry

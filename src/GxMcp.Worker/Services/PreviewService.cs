@@ -181,6 +181,13 @@ namespace GxMcp.Worker.Services
         private JObject _cachedConfig;
         private string _cachedCliPath;
 
+        // v2.6.6 Stream H (FR#25) — F5 launcher resolver. Defaults to KbService
+        // when running in-process; tests inject a deterministic resolver that
+        // doesn't need a live KB. Returns the object name or null.
+        private Func<string> _launcherResolver;
+
+        internal void SetLauncherResolverForTest(Func<string> resolver) => _launcherResolver = resolver;
+
         // Cold-start of chrome-devtools-axi's bridge (which spawns chrome-devtools-mcp
         // via npx by default) commonly takes 25-60 s on Windows. 30 s leaves no head
         // room; 90 s safely covers the warm-up plus a few snapshot/eval calls.
@@ -197,6 +204,61 @@ namespace GxMcp.Worker.Services
             _runner = runner ?? new DefaultCliRunner();
             _configPath = configPath ?? DefaultConfigPath();
             _baselineRootOverride = baselineRootOverride;
+            // Default resolver — best-effort lookup via KbService. Falls back to
+            // null when ObjectService isn't wired (unit tests), in which case
+            // the caller is expected to pass an explicit target.
+            _launcherResolver = () =>
+            {
+                try { return _objectService?.GetKbService()?.GetLauncherObjectName(); }
+                catch { return null; }
+            };
+        }
+
+        /// <summary>
+        /// v2.6.6 Stream H (FR#25) — F5-equivalent entry point.
+        ///
+        /// When <paramref name="name"/> is null/empty the launcher object
+        /// configured in the KB metadata is resolved (KbService probes
+        /// <c>DefaultStartupObject</c> / <c>MainObject</c> SDK properties
+        /// first, then falls back to the first IsMain-tagged WebPanel /
+        /// SDPanel / Procedure in the index). When no candidate exists
+        /// returns a <c>NoLauncher</c> envelope rather than guessing.
+        ///
+        /// Explicit <c>target</c> still works — passing a name skips
+        /// resolution and behaves identically to <see cref="PreviewAsync"/>.
+        /// </summary>
+        public Task<JObject> RunAsync(
+            string name,
+            JObject parms = null,
+            string launcher = "auto",
+            bool buildFirst = false,
+            int waitMs = 3000,
+            string[] capture = null,
+            bool diffBaseline = false,
+            bool updateBaseline = false,
+            JObject fill = null,
+            string click = null,
+            JObject auth = null)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                string resolved = null;
+                try { resolved = _launcherResolver?.Invoke(); } catch { }
+                if (string.IsNullOrWhiteSpace(resolved))
+                {
+                    var noLauncher = new JObject
+                    {
+                        ["status"] = "NoLauncher",
+                        ["hint"] = "Pass explicit target=<webpanel>. No KB launcher object is configured and no IsMain WebPanel/SDPanel was found in the index."
+                    };
+                    return Task.FromResult(noLauncher);
+                }
+                name = resolved;
+            }
+
+            var result = PreviewSync(name, parms, launcher, buildFirst, waitMs, capture, diffBaseline, updateBaseline, fill, click, auth);
+            result["resolvedLauncher"] = name;
+            return Task.FromResult(result);
         }
 
         private static string DefaultConfigPath()
@@ -304,9 +366,12 @@ namespace GxMcp.Worker.Services
             int waitMs = 3000,
             string[] capture = null,
             bool diffBaseline = false,
-            bool updateBaseline = false)
+            bool updateBaseline = false,
+            JObject fill = null,
+            string click = null,
+            JObject auth = null)
         {
-            return Task.FromResult(PreviewSync(name, parms, launcher, buildFirst, waitMs, capture, diffBaseline, updateBaseline));
+            return Task.FromResult(PreviewSync(name, parms, launcher, buildFirst, waitMs, capture, diffBaseline, updateBaseline, fill, click, auth));
         }
 
         internal JObject PreviewSync(
@@ -317,7 +382,10 @@ namespace GxMcp.Worker.Services
             int waitMs,
             string[] capture,
             bool diffBaseline,
-            bool updateBaseline)
+            bool updateBaseline,
+            JObject fill = null,
+            string click = null,
+            JObject auth = null)
         {
             var result = new JObject { ["name"] = name };
             try
@@ -413,10 +481,61 @@ namespace GxMcp.Worker.Services
                 // 6) Snapshot launcher to detect auth/form
                 var snap1 = _runner.Run(cli, "snapshot", DefaultCliTimeoutMs);
                 string snap1Text = snap1.StdOut ?? "";
+
+                // 6a) FR#17 — GAM session injection. When auth.mode == "gam" (or
+                //     env vars are set and the page looks like login), fill the
+                //     GAM login form and resubmit before bailing out.
+                bool authAttempted = false;
+                if (LooksLikeAuthScreen(snap1Text) || LooksLikeGamLoginUrl(launcherUrl))
+                {
+                    var ai = ResolveAuthInfo(auth);
+                    if (ai.Mode == "gam" && !string.IsNullOrEmpty(ai.User) && !string.IsNullOrEmpty(ai.Pass))
+                    {
+                        authAttempted = true;
+                        var driver = GxFormDriver.Parse(snap1Text);
+                        var loginVals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["UserName"] = ai.User,
+                            ["User"] = ai.User,
+                            ["Usuario"] = ai.User,
+                            ["UserPassword"] = ai.Pass,
+                            ["Password"] = ai.Pass,
+                            ["Senha"] = ai.Pass
+                        };
+                        // Restrict the fill to attrs actually present on the page so we
+                        // don't spam noise into the result.errors[].
+                        var present = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var kv in loginVals)
+                        {
+                            if (driver.ResolveSelector(kv.Key, out _) != null) present[kv.Key] = kv.Value;
+                        }
+                        string loginJs = driver.BuildFillScript(present, out _);
+                        if (!string.IsNullOrEmpty(loginJs))
+                            _runner.Run(cli, "eval " + Quote(loginJs), DefaultCliTimeoutMs);
+
+                        // Standard GAM submit button id is "GXSUBMIT" / class gxsubmit /
+                        // sometimes a regular form submit. Try a couple of selectors.
+                        const string submitJs =
+                            "(function(){var b=document.querySelector('input.gxsubmit,button.gxsubmit," +
+                            "input[id=GXSUBMIT],input[name=GXSUBMIT],input[type=submit],button[type=submit]');" +
+                            "if(b){b.click();return 'clicked';}" +
+                            "var f=document.forms[0];if(f){f.submit();return 'form.submit';}" +
+                            "return 'no-submit';})()";
+                        _runner.Run(cli, "eval " + Quote(submitJs), DefaultCliTimeoutMs);
+
+                        // Allow the redirect to settle, then re-snapshot.
+                        try { System.Threading.Thread.Sleep(1500); } catch { }
+                        var snapPost = _runner.Run(cli, "snapshot", DefaultCliTimeoutMs);
+                        snap1Text = snapPost.StdOut ?? "";
+                        result["auth"] = new JObject { ["mode"] = "gam", ["status"] = "injected" };
+                    }
+                }
+
                 if (LooksLikeAuthScreen(snap1Text))
                 {
                     result["status"] = "auth_required";
                     result["url"] = launcherUrl;
+                    if (authAttempted) result["message"] = "GAM injection attempted but login screen still detected.";
                     return result;
                 }
                 if (!LooksLikeLauncherForm(snap1Text, mergedParms))
@@ -442,6 +561,44 @@ namespace GxMcp.Worker.Services
                     "var links=document.querySelectorAll('a'); for(var i=0;i<links.length;i++){{var l=links[i]; if((l.textContent||'').trim().toLowerCase()==='{0}'.toLowerCase() || (l.getAttribute('href')||'').toLowerCase().indexOf('{0}.aspx'.toLowerCase())>=0){{l.click(); break;}}}}",
                     EscapeJs(name));
                 _runner.Run(cli, "eval " + Quote(clickJs), DefaultCliTimeoutMs);
+
+                // 8a) FR#16 — GX-aware fill / click. After navigating to the
+                //     target panel, snapshot once and drive the GX form through
+                //     GxFormDriver (logical attr names → selectors → fill JS).
+                if ((fill != null && fill.Count > 0) || !string.IsNullOrWhiteSpace(click))
+                {
+                    // Give the click above a brief moment to navigate before we
+                    // snapshot the resulting GX panel.
+                    try { System.Threading.Thread.Sleep(Math.Min(waitMs, 5000)); } catch { }
+                    var snapPanel = _runner.Run(cli, "snapshot", DefaultCliTimeoutMs);
+                    var driver = GxFormDriver.Parse(snapPanel.StdOut ?? "");
+                    var fillReport = new JObject();
+
+                    if (fill != null && fill.Count > 0)
+                    {
+                        var vals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var p in fill.Properties())
+                            vals[p.Name] = p.Value?.ToString() ?? "";
+                        string fillJs = driver.BuildFillScript(vals, out var fillErrors);
+                        if (!string.IsNullOrEmpty(fillJs))
+                            _runner.Run(cli, "eval " + Quote(fillJs), DefaultCliTimeoutMs);
+                        var errArr = new JArray();
+                        foreach (var e in fillErrors) errArr.Add(e);
+                        fillReport["errors"] = errArr;
+                        fillReport["requested"] = fill.Count;
+                        fillReport["resolved"] = fill.Count - fillErrors.Count;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(click))
+                    {
+                        string evJs = driver.BuildClickScript(click);
+                        if (!string.IsNullOrEmpty(evJs))
+                            _runner.Run(cli, "eval " + Quote(evJs), DefaultCliTimeoutMs);
+                        fillReport["click"] = click;
+                    }
+
+                    if (fillReport.Count > 0) result["formDriver"] = fillReport;
+                }
 
                 // 9) Wait
                 if (waitMs > 0)
@@ -644,5 +801,53 @@ namespace GxMcp.Worker.Services
 
         private static string EscapeJs(string s) =>
             (s ?? "").Replace("\\", "\\\\").Replace("'", "\\'");
+
+        // ---- FR#17 GAM session injection helpers ----------------------------
+
+        internal class AuthInfo
+        {
+            public string Mode = "none";
+            public string User;
+            public string Pass;
+            public string LoginUrl;
+        }
+
+        /// <summary>
+        /// Resolves the effective auth config. Precedence: caller-passed
+        /// <c>auth</c> JObject &gt; env (<c>GXMCP_GAM_USER</c> /
+        /// <c>GXMCP_GAM_PASS</c> / <c>GXMCP_GAM_LOGIN_URL</c>) &gt; default
+        /// "none". Never logs credentials.
+        /// </summary>
+        internal static AuthInfo ResolveAuthInfo(JObject auth)
+        {
+            var ai = new AuthInfo();
+            string mode = auth?["mode"]?.ToString();
+            string user = auth?["user"]?.ToString();
+            string pass = auth?["pass"]?.ToString();
+
+            if (string.IsNullOrEmpty(user))
+                user = Environment.GetEnvironmentVariable("GXMCP_GAM_USER");
+            if (string.IsNullOrEmpty(pass))
+                pass = Environment.GetEnvironmentVariable("GXMCP_GAM_PASS");
+            string envLogin = Environment.GetEnvironmentVariable("GXMCP_GAM_LOGIN_URL");
+
+            // If no explicit mode but env creds exist, default to gam.
+            if (string.IsNullOrEmpty(mode))
+                mode = (!string.IsNullOrEmpty(user) && !string.IsNullOrEmpty(pass)) ? "gam" : "none";
+
+            ai.Mode = mode;
+            ai.User = user;
+            ai.Pass = pass;
+            ai.LoginUrl = envLogin;
+            return ai;
+        }
+
+        /// <summary>Heuristic — URL pattern matches the GAM login page.</summary>
+        internal static bool LooksLikeGamLoginUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            return url.IndexOf("glogin", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   url.IndexOf("gamlogin", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
     }
 }

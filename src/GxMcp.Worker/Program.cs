@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Collections.Concurrent;
@@ -17,6 +18,18 @@ namespace GxMcp.Worker
         public static readonly BlockingCollection<string> CommandQueue = new BlockingCollection<string>();
         public static readonly BlockingCollection<string> SdkCommandQueue = new BlockingCollection<string>();
         public static readonly ConcurrentQueue<Action> BackgroundQueue = new ConcurrentQueue<Action>();
+
+        // FR#20 (v2.6.6 Stream B): soft-reload coordination. When a genexus_worker_reload
+        // with mode=soft arrives, we flip this flag, drain the queues, persist
+        // BackgroundJobRegistry state, and exit cleanly with code 0 so the gateway can
+        // respawn. Read by every dispatch loop that needs to honor a quiesce request.
+        public static volatile bool ShuttingDown = false;
+        // Exit code 17 = "busy" (FR#19 single-instance reject). Distinct from 0
+        // (clean shutdown / soft reload), 1 (init failure), and the process-crash codes.
+        public const int ExitCodeBusy = 17;
+        public const int ExitCodeSoftReload = 0;
+
+        public static SingleInstanceLock InstanceLock { get; private set; }
         // PERFORMANCE (W-B3): signal that wakes the background worker immediately on Enqueue,
         // instead of busy-polling with Thread.Sleep(100). WaitOne(100) keeps a safety timeout
         // so the loop still re-checks shutdown state if a signal is missed.
@@ -99,8 +112,38 @@ namespace GxMcp.Worker
                     }
                 }
 
-                if (string.IsNullOrEmpty(gxPath)) 
+                if (string.IsNullOrEmpty(gxPath))
                     throw new Exception("GX_PROGRAM_DIR not specified in environment or local config.json.");
+
+                // FR#19 (v2.6.6 Stream B): refuse to start when another worker already
+                // serves this (kbPath, workerExe) pair. We resolve the cli-arg kbPath
+                // first so the lock key matches whatever the gateway intended.
+                string lockKb = kbPath;
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (args[i] == "--kb" && i + 1 < args.Length) { lockKb = args[i + 1]; break; }
+                }
+                string workerExePath = "";
+                try { workerExePath = Process.GetCurrentProcess().MainModule?.FileName ?? Assembly.GetEntryAssembly()?.Location ?? ""; }
+                catch (Exception lockEx) { Logger.Error("[SingleInstanceLock] could not resolve own exe path: " + lockEx.Message); }
+                string lockDir = "";
+                try { lockDir = Path.GetDirectoryName(workerExePath) ?? Path.GetTempPath(); }
+                catch { lockDir = Path.GetTempPath(); }
+                InstanceLock = SingleInstanceLock.TryAcquire(lockKb ?? "", workerExePath, lockDir);
+                if (!InstanceLock.Acquired)
+                {
+                    int existing = InstanceLock.ExistingPid ?? -1;
+                    // Bypass the QueueWriter to guarantee the gateway sees this message
+                    // even before the output thread fully spins up.
+                    try { _originalOut?.WriteLine("WORKER_HANDSHAKE_REJECT_BUSY pid=" + existing); _originalOut?.Flush(); } catch { }
+                    Logger.Info("[SingleInstanceLock] reject_busy existingPid=" + existing + " key=" + InstanceLock.Key);
+                    Environment.Exit(ExitCodeBusy);
+                    return;
+                }
+                Logger.Info("[SingleInstanceLock] acquired pid=" + Process.GetCurrentProcess().Id + " lockPath=" + InstanceLock.LockPath);
+                // Advertise soft-reload support in the handshake so the gateway can
+                // default to mode=soft for callers that don't specify a mode.
+                WriteLine("WORKER_HANDSHAKE_FEATURES soft_reload=true single_instance=true");
 
                 AppDomain.CurrentDomain.AssemblyResolve += (sender, resolveArgs) => {
                     try {
@@ -128,6 +171,23 @@ namespace GxMcp.Worker
                     }
                 }
 
+                // v2.6.6 live-test finding: ArtechTask.cctor activates the
+                // GxServiceManager process-singleton and throws GxException
+                // "Service Manager já foi ativado" if SM is already active
+                // when the cctor first runs. Our worker previously activated SM
+                // via KbService.OpenKB → ArtechTask cctor would throw on first
+                // in-process build, then the type was permanently dead for the
+                // worker's lifetime (cctor failures cache forever in .NET).
+                //
+                // The IDE avoids this by triggering ArtechTask FIRST. We mirror
+                // that: warm the cctor BEFORE InitializeSdk so ArtechTask gets
+                // to set up SM on its own terms; later SDK Initialize calls and
+                // KbService.OpenKB then reuse the same activated SM cleanly.
+                //
+                // Best-effort: any failure here is logged and ignored — the
+                // in-process build path will fall back to MSBuild.exe spawn.
+                TryWarmupArtechTaskCctor(gxPath);
+
                 InitializeSdk(gxPath);
                 _dispatcher = CommandDispatcher.Instance;
                 
@@ -152,6 +212,30 @@ namespace GxMcp.Worker
                 }
 
                 Logger.Info("Worker SDK ready.");
+
+                // FR#20: best-effort restore of BackgroundJobRegistry rehydration state
+                // written by the previous (soft-reloaded) worker. JobEntry lives in the
+                // gateway, but we surface the file path here so a future worker-side
+                // job system can pick it up — and so soft reload tests can observe the
+                // file lifecycle without touching the gateway.
+                try
+                {
+                    string stateDir = Path.Combine(Path.GetDirectoryName(workerExePath) ?? Path.GetTempPath(), "state");
+                    string jobsFile = Path.Combine(stateDir, "jobs.json");
+                    if (File.Exists(jobsFile))
+                    {
+                        Logger.Info("[SoftReload] found pending jobs snapshot at " + jobsFile + " (size=" + new FileInfo(jobsFile).Length + ")");
+                        // Snapshot is consumed by the gateway through worker_reload_jobs_path
+                        // notification; we just leave it for the next pickup. Removed only
+                        // by the consumer to avoid races on dual-restart scenarios.
+                        SendNotification("notifications/worker/jobs_restored", new {
+                            path = jobsFile,
+                            sizeBytes = new FileInfo(jobsFile).Length
+                        });
+                    }
+                }
+                catch (Exception jrEx) { Logger.Error("[SoftReload] jobs snapshot probe failed: " + jrEx.Message); }
+
 
                 // Start External KB Watcher
                 var watcher = new KbWatcherService(_dispatcher.GetKbService(), (name, type, time) => {
@@ -249,6 +333,121 @@ namespace GxMcp.Worker
                 Logger.Info("Worker shutting down safely.");
             } catch (Exception ex) {
                 Logger.Error($"Main FATAL: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// FR#20: drain in-flight commands, persist gateway job state via stdout notification,
+        /// close the KB, and exit cleanly so the gateway can respawn against a fresh binary.
+        /// Returns the worker-side ack JSON; the gateway sees the clean exit and re-launches.
+        /// </summary>
+        public static string PerformSoftReload(int drainTimeoutMs)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                Logger.Info("[SoftReload] beginning soft reload drainTimeoutMs=" + drainTimeoutMs);
+                ShuttingDown = true;
+
+                // Signal the gateway: persist your JobRegistry NOW before we exit.
+                // The gateway listens for this and dumps to publish\worker\state\jobs.json.
+                try
+                {
+                    string stateDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "state");
+                    try { Directory.CreateDirectory(stateDir); }
+                    catch (Exception dirEx) { Logger.Error("[SoftReload] state dir create failed: " + dirEx.Message); }
+                    SendNotification("notifications/worker/persist_jobs_request", new {
+                        path = Path.Combine(stateDir, "jobs.json"),
+                        reason = "soft_reload"
+                    });
+                }
+                catch (Exception nEx) { Logger.Error("[SoftReload] persist_jobs notification failed: " + nEx.Message); }
+
+                // Drain main queue (already STA-routed) — let in-flight commands flush.
+                var deadline = DateTime.UtcNow.AddMilliseconds(Math.Max(1000, drainTimeoutMs));
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (CommandQueue.Count == 0 && SdkCommandQueue.Count == 0 && BackgroundQueue.IsEmpty) break;
+                    Thread.Sleep(100);
+                }
+                Logger.Info("[SoftReload] drain finished pendingMain=" + CommandQueue.Count +
+                            " pendingSdk=" + SdkCommandQueue.Count + " pendingBg=" + BackgroundQueue.Count +
+                            " elapsedMs=" + sw.ElapsedMilliseconds);
+
+                // Close KB best-effort. KbService has no explicit Close — releasing the dynamic
+                // reference is the closest we have; the SDK disposes on AppDomain unload.
+                try
+                {
+                    var kb = _dispatcher?.GetKbService()?.GetKB();
+                    if (kb != null)
+                    {
+                        try { kb.Close(); } catch (Exception closeEx) { Logger.Error("[SoftReload] kb.Close() threw: " + closeEx.Message); }
+                    }
+                }
+                catch (Exception kbEx) { Logger.Error("[SoftReload] KB close best-effort failed: " + kbEx.Message); }
+
+                // Schedule exit on a background thread so the dispatcher can return the
+                // ack to the gateway BEFORE the process dies.
+                var exitDelay = System.Threading.Tasks.Task.Run(async () =>
+                {
+                    await System.Threading.Tasks.Task.Delay(750);
+                    try { InstanceLock?.Dispose(); } catch (Exception lockEx) { Logger.Error("[SoftReload] lock dispose: " + lockEx.Message); }
+                    Logger.Info("[SoftReload] exiting code=" + ExitCodeSoftReload + " totalMs=" + sw.ElapsedMilliseconds);
+                    Environment.Exit(ExitCodeSoftReload);
+                });
+
+                return "{\"status\":\"Accepted\",\"mode\":\"soft\",\"drainMs\":" + sw.ElapsedMilliseconds +
+                       ",\"note\":\"Worker draining and exiting code 0 in ~750ms; gateway will respawn against current binary.\"}";
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("[SoftReload] failed: " + ex.Message);
+                return "{\"status\":\"Error\",\"mode\":\"soft\",\"error\":\"" + ex.Message.Replace("\"", "\\\"") + "\"}";
+            }
+        }
+
+        // v2.6.6: one-shot warmup of Artech.MsBuild.Common.ArtechTask so its
+        // static ctor activates GxServiceManager BEFORE InitializeSdk / OpenKB
+        // get a chance to. Order matters: cctor failures cache permanently per
+        // AppDomain, so this MUST succeed on the first try. If it throws here
+        // (e.g. SDK install layout mismatch) the in-process build path will be
+        // dead for this worker session, but the external MSBuild.exe fallback
+        // still works.
+        private static void TryWarmupArtechTaskCctor(string gxPath)
+        {
+            try
+            {
+                string asmPath = Path.Combine(gxPath, "Genexus.MsBuild.Tasks.dll");
+                // No File.Exists pre-check — LoadFrom throws a clean
+                // FileNotFoundException that we unwrap below.
+                var asm = Assembly.LoadFrom(asmPath);
+                // SpecifyOneOnly inherits from ArtechTask; touching the type
+                // triggers ArtechTask's static initializer.
+                var t = asm.GetType("Genexus.MsBuild.Tasks.SpecifyOneOnly", throwOnError: false);
+                if (t == null)
+                {
+                    Logger.Warn("[ArtechTask-warmup] SpecifyOneOnly type not found — skipping");
+                    return;
+                }
+                var artechBase = t.BaseType;
+                while (artechBase != null && artechBase.FullName != "Artech.MsBuild.Common.ArtechTask")
+                    artechBase = artechBase.BaseType;
+                if (artechBase == null)
+                {
+                    Logger.Warn("[ArtechTask-warmup] ArtechTask not in inheritance chain of SpecifyOneOnly — skipping");
+                    return;
+                }
+                System.Runtime.CompilerServices.RuntimeHelpers.RunClassConstructor(artechBase.TypeHandle);
+                Logger.Info("[ArtechTask-warmup] OK — Service Manager activated by ArtechTask cctor");
+            }
+            catch (Exception ex)
+            {
+                int depth = 0;
+                for (Exception e = ex; e != null && depth < 6; e = e.InnerException, depth++)
+                {
+                    Logger.Error("[ArtechTask-warmup] ex[" + depth + "] "
+                                 + e.GetType().FullName + ": " + e.Message);
+                }
             }
         }
 

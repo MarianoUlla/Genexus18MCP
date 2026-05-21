@@ -1,4 +1,4 @@
-# GeneXus MCP - Corporate Installer (fixed-path)
+﻿# GeneXus MCP - Corporate Installer (fixed-path)
 # ==============================================
 # Installs `genexus-mcp` to a stable directory so corporate ASR / Defender
 # policies can whitelist exact paths without needing wildcards over the
@@ -16,6 +16,8 @@
 #   & ([scriptblock]::Create($script)) -Kb "C:\KBs\MyKB" -Gx "C:\Program Files (x86)\GeneXus\GeneXus18"
 #
 # Re-run with the same args to upgrade. Use -Force to reinstall the same version.
+# Use -Repair to wipe + reinstall the same currently-installed version.
+# Use -Uninstall to remove the install dir + drop AI client mcpServers.genexus entries.
 
 [CmdletBinding()]
 param(
@@ -39,7 +41,19 @@ param(
     # Show interactive y/N prompt per detected agent (overrides -Clients).
     [switch]$InteractiveClients,
 
-    [switch]$Force
+    [switch]$Force,
+
+    # Wipe + reinstall the currently-installed version (or -Version) into the same dir.
+    [switch]$Repair,
+
+    # Remove the install dir and any AI client config that points at it. No reinstall.
+    [switch]$Uninstall,
+
+    # Skip the post-install AI client process detect/restart prompt.
+    [switch]$NoRestartPrompt,
+
+    # Number of times to retry the publish.zip download on transient failure.
+    [int]$DownloadRetries = 3
 )
 
 Set-StrictMode -Version Latest
@@ -48,6 +62,7 @@ $ErrorActionPreference = 'Stop'
 $script:initFailed = $false
 $Repo = 'lennix1337/Genexus18MCP'
 $ApiBase = 'https://api.github.com'
+$skipExtract = $false
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -58,83 +73,364 @@ function Test-IsAdmin {
 function Write-Step($msg) { Write-Host "[i] $msg" -ForegroundColor Cyan }
 function Write-Warn($msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
 function Write-Ok($msg)   { Write-Host "[OK] $msg" -ForegroundColor Green }
+function Write-Err($msg)  { Write-Host "[X] $msg" -ForegroundColor Red }
 
+function Confirm-Action {
+    param([string]$Prompt, [bool]$DefaultYes = $false)
+    $suffix = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
+    $ans = Read-Host "$Prompt $suffix"
+    if ([string]::IsNullOrWhiteSpace($ans)) { return $DefaultYes }
+    return ($ans.Trim().ToLowerInvariant() -in @('y', 'yes', 's', 'sim'))
+}
+
+# Surfaces proxy hint when the user is likely behind a corporate proxy but
+# hasn't exported the env vars Invoke-WebRequest honors. PowerShell respects
+# $env:HTTPS_PROXY / $env:HTTP_PROXY automatically.
+function Test-LikelyProxiedNetwork {
+    if ($env:HTTPS_PROXY -or $env:HTTP_PROXY) { return $false }
+    try {
+        $sysProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $direct = $sysProxy.GetProxy([uri]'https://api.github.com')
+        if ($direct -and $direct.AbsoluteUri -ne 'https://api.github.com/') { return $true }
+    } catch { }
+    return $false
+}
+
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$Action,
+        [int]$Retries = 3,
+        [string]$Label = 'network call'
+    )
+    $attempt = 0
+    $lastErr = $null
+    while ($attempt -lt $Retries) {
+        $attempt += 1
+        try {
+            return & $Action
+        } catch {
+            $lastErr = $_
+            if ($attempt -lt $Retries) {
+                $waitSec = [Math]::Min(30, [Math]::Pow(2, $attempt))
+                Write-Warn "$Label attempt $attempt/$Retries failed: $($_.Exception.Message). Retrying in $waitSec s..."
+                Start-Sleep -Seconds $waitSec
+            }
+        }
+    }
+    throw $lastErr
+}
+
+# Scan likely GeneXus install roots and return all candidates. We don't just take
+# the first hit - the user might have GeneXus18 + GeneXus18u7 side-by-side and we
+# want to surface both. This catches the exact case from the v2.6.7 field report:
+# user accepted the doc default `GeneXus18` but their install was at `GeneXus18u7`,
+# so init wrote a broken config and the worker crashed silently on first call.
+function Find-GeneXusInstallations {
+    $roots = @()
+    $pfx86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    if ($pfx86)            { $roots += $pfx86 }
+    if ($env:ProgramFiles) { $roots += $env:ProgramFiles }
+    foreach ($drive in 'C', 'D', 'E') {
+        $roots += "${drive}:\Program Files (x86)"
+        $roots += "${drive}:\Program Files"
+    }
+
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($root in $roots) {
+        $gxRoot = Join-Path $root 'GeneXus'
+        if (-not (Test-Path -LiteralPath $gxRoot)) { continue }
+        try {
+            Get-ChildItem -LiteralPath $gxRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $exe = Join-Path $_.FullName 'genexus.exe'
+                if (Test-Path -LiteralPath $exe) {
+                    $key = $_.FullName.ToLowerInvariant()
+                    if ($seen.Add($key)) {
+                        $version = $null
+                        try {
+                            $vinfo = (Get-Item -LiteralPath $exe).VersionInfo
+                            $version = $vinfo.ProductVersion
+                        } catch { }
+                        $found.Add([pscustomobject]@{
+                            Path    = $_.FullName
+                            Folder  = $_.Name
+                            Version = $version
+                        })
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    return $found
+}
+
+function Resolve-GeneXusPath {
+    param([string]$ProvidedGx)
+
+    if ($ProvidedGx) {
+        if (Test-Path -LiteralPath (Join-Path $ProvidedGx 'genexus.exe')) {
+            Write-Ok "Using -Gx: $ProvidedGx"
+            return $ProvidedGx
+        }
+        Write-Warn "-Gx '$ProvidedGx' does not contain genexus.exe. Searching for alternatives..."
+    }
+
+    $candidates = Find-GeneXusInstallations
+    if ($candidates.Count -eq 0) {
+        Write-Warn 'No GeneXus installations auto-detected. Init will require -Gx explicitly.'
+        return $ProvidedGx  # may be empty; let npx init produce the actionable error
+    }
+
+    if ($candidates.Count -eq 1) {
+        $verLabel = if ($candidates[0].Version) { $candidates[0].Version } else { 'unknown version' }
+        Write-Ok ("Detected GeneXus install: {0} ({1})" -f $candidates[0].Path, $verLabel)
+        return $candidates[0].Path
+    }
+
+    Write-Step "Found $($candidates.Count) GeneXus installations:"
+    for ($i = 0; $i -lt $candidates.Count; $i++) {
+        $c = $candidates[$i]
+        $verStr = if ($c.Version) { " v$($c.Version)" } else { '' }
+        Write-Host ("  [{0}] {1}{2}" -f ($i + 1), $c.Path, $verStr)
+    }
+    $pick = Read-Host "Pick one [1-$($candidates.Count)] (default 1)"
+    if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
+    $idx = 0
+    if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $candidates.Count) {
+        Write-Warn "Invalid choice; defaulting to [1]."
+        $idx = 1
+    }
+    return $candidates[$idx - 1].Path
+}
+
+# Detect known AI client processes so we can offer to restart them after init.
+# Restart is required for clients that read mcpServers.* once at startup.
+function Get-RunningAiClients {
+    $known = @(
+        @{ Name = 'Claude'; Process = 'claude'; Display = 'Claude Desktop' },
+        @{ Name = 'Cursor'; Process = 'Cursor'; Display = 'Cursor' },
+        @{ Name = 'Antigravity'; Process = 'antigravity'; Display = 'Antigravity' },
+        @{ Name = 'Code'; Process = 'Code'; Display = 'VS Code (Continue/Claude Code extension)' }
+    )
+    $running = @()
+    foreach ($c in $known) {
+        $procs = Get-Process -Name $c.Process -ErrorAction SilentlyContinue
+        if ($procs) {
+            $running += [pscustomobject]@{
+                Display = $c.Display
+                Name    = $c.Name
+                Pids    = ($procs | Select-Object -ExpandProperty Id)
+                Path    = (try { $procs[0].MainModule.FileName } catch { $null })
+            }
+        }
+    }
+    return $running
+}
+
+# Read genexus mcpServers entries out of AI client config files and remove them.
+# Used by -Uninstall. Best-effort; missing files are skipped silently.
+function Remove-GenexusFromClientConfigs {
+    $candidates = @()
+    if ($env:APPDATA) {
+        $candidates += (Join-Path $env:APPDATA 'Claude\claude_desktop_config.json')
+        $candidates += (Join-Path $env:APPDATA 'Cursor\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json')
+    }
+    if ($env:USERPROFILE) {
+        $candidates += (Join-Path $env:USERPROFILE '.codex\config.json')
+        $candidates += (Join-Path $env:USERPROFILE '.config\opencode\config.json')
+    }
+    $removed = @()
+    foreach ($cfg in $candidates) {
+        if (-not (Test-Path -LiteralPath $cfg)) { continue }
+        try {
+            $raw = Get-Content -LiteralPath $cfg -Raw
+            $obj = $raw | ConvertFrom-Json
+            $hadIt = $false
+            if ($obj.PSObject.Properties.Name -contains 'mcpServers' -and $obj.mcpServers.PSObject.Properties.Name -contains 'genexus') {
+                $obj.mcpServers.PSObject.Properties.Remove('genexus')
+                $hadIt = $true
+            }
+            if ($hadIt) {
+                ($obj | ConvertTo-Json -Depth 100) | Set-Content -LiteralPath $cfg -Encoding utf8
+                $removed += $cfg
+            }
+        } catch {
+            Write-Warn "Could not edit client config $cfg : $($_.Exception.Message)"
+        }
+    }
+    return $removed
+}
+
+# -------------------------------------------------------------------------
+# Uninstall path
+# -------------------------------------------------------------------------
+if ($Uninstall) {
+    if (-not $InstallDir) {
+        if (Test-IsAdmin) { $InstallDir = 'C:\Tools\GenexusMCP' }
+        else              { $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\GenexusMCP' }
+    }
+    Write-Step "Uninstall: target install dir $InstallDir"
+    $removedConfigs = Remove-GenexusFromClientConfigs
+    if ($removedConfigs.Count -gt 0) {
+        Write-Ok "Removed mcpServers.genexus from $($removedConfigs.Count) client config(s):"
+        $removedConfigs | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Write-Step 'No AI client configs referenced genexus - nothing to unpatch.'
+    }
+    if (Test-Path -LiteralPath $InstallDir) {
+        if ($Force -or (Confirm-Action "Delete '$InstallDir' and all contents?" $false)) {
+            try {
+                Remove-Item -LiteralPath $InstallDir -Recurse -Force
+                Write-Ok "Removed $InstallDir"
+            } catch {
+                Write-Err "Failed to remove ${InstallDir}: $($_.Exception.Message)"
+                exit 1
+            }
+        } else {
+            Write-Step 'Skipped install dir removal.'
+        }
+    } else {
+        Write-Step "$InstallDir not present - nothing to remove."
+    }
+    Write-Host ''
+    Write-Ok 'Uninstall complete. Restart your AI client to release any stale MCP connections.'
+    exit 0
+}
+
+# -------------------------------------------------------------------------
+# Install dir resolution + admin warning
+# -------------------------------------------------------------------------
 if (-not $InstallDir) {
     if (Test-IsAdmin) {
         $InstallDir = 'C:\Tools\GenexusMCP'
     } else {
         $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\GenexusMCP'
-        Write-Warn "Not running as admin — installing to per-user path: $InstallDir"
+        Write-Host ''
+        Write-Warn 'You are NOT running as Administrator.'
+        Write-Warn "The installer will default to a per-user path under %LOCALAPPDATA%:"
+        Write-Host  "    $InstallDir" -ForegroundColor Yellow
+        Write-Warn 'This path is commonly BLOCKED by corporate AppLocker / SRP policies.'
+        Write-Warn 'Symptoms: AI client shows "Failed to connect" or "Access denied" when calling the MCP.'
+        Write-Host ''
+        Write-Host 'Recommended: re-launch PowerShell as Administrator so the installer uses C:\Tools\GenexusMCP' -ForegroundColor Cyan
+        Write-Host '(or pass -InstallDir to a path your IT policy whitelists, e.g. C:\Apps\GenexusMCP).' -ForegroundColor Cyan
+        Write-Host ''
+        if (-not $Force) {
+            if (-not (Confirm-Action 'Continue with the per-user install anyway?' $false)) {
+                Write-Step 'Install cancelled. Re-run elevated, or pass -Force to bypass this prompt.'
+                exit 0
+            }
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Version resolution
+# -------------------------------------------------------------------------
+if ($Repair -and -not $Version) {
+    $existingVersionFile = Join-Path $InstallDir 'version.txt'
+    if (Test-Path -LiteralPath $existingVersionFile) {
+        $Version = (Get-Content -LiteralPath $existingVersionFile -Raw).Trim()
+        Write-Step "Repair: reusing currently-installed version $Version"
     }
 }
 
 if (-not $Version) {
+    if (Test-LikelyProxiedNetwork) {
+        Write-Warn 'System proxy detected but $env:HTTPS_PROXY is not set; PowerShell may not honor it. Export $env:HTTPS_PROXY=<proxy> if the download fails.'
+    }
     Write-Step 'Resolving latest release...'
-    $rel = Invoke-RestMethod -Uri "$ApiBase/repos/$Repo/releases/latest" -UseBasicParsing
+    $rel = Invoke-WithRetry -Label 'GitHub API release lookup' -Retries $DownloadRetries -Action {
+        Invoke-RestMethod -Uri "$ApiBase/repos/$Repo/releases/latest" -UseBasicParsing
+    }
     $Version = $rel.tag_name
 }
 if ($Version -notmatch '^v') { $Version = "v$Version" }
+$VersionNoV = $Version.TrimStart('v')
 Write-Step "Target version: $Version"
 
 $versionFile = Join-Path $InstallDir 'version.txt'
 $gatewayExe  = Join-Path $InstallDir 'GxMcp.Gateway.exe'
 $workerExe   = Join-Path $InstallDir 'worker\GxMcp.Worker.exe'
 
+# Repair == force a fresh extract even if versions match.
+if ($Repair) { $Force = $true }
+
 if ((Test-Path $versionFile) -and -not $Force) {
     $current = (Get-Content $versionFile -Raw).Trim()
     if ($current -eq $Version) {
-        Write-Ok "Already at $Version. Pass -Force to reinstall."
-        exit 0
+        Write-Ok "Already at $Version. Pass -Force (or -Repair) to reinstall."
+        # Even if we don't re-extract, still run init if -Kb/-Gx were given,
+        # so the user can fix a broken config without nuking the install dir.
+        if (-not $Kb -and -not $Gx) { exit 0 }
+        Write-Step 'Skipping extract; re-running init with provided KB/GX.'
+        $skipExtract = $true
     }
-    Write-Step "Upgrading $current -> $Version"
+    if (-not $skipExtract) { Write-Step "Upgrading $current -> $Version" }
 }
 
-$zipUrl = "https://github.com/$Repo/releases/download/$Version/publish.zip"
-$tmpZip = Join-Path ([IO.Path]::GetTempPath()) "genexus-mcp-$Version.zip"
+if (-not $skipExtract) {
+    $zipUrl = "https://github.com/$Repo/releases/download/$Version/publish.zip"
+    $tmpZip = Join-Path ([IO.Path]::GetTempPath()) "genexus-mcp-$Version.zip"
 
-Write-Step "Downloading $zipUrl"
-try {
-    Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
-} catch {
-    if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
-    throw "Failed to download $zipUrl. Check the version exists on Releases or your network/proxy. Error: $($_.Exception.Message)"
-}
+    Write-Step "Downloading $zipUrl"
+    try {
+        Invoke-WithRetry -Label 'publish.zip download' -Retries $DownloadRetries -Action {
+            Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
+        } | Out-Null
+    } catch {
+        if (Test-Path $tmpZip) { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
+        throw "Failed to download $zipUrl after $DownloadRetries attempts. Check the version exists on Releases, your network/proxy ('$env:HTTPS_PROXY'), or pass -Version to a known-good tag. Error: $($_.Exception.Message)"
+    }
 
-# Refuse to clean an unrelated directory — only wipe if it already looks like
-# an install (version.txt or the gateway exe present), or is brand new.
-if (Test-Path $InstallDir) {
-    $looksOurs = (Test-Path $versionFile) -or (Test-Path $gatewayExe)
-    $isEmpty = -not (Get-ChildItem -Path $InstallDir -Force | Select-Object -First 1)
-    if (-not $looksOurs -and -not $isEmpty) {
+    # Refuse to clean an unrelated directory - only wipe if it already looks like
+    # an install (version.txt or the gateway exe present), or is brand new.
+    if (Test-Path $InstallDir) {
+        $looksOurs = (Test-Path $versionFile) -or (Test-Path $gatewayExe)
+        $isEmpty = -not (Get-ChildItem -Path $InstallDir -Force | Select-Object -First 1)
+        if (-not $looksOurs -and -not $isEmpty) {
+            Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+            throw "Refusing to clean '$InstallDir' - it exists but doesn't look like a previous GenexusMCP install. Pass -InstallDir to a dedicated directory."
+        }
+        Write-Step "Cleaning existing $InstallDir"
+        Remove-Item -Path (Join-Path $InstallDir '*') -Recurse -Force
+    } else {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    }
+
+    Write-Step "Extracting to $InstallDir"
+    try {
+        Expand-Archive -Path $tmpZip -DestinationPath $InstallDir -Force
+    } finally {
         Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
-        throw "Refusing to clean '$InstallDir' — it exists but doesn't look like a previous GenexusMCP install. Pass -InstallDir to a dedicated directory."
     }
-    Write-Step "Cleaning existing $InstallDir"
-    Remove-Item -Path (Join-Path $InstallDir '*') -Recurse -Force
-} else {
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+
+    if (-not (Test-Path $gatewayExe)) { throw "Extraction failed: $gatewayExe not found." }
+    if (-not (Test-Path $workerExe))  { throw "Extraction failed: $workerExe not found." }
 }
 
-Write-Step "Extracting to $InstallDir"
-try {
-    Expand-Archive -Path $tmpZip -DestinationPath $InstallDir -Force
-} finally {
-    Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+# -------------------------------------------------------------------------
+# Pre-flight GX resolution (catches the GeneXus18u7 case before init)
+# -------------------------------------------------------------------------
+if (-not $NoClient) {
+    $Gx = Resolve-GeneXusPath -ProvidedGx $Gx
 }
 
-if (-not (Test-Path $gatewayExe)) { throw "Extraction failed: $gatewayExe not found." }
-if (-not (Test-Path $workerExe))  { throw "Extraction failed: $workerExe not found." }
-
-# Spawn probe: if AppLocker/SRP blocks execution from $InstallDir, fail HERE with a
-# clear actionable message instead of letting the user discover it via "Failed to
-# connect" from their MCP client hours later.
+# -------------------------------------------------------------------------
+# Gateway self-test: validates the install can read config + see GX + load build dll.
+# Replaces the no-op --axi-spawn-probe flag that only checked exe-launchability.
+# Without -Kb / -Gx we still run the AppLocker-only spawn check, since the gateway
+# can't load a config that doesn't exist yet.
+# -------------------------------------------------------------------------
 Write-Step 'Probing gateway exe (AppLocker / execution policy check)...'
 $probeError = $null
 try {
-    $proc = Start-Process -FilePath $gatewayExe -ArgumentList '--axi-spawn-probe' `
+    $proc = Start-Process -FilePath $gatewayExe -ArgumentList '--self-test' `
         -PassThru -WindowStyle Hidden -ErrorAction Stop
-    Start-Sleep -Milliseconds 600
-    if (-not $proc.HasExited) {
+    # Self-test exits on its own; give it up to 5s for a slow disk + JIT warmup.
+    if (-not $proc.WaitForExit(5000)) {
         try { $proc.Kill() } catch { }
     }
     Write-Ok 'Gateway exe is launchable from the install path.'
@@ -143,12 +439,11 @@ try {
 }
 
 if ($probeError) {
-    Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
     $msg = $probeError
     $accessDenied = $msg -match 'Access is denied|Access denied|Acesso negado|0x80070005|UnauthorizedAccess'
     Write-Host ''
     if ($accessDenied) {
-        Write-Host '[X] AppLocker / SRP / Defender blocked execution of the gateway from this path.' -ForegroundColor Red
+        Write-Err 'AppLocker / SRP / Defender blocked execution of the gateway from this path.'
         Write-Host "    Path: $gatewayExe" -ForegroundColor Red
         Write-Host ''
         Write-Host 'Remediations:' -ForegroundColor Yellow
@@ -156,11 +451,10 @@ if ($probeError) {
         Write-Host '  - Or pass -InstallDir to a path your IT policy allows execution from'
         Write-Host '    (e.g. C:\Apps\GenexusMCP). AppLocker default rules deny exec from'
         Write-Host '    %APPDATA%, %LOCALAPPDATA%, and %TEMP%.'
-        Write-Host '  - If you got here via -InstallDir under AppData, retry with a path outside AppData.'
         Write-Host '  - Get-AppLockerPolicy -Effective -Xml  # to inspect current policy'
         Write-Host '  - Event log: Microsoft-Windows-AppLocker/EXE and DLL, IDs 8003/8004'
     } else {
-        Write-Host '[X] Gateway exe failed to launch from the install path.' -ForegroundColor Red
+        Write-Err 'Gateway exe failed to launch from the install path.'
         Write-Host "    Path: $gatewayExe" -ForegroundColor Red
         Write-Host "    Error: $msg" -ForegroundColor Red
     }
@@ -169,36 +463,91 @@ if ($probeError) {
 
 $Version | Out-File -FilePath $versionFile -Encoding ascii -NoNewline
 
+# -------------------------------------------------------------------------
+# AI client registration via npx, with humanized error output
+# -------------------------------------------------------------------------
 if (-not $NoClient) {
     $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
     if (-not $npx) { $npx = Get-Command npx -ErrorAction SilentlyContinue }
 
     if (-not $npx) {
-        Write-Warn 'npx not found — skipping AI client registration.'
+        Write-Warn 'npx not found - skipping AI client registration.'
         Write-Warn '  Install Node.js 18+ (https://nodejs.org/) and re-run, or pass -NoClient and configure clients manually.'
     } else {
-        $initArgs = @('-y', 'genexus-mcp@latest', 'init', '--write-clients', '--no-smoke')
+        # Pin npx to the same version we just extracted so the CLI shape (flags,
+        # checks, error envelopes) matches the gateway exe. Otherwise `@latest`
+        # may pull a newer or older CLI that doesn't agree with this gateway.
+        $npxPkg = "genexus-mcp@$VersionNoV"
+        $initArgs = @('-y', $npxPkg, 'init', '--write-clients', '--no-smoke', '--format', 'json')
         if ($Kb) { $initArgs += @('--kb', $Kb) }
         if ($Gx) { $initArgs += @('--gx', $Gx) }
         if ($InteractiveClients) {
-            # Full interactive flow: prompts per detected agent (plus KB/GX prompts if not provided).
-            $initArgs = @('-y', 'genexus-mcp@latest', 'init', '--interactive')
+            # Interactive flow can't run with --format json (it expects a TTY for prompts).
+            $initArgs = @('-y', $npxPkg, 'init', '--interactive')
             if ($Kb) { $initArgs += @('--kb', $Kb) }
             if ($Gx) { $initArgs += @('--gx', $Gx) }
         } elseif ($Clients) {
             $initArgs += @('--clients', $Clients)
         }
 
-        Write-Step "Registering with AI clients (gateway = $gatewayExe)"
-        # GENEXUS_MCP_GATEWAY_EXE is the contract that tells patchClientConfig
-        # in cli/lib/config.js to write the direct exe path into the client
-        # mcpServers entry instead of an npx invocation.
+        Write-Step "Registering with AI clients via $npxPkg (gateway = $gatewayExe)"
         $prev = $env:GENEXUS_MCP_GATEWAY_EXE
         $env:GENEXUS_MCP_GATEWAY_EXE = $gatewayExe
         try {
-            & $npx.Source @initArgs
-            if ($LASTEXITCODE -ne 0) {
-                $script:initFailed = $true
+            if ($InteractiveClients) {
+                & $npx.Source @initArgs
+                if ($LASTEXITCODE -ne 0) { $script:initFailed = $true }
+            } else {
+                # Capture stdout/stderr, parse the JSON envelope, surface only the
+                # human-readable bits. Wall-of-YAML output was the #2 friction point
+                # in the v2.6.7 field install: operators couldn't tell pass from fail.
+                $output = & $npx.Source @initArgs 2>&1
+                $exitCode = $LASTEXITCODE
+                $jsonText = ($output | Out-String).Trim()
+                $envelope = $null
+                try { $envelope = $jsonText | ConvertFrom-Json -ErrorAction Stop } catch { }
+
+                if ($envelope) {
+                    if ($exitCode -ne 0) {
+                        $script:initFailed = $true
+                        Write-Host ''
+                        Write-Err 'Init reported a failure:'
+                        $errMsg = if ($envelope.PSObject.Properties.Name -contains 'error') { $envelope.error.message } else { 'unknown error (envelope missing error.message)' }
+                        Write-Host "    $errMsg" -ForegroundColor Red
+                        if ($envelope.PSObject.Properties.Name -contains 'help' -and $envelope.help.Count -gt 0) {
+                            Write-Host ''
+                            Write-Host 'Suggested fix:' -ForegroundColor Yellow
+                            foreach ($h in $envelope.help) { Write-Host "    $h" -ForegroundColor Yellow }
+                        }
+                        # If verification has failed checks, list them - this is the
+                        # gx_installation / kb_path_exists / worker_startup_smoke output.
+                        if ($envelope.PSObject.Properties.Name -contains 'ok' -and
+                            $envelope.ok.PSObject.Properties.Name -contains 'verification' -and
+                            $envelope.ok.verification.PSObject.Properties.Name -contains 'checks') {
+                            $failed = $envelope.ok.verification.checks | Where-Object { $_.status -eq 'fail' }
+                            if ($failed) {
+                                Write-Host ''
+                                Write-Host 'Failed verification checks:' -ForegroundColor Yellow
+                                foreach ($f in $failed) {
+                                    Write-Host ("    [X] {0,-30} {1}" -f $f.id, $f.detail) -ForegroundColor Red
+                                }
+                            }
+                        }
+                    } else {
+                        # Success - print a one-line confirmation, surface any warnings.
+                        $cfgPath = if ($envelope.ok.PSObject.Properties.Name -contains 'configPath') { $envelope.ok.configPath } else { '<unknown>' }
+                        $patched = if ($envelope.meta.PSObject.Properties.Name -contains 'patchedClients') { ($envelope.meta.patchedClients -join ', ') } else { '' }
+                        Write-Ok "Config written: $cfgPath"
+                        if ($patched) { Write-Ok "Patched AI clients: $patched" }
+                        if ($envelope.PSObject.Properties.Name -contains 'help' -and $envelope.help.Count -gt 0) {
+                            foreach ($h in $envelope.help) { Write-Host "    [i] $h" -ForegroundColor Cyan }
+                        }
+                    }
+                } else {
+                    # Couldn't parse - fall back to raw output so the operator still sees something.
+                    if ($exitCode -ne 0) { $script:initFailed = $true }
+                    Write-Host $jsonText
+                }
             }
         } finally {
             if ($null -ne $prev) { $env:GENEXUS_MCP_GATEWAY_EXE = $prev }
@@ -207,16 +556,19 @@ if (-not $NoClient) {
     }
 }
 
+# -------------------------------------------------------------------------
+# Final report + AI client restart prompt
+# -------------------------------------------------------------------------
 Write-Host ''
 if ($script:initFailed) {
     Write-Warn "genexus-mcp $Version files installed to:"
     Write-Host "     $InstallDir"
     Write-Host ''
-    Write-Warn 'Client registration (init) FAILED — see error output above.'
+    Write-Warn 'Client registration (init) FAILED - see error output above.'
     Write-Warn 'Files are extracted, but no AI client config was written and no config.json was created.'
     Write-Host ''
     Write-Host 'Common causes:' -ForegroundColor Yellow
-    Write-Host '  - GeneXus installed in a non-standard path (auto-discovery missed it)'
+    Write-Host '  - GeneXus installed in a non-standard path (e.g. GeneXus18u7 vs GeneXus18)'
     Write-Host '  - Not running from inside a KB folder'
     Write-Host ''
     Write-Host 'Fix by re-running with explicit paths:' -ForegroundColor Cyan
@@ -233,4 +585,35 @@ Write-Host 'Paths to whitelist with IT (ASR / Defender):' -ForegroundColor Cyan
 Write-Host "  $gatewayExe"
 Write-Host "  $workerExe"
 Write-Host ''
-Write-Host 'Restart your AI client (Claude Desktop / Cursor / Antigravity) to pick up the MCP.' -ForegroundColor Cyan
+
+if (-not $NoClient -and -not $NoRestartPrompt) {
+    $running = Get-RunningAiClients
+    if ($running.Count -gt 0) {
+        Write-Host 'Detected running AI client(s) - they MUST be restarted to load the new MCP config:' -ForegroundColor Cyan
+        foreach ($r in $running) {
+            Write-Host ("  - {0} (PID: {1})" -f $r.Display, ($r.Pids -join ', '))
+        }
+        Write-Host ''
+        if (Confirm-Action 'Restart them now?' $false) {
+            foreach ($r in $running) {
+                try {
+                    $r.Pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction Stop }
+                    Write-Ok "Stopped $($r.Display)"
+                    if ($r.Path -and (Test-Path -LiteralPath $r.Path)) {
+                        Start-Sleep -Milliseconds 600
+                        Start-Process -FilePath $r.Path | Out-Null
+                        Write-Ok "Relaunched $($r.Display)"
+                    } else {
+                        Write-Warn "Could not relaunch $($r.Display) - original exe path unknown; please start it manually."
+                    }
+                } catch {
+                    Write-Warn "Failed to restart $($r.Display): $($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Host 'Skipped restart. Restart your AI client manually before using the MCP.' -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host 'Restart your AI client (Claude Desktop / Cursor / Antigravity) to pick up the MCP.' -ForegroundColor Cyan
+    }
+}

@@ -1,7 +1,9 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Xml.Linq;
 using GxMcp.Worker.Models;
+using Newtonsoft.Json.Linq;
 
 namespace GxMcp.Worker.Services
 {
@@ -13,6 +15,103 @@ namespace GxMcp.Worker.Services
             foreach (var op in ops)
                 Dispatch(doc, objectKind, op);
             return doc.ToString(SaveOptions.DisableFormatting);
+        }
+
+        /// <summary>
+        /// v2.6.6 FR#13 — per-op apply that records success/failure per index. In
+        /// <c>strict</c> mode the first failure aborts (mirrors legacy
+        /// <see cref="Apply(string,string,System.Collections.Generic.IEnumerable{SemanticOp})"/>).
+        /// In <c>best-effort</c> mode failing ops are skipped and the doc retains
+        /// the successful ones. <c>only</c> mode is identical to <c>best-effort</c>
+        /// at this layer — the caller decides not to persist.
+        /// </summary>
+        public OpsApplyOutcome ApplyWithResults(string xml, string objectKind, IList<SemanticOp> ops, string validate)
+        {
+            var doc = XDocument.Parse(xml);
+            var results = new List<OpResult>(ops.Count);
+            string mode = NormalizeMode(validate);
+            bool aborted = false;
+
+            for (int i = 0; i < ops.Count; i++)
+            {
+                var op = ops[i];
+                try
+                {
+                    Dispatch(doc, objectKind, op);
+                    results.Add(new OpResult { Index = i, Op = op.Op, Ok = true });
+                }
+                catch (UsageException ux)
+                {
+                    results.Add(new OpResult { Index = i, Op = op.Op, Ok = false, Reason = ux.Message, Code = ux.Code });
+                    if (mode == "strict") { aborted = true; break; }
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new OpResult { Index = i, Op = op.Op, Ok = false, Reason = ex.Message, Code = "internal_error" });
+                    if (mode == "strict") { aborted = true; break; }
+                }
+            }
+
+            return new OpsApplyOutcome
+            {
+                Xml = doc.ToString(SaveOptions.DisableFormatting),
+                Results = results,
+                Aborted = aborted,
+                Mode = mode
+            };
+        }
+
+        internal static string NormalizeMode(string validate)
+        {
+            if (string.IsNullOrWhiteSpace(validate)) return "strict";
+            string v = validate.Trim().ToLowerInvariant();
+            switch (v)
+            {
+                case "strict":
+                case "best-effort":
+                case "best_effort":
+                case "besteffort":
+                    return v == "best_effort" || v == "besteffort" ? "best-effort" : v;
+                case "only":
+                case "validate-only":
+                case "validate_only":
+                    return "only";
+                default:
+                    return "strict";
+            }
+        }
+
+        public sealed class OpResult
+        {
+            public int Index;
+            public string Op;
+            public bool Ok;
+            public string Reason;
+            public string Code;
+
+            public JObject ToJson()
+            {
+                var j = new JObject
+                {
+                    ["index"] = Index,
+                    ["op"] = Op,
+                    ["ok"] = Ok
+                };
+                if (!Ok)
+                {
+                    if (!string.IsNullOrEmpty(Reason)) j["reason"] = Reason;
+                    if (!string.IsNullOrEmpty(Code)) j["code"] = Code;
+                }
+                return j;
+            }
+        }
+
+        public sealed class OpsApplyOutcome
+        {
+            public string Xml;
+            public List<OpResult> Results;
+            public bool Aborted;
+            public string Mode;
         }
 
         private static void Dispatch(XDocument doc, string kind, SemanticOp op)

@@ -588,6 +588,15 @@
           "type": {
             "type": "string"
           },
+          "validate": {
+            "description": "v2.6.6 FR#13. strict (default) aborts on the first op compile error. best-effort applies every op that compiles and reports per-op outcomes under result.opResults[]. only runs ops in-memory and returns diagnostics without persisting.",
+            "enum": [
+              "strict",
+              "best-effort",
+              "only"
+            ],
+            "type": "string"
+          },
           "verbose": {
             "description": "When true, adds slices (±15 lines around each hunk) to post_state (default false).",
             "type": "boolean"
@@ -770,7 +779,7 @@
       "name": "genexus_format"
     },
     {
-      "description": "List, read, save, or restore GeneXus object history snapshots.",
+      "description": "List, read, save, or restore GeneXus object history snapshots. v2.6.6 (FR#28): restore now supports IDE 'Discard changes' parity — pass discard=true with part=<part> to restore the most recent EditSnapshotStore baseline. Returns {status:NoSnapshot,hint:...} when no baseline exists.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -782,11 +791,24 @@
             ],
             "type": "string"
           },
+          "discard": {
+            "default": false,
+            "description": "action=restore only. When true and no snapshot is supplied, restore the most recent EditSnapshotStore baseline for (name,part) — IDE History|Restore (Discard changes) parity.",
+            "type": "boolean"
+          },
           "kb": {
             "description": "Target KB. Required when 2+ open.",
             "type": "string"
           },
           "name": {
+            "type": "string"
+          },
+          "part": {
+            "description": "Part name for snapshot-based restore (default 'Source').",
+            "type": "string"
+          },
+          "snapshot": {
+            "description": "Snapshot token (timestamp or 'latest') for explicit edit-snapshot restore.",
             "type": "string"
           },
           "versionId": {
@@ -1061,12 +1083,20 @@
           "limit": {
             "type": "integer"
           },
+          "since": {
+            "description": "Status: prior _meta.snapshot for chained waits.",
+            "type": "string"
+          },
           "snapshotPath": {
             "type": "string"
           },
           "target": {
             "description": "Object name(s), taskId, job_id, or op:<operationId>.",
             "type": "string"
+          },
+          "wait": {
+            "description": "Status taskId: 0-300. Event-driven block until baseline (phase/counts/done) changes.",
+            "type": "integer"
           },
           "wait_seconds": {
             "description": "Status: 0-25. >0 long-polls server-side until terminal or timeout.",
@@ -1191,6 +1221,19 @@
       "description": "Render preview of a WebPanel via headless Chrome (chrome-devtools-axi). Opens the launcher page, fills required parms, navigates to the target, captures HTML/a11y/screenshot, optionally diffs vs baseline. Returns status + captures.",
       "inputSchema": {
         "properties": {
+          "action": {
+            "default": "render",
+            "description": "v2.6.6 Stream H (FR#25): 'run' resolves the KB launcher object automatically when name is omitted (IDE F5 parity). 'render' (default) requires explicit name.",
+            "enum": [
+              "render",
+              "run"
+            ],
+            "type": "string"
+          },
+          "auth": {
+            "description": "GAM auth override (mode/user/pass).",
+            "type": "object"
+          },
           "buildFirst": {
             "default": false,
             "description": "If true, dispatch a build before opening the browser.",
@@ -1209,10 +1252,18 @@
             },
             "type": "array"
           },
+          "click": {
+            "description": "GX-aware click target (button/link logical name).",
+            "type": "string"
+          },
           "diffBaseline": {
             "default": false,
             "description": "Compute structural diff vs stored a11y baseline.",
             "type": "boolean"
+          },
+          "fill": {
+            "description": "GX-aware form fills (logical attr names → values).",
+            "type": "object"
           },
           "kb": {
             "description": "Target KB. Required when 2+ open.",
@@ -1223,7 +1274,7 @@
             "type": "string"
           },
           "name": {
-            "description": "Target WebPanel name.",
+            "description": "Target WebPanel name. Optional when action=run.",
             "type": "string"
           },
           "parms": {
@@ -1241,9 +1292,6 @@
             "type": "integer"
           }
         },
-        "required": [
-          "name"
-        ],
         "type": "object"
       },
       "name": "genexus_preview"
@@ -1614,17 +1662,25 @@
       "name": "genexus_whoami"
     },
     {
-      "description": "Hot-reload worker: copy new binaries and respawn.",
+      "description": "Reload worker. mode=soft (default): drain + clean exit, gateway respawns same binary, JobRegistry preserved. mode=hard: copy sourceDir over publish/worker and respawn (iterating on worker code).",
       "inputSchema": {
         "properties": {
+          "drainTimeoutMs": {
+            "description": "Soft only; default 30000.",
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "soft",
+              "hard"
+            ],
+            "type": "string"
+          },
           "sourceDir": {
-            "description": "Absolute path to freshly built bin/Release.",
+            "description": "Required for mode=hard.",
             "type": "string"
           }
         },
-        "required": [
-          "sourceDir"
-        ],
         "type": "object"
       },
       "name": "genexus_worker_reload"

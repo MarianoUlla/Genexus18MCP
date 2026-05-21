@@ -40,7 +40,23 @@ namespace GxMcp.Gateway.Routers
                             {
                                 int? page = args?["page"]?.ToObject<int?>();
                                 int? pageSize = args?["pageSize"]?.ToObject<int?>() ?? args?["page_size"]?.ToObject<int?>();
-                                return new { module = "Build", action = "Status", target = target, page = page ?? 1, pageSize = pageSize ?? 50 };
+                                // v2.6.6 Stream F: event-driven long-poll on worker taskId.
+                                // `wait` blocks the worker until the baseline changes (Phase /
+                                // counts / TargetsDone / terminal Status) or the timeout fires.
+                                // `since` is the snapshot string returned under _meta.snapshot
+                                // by the previous status response — pass it back for chaining.
+                                int wait = args?["wait"]?.ToObject<int?>() ?? 0;
+                                if (wait < 0) wait = 0;
+                                if (wait > 300) wait = 300;
+                                return new {
+                                    module = "Build",
+                                    action = "Status",
+                                    target = target,
+                                    page = page ?? 1,
+                                    pageSize = pageSize ?? 50,
+                                    wait = wait,
+                                    since = args?["since"]?.ToString()
+                                };
                             }
                             return new { module = "KB", action = "GetIndexStatus" };
                         case "result":
@@ -94,14 +110,12 @@ namespace GxMcp.Gateway.Routers
                     return new { module = "Validation", action = "Check", target = target, payload = args?["code"]?.ToString() };
                 case "genexus_build":
                     return new { module = "Build", action = args?["action"]?.ToString(), target = target };
-                case "genexus_history":
-                    return new {
-                        module = "History",
-                        action = args?["action"]?.ToString(),
-                        target = args?["name"]?.ToString(),
-                        versionId = args?["versionId"]?.ToObject<int?>()
-                    };
-
+                // genexus_history routing intentionally NOT handled here — the
+                // canonical handler lives in OperationsRouter.cs:177 which forwards
+                // the v2.6.6 Stream H fields (discard / part / snapshot). The old
+                // duplicate handler dropped those flags silently because router
+                // pipeline order made SystemRouter win before OperationsRouter.
+                //
                 default:
                     return null;
             }

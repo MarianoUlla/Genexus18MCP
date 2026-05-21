@@ -338,6 +338,40 @@ namespace GxMcp.Gateway
         {
         }
 
+        /// <summary>
+        /// FR#19: locate an existing GxMcp.Worker process bound to the given KB by
+        /// scanning the Win32_Process command-line for "--kb &lt;kbPath&gt;". Used when
+        /// our own spawn lost the single-instance race (exit code 17) so we can
+        /// surface the live worker's PID to operators rather than thrashing on the
+        /// lock. Returns null when no match is found.
+        /// </summary>
+        public static int? FindExistingWorkerPidForKb(string kbPath)
+        {
+            if (string.IsNullOrWhiteSpace(kbPath)) return null;
+            string norm = kbPath.Trim().TrimEnd('\\', '/').ToLowerInvariant();
+            try
+            {
+                foreach (var proc in Process.GetProcessesByName("GxMcp.Worker"))
+                {
+                    try
+                    {
+                        string cmd = GetCommandLine(proc);
+                        if (string.IsNullOrEmpty(cmd)) continue;
+                        if (cmd.ToLowerInvariant().Contains(norm)) return proc.Id;
+                    }
+                    catch (Exception ex)
+                    {
+                        Program.Log($"[Gateway] FindExistingWorkerPidForKb: probe pid={proc.Id} failed: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.Log($"[Gateway] FindExistingWorkerPidForKb: enumeration failed: {ex.Message}");
+            }
+            return null;
+        }
+
         private static string GetCommandLine(Process process)
         {
             try
@@ -454,15 +488,30 @@ namespace GxMcp.Gateway
                     }
 
                     var restartAllowed = !_cts.Token.IsCancellationRequested && !_suppressAutoRestart;
-                    Program.Log($"[Gateway] Worker process EXITED with code {exitCode}. reason={_stopReason} restartAllowed={restartAllowed}");
+                    // FR#19: exit code 17 means a sibling worker already serves this KB
+                    // (single-instance reject). Auto-restarting would just bounce off the
+                    // same lock — log and back off; the live worker continues to serve.
+                    bool busyReject = exitCode == 17;
+                    // FR#20: exit code 0 after a soft reload is INTENTIONAL — respawn fast
+                    // (no 2s crash-cooldown) so the developer sees minimal downtime.
+                    bool softReload = exitCode == 0 && !_suppressAutoRestart && _stopReason == "none";
+                    Program.Log($"[Gateway] Worker process EXITED with code {exitCode}. reason={_stopReason} restartAllowed={restartAllowed} busyReject={busyReject} softReload={softReload}");
                     OnWorkerExited?.Invoke();
+                    if (busyReject)
+                    {
+                        // Don't retry — the existing worker is authoritative. Caller (gateway
+                        // orchestration) can adopt via WorkerProcess.TryAdoptExistingWorker.
+                        _suppressAutoRestart = true;
+                        return;
+                    }
                     if (restartAllowed)
                     {
-                        Task.Delay(2000, _cts.Token).ContinueWith(_ =>
+                        int respawnDelayMs = softReload ? 250 : 2000;
+                        Task.Delay(respawnDelayMs, _cts.Token).ContinueWith(_ =>
                         {
                             if (!_cts.Token.IsCancellationRequested && (_process == null || _process.HasExited))
                             {
-                                Program.Log("[Gateway] Auto-restarting Worker after crash...");
+                                Program.Log($"[Gateway] Auto-restarting Worker after {(softReload ? "soft reload" : "crash")}...");
                                 try
                                 {
                                     Start();
@@ -657,6 +706,17 @@ namespace GxMcp.Gateway
                 var id = payload["id"]?.ToString();
                 if (string.IsNullOrWhiteSpace(id))
                 {
+                    // Notification path — handle soft-reload persist request inline so
+                    // the JobRegistry survives the worker's clean exit (FR#20).
+                    var method = payload["method"]?.ToString();
+                    if (string.Equals(method, "notifications/worker/persist_jobs_request", StringComparison.Ordinal))
+                    {
+                        TryPersistJobsForSoftReload(payload["params"] as JObject);
+                    }
+                    else if (string.Equals(method, "notifications/worker/jobs_restored", StringComparison.Ordinal))
+                    {
+                        TryReloadJobsAfterSoftReload(payload["params"] as JObject);
+                    }
                     return;
                 }
 
@@ -666,8 +726,50 @@ namespace GxMcp.Gateway
                     CompleteInFlight();
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                // Never swallow silently — a parse failure here always meant a bug upstream
+                // (worker emitted malformed JSON-RPC) but historically nobody saw it.
+                Program.Log($"[Gateway] HandleWorkerRpcResponse error: {ex.Message}");
+            }
+        }
+
+        private void TryReloadJobsAfterSoftReload(JObject? p)
+        {
+            try
+            {
+                string? path = p?["path"]?.ToString();
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    Program.Log("[Gateway] soft_reload jobs_restored missing path; skipping.");
+                    return;
+                }
+                int count = Program.JobRegistry.LoadFrom(path, deleteAfterRead: true);
+                Program.Log($"[Gateway] soft_reload rehydrated {count} jobs from {path}");
+            }
+            catch (Exception ex)
+            {
+                Program.Log($"[Gateway] soft_reload rehydrate failed: {ex.Message}");
+            }
+        }
+
+        private void TryPersistJobsForSoftReload(JObject? p)
+        {
+            try
+            {
+                string? path = p?["path"]?.ToString();
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    Program.Log("[Gateway] soft_reload persist_jobs_request missing path; skipping.");
+                    return;
+                }
+                Program.JobRegistry.SaveTo(path);
+                int count = Program.JobRegistry.Count;
+                Program.Log($"[Gateway] soft_reload persisted {count} jobs to {path}");
+            }
+            catch (Exception ex)
+            {
+                Program.Log($"[Gateway] soft_reload persist failed: {ex.Message}");
             }
         }
 

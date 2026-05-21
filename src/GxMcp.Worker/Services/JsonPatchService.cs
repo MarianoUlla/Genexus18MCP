@@ -17,13 +17,44 @@ namespace GxMcp.Worker.Services
         /// </summary>
         public static JObject BuildPostState(string before, string after, bool verbose)
         {
+            return BuildPostState(before, after, verbose, persistedAfter: null);
+        }
+
+        /// <summary>
+        /// v2.6.6 FR#12 — return_post_state safety. When the caller has re-read the
+        /// part from disk AFTER the SDK commit flushes, pass the persisted content as
+        /// <paramref name="persistedAfter"/>. The diff is computed against
+        /// <paramref name="after"/> (the in-memory new content) for fidelity, while
+        /// the verbose <c>slices[].content</c> reports the bytes that landed on disk.
+        /// When <paramref name="persistedAfter"/> is <c>null</c> the behavior is
+        /// identical to the legacy two-argument overload.
+        /// </summary>
+        public static JObject BuildPostState(string before, string after, bool verbose, string persistedAfter)
+        {
             string diffStr = DiffBuilder.UnifiedDiff(before, after, context: verbose ? 15 : 3);
             var obj = new JObject { ["diff"] = diffStr };
             if (verbose)
             {
-                obj["slices"] = new JArray { new JObject { ["content"] = after } };
+                string sliceContent = persistedAfter ?? after;
+                var slice = new JObject { ["content"] = sliceContent };
+                if (persistedAfter != null)
+                    slice["source"] = "persisted";
+                obj["slices"] = new JArray { slice };
+            }
+            if (persistedAfter != null)
+            {
+                obj["persistedAfterHash"] = ComputeShortHash(persistedAfter);
             }
             return obj;
+        }
+
+        private static string ComputeShortHash(string s)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(s ?? ""));
+                return "sha256:" + BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+            }
         }
 
         public string Apply(string xml, string rootName, JArray patch)

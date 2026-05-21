@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using GxMcp.Worker.Helpers;
 using GxMcp.Worker.Models;
@@ -61,6 +62,93 @@ namespace GxMcp.Worker.Services
         private static readonly Regex _rxOpenKb     = new Regex(@"^\s*Opening Knowledge Base\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex _rxBuildDone  = new Regex(@"^\s*(Build|Specification|Compilation)\s+(succeeded|failed|complete)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex _rxBuildOneEnd = new Regex(@"Build One Task\s+(terminado|finished|Sucesso|completed|ended)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        // Missing dependency surfacing — the GeneXus C# compile leaks CS0246 / CS2001
+        // when a referenced object was never spec/gen'd. Pulling the missing type or
+        // source file out of the error line gives the agent the next target to build
+        // without spelunking the raw output:
+        //   CS0246 ... 'wsretdatainicio' não pôde ser encontrado  → object 'retdatainicio'
+        //   CS2001 ... 'painelclassesala_bc.cs' não pôde ser encontrado → object 'painelclassesala'
+        private static readonly Regex _rxCs0246Missing = new Regex(
+            @"error\s+CS0246:.*?['""‘’]([A-Za-z_][\w]*)['""‘’]",
+            RegexOptions.Compiled);
+        private static readonly Regex _rxCs2001Missing = new Regex(
+            @"error\s+CS2001:.*?['""‘’]([^'""‘’]+\.cs)['""‘’]",
+            RegexOptions.Compiled);
+        // v2.6.6 Stream E (FR#7): index-aware normalizer. The pre-Stream-E version
+        // could suggest a stripped name that doesn't exist in the KB (e.g.
+        // "acessoperfil" → "cessoperfil" via a phantom 'a' strip; or "wsfoo"
+        // when both "wsfoo" AND "foo" happen to be present, but only "wsfoo" is
+        // the real object). When an IndexCacheService lookup is available the
+        // result is verified:
+        //   - stripped name known       → return stripped
+        //   - stripped name unknown but
+        //     ORIGINAL symbol known     → return original (no normalization)
+        //   - neither known             → return null (suggestion dropped)
+        // When lookup is null we keep legacy behaviour (return stripped form)
+        // so call sites without an index cache still get a best-effort answer.
+        private static string NormalizeMissingObjectName(string symbol, IndexCacheService lookup = null)
+        {
+            if (string.IsNullOrWhiteSpace(symbol)) return null;
+            // GX naming map: ws<obj>=web-service wrapper, a<obj>=async wrapper,
+            //                <obj>_bc=business component, <obj>_level_detail=trn detail,
+            //                p<obj>=print wrapper. Strip common prefixes/suffixes so the
+            //                agent's next build hits the real KB object name.
+            var original = symbol.Trim();
+            var s = original;
+            int us = s.LastIndexOf('_');
+            if (us > 0)
+            {
+                var tail = s.Substring(us + 1).ToLowerInvariant();
+                if (tail == "bc" || tail == "level" || tail == "detail" || tail == "ws" ||
+                    tail == "impl" || tail == "client" || tail == "main")
+                    s = s.Substring(0, us);
+            }
+            if (s.Length > 2 && s.StartsWith("ws", StringComparison.OrdinalIgnoreCase))
+                s = s.Substring(2);
+            // NOTE: do NOT strip 'a' / 'p' single-letter prefixes — those collide
+            // with real KB object names that happen to start with those letters
+            // (acessoperfil, painelclassesala, premiomerito, …). Only the explicit
+            // 'ws' web-service wrapper prefix is safe to strip.
+
+            if (lookup == null) return s;
+
+            // Index-aware verification.
+            bool strippedKnown = !string.IsNullOrEmpty(s) && lookup.IsObjectKnown(s);
+            if (strippedKnown) return s;
+            bool originalKnown = lookup.IsObjectKnown(original);
+            if (originalKnown) return original;
+            // Neither form is in the index — drop the suggestion rather than
+            // sending the agent chasing a phantom target.
+            return null;
+        }
+
+        // v2.6.6 Stream E (FR#9): CS2001 referencing "<obj>_bc.cs" is treated as
+        // an orphan demotion when the underlying object is not a Transaction in the
+        // current index (either missing entirely, or renamed to a different type).
+        // Conservative: if the index lookup is unavailable, the predicate returns
+        // false so the legacy "error stands" behaviour holds.
+        internal static bool IsBcOrphanError(string line, IndexCacheService lookup)
+        {
+            if (lookup == null || string.IsNullOrEmpty(line)) return false;
+            var m = _rxCs2001Missing.Match(line);
+            if (!m.Success) return false;
+            var file = m.Groups[1].Value;
+            var slash = Math.Max(file.LastIndexOf('\\'), file.LastIndexOf('/'));
+            var bare = slash >= 0 ? file.Substring(slash + 1) : file;
+            if (bare.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                bare = bare.Substring(0, bare.Length - 3);
+            if (!bare.EndsWith("_bc", StringComparison.OrdinalIgnoreCase)) return false;
+            var trnName = bare.Substring(0, bare.Length - 3);
+            if (string.IsNullOrEmpty(trnName)) return false;
+            try
+            {
+                var entry = lookup.TryGetEntryByName(trnName);
+                if (entry == null) return true; // Transaction gone — _bc.cs is orphan
+                // Different type with the same name → not a Transaction → orphan.
+                return !string.Equals(entry.Type, "Transaction", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
 
         // FR#12 (friction-report 2026-05-14): MSBuild + GeneXus emit dozens of
         // "Copiando módulo X" / "Copying module X" / "Restoring NuGet packages" lines per build.
@@ -69,6 +157,14 @@ namespace GxMcp.Worker.Services
         private static readonly Regex _rxModuleCopyNoise = new Regex(
             @"^\s*(Copiando|Copying|Restoring NuGet|Restaurando NuGet|Wrote\s+|Touching\s+)",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        public class ErrorDetail
+        {
+            public string raw { get; set; }
+            public string rewritten { get; set; }
+            public string phase { get; set; }
+            public string gxObject { get; set; }
+        }
 
         public class BuildTaskStatus
         {
@@ -83,17 +179,40 @@ namespace GxMcp.Worker.Services
             public string CurrentObject { get; set; }
             public int ErrorCount { get; set; }
             public int WarningCount { get; set; }
+            /// <summary>
+            /// Object names extracted from CS0246/CS2001 compile errors —
+            /// dependencies whose .dll is stale or never built. The agent
+            /// should chain <c>genexus_lifecycle build target=...</c> on
+            /// these before retrying.
+            /// </summary>
+            public HashSet<string> SuggestedRebuildTargets { get; set; } =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             public int LineCount { get; set; }
             public string LastLine { get; set; }
             public List<string> TailLines { get; set; } = new List<string>();
             public List<string> Errors { get; set; } = new List<string>();
             public List<string> Warnings { get; set; } = new List<string>();
-            public string Output { get; set; }
+            // FR#21 (v2.6.6 Stream C): keep both the raw MSBuild line and the
+            // rewritten "[gx-object=... phase=...]" form so debugging is possible.
+            public List<ErrorDetail> ErrorsDetailed { get; set; } = new List<ErrorDetail>();
+            // FR#9 (v2.6.6 Stream E): CS2001 errors referencing "<obj>_bc.cs" where
+            // the underlying Transaction no longer exists (or isn't a Transaction)
+            // are demoted to warnings — counted here, full lines preserved in
+            // Warnings[] with a "[demoted-bc-orphan]" prefix.
+            public int DemotedErrors { get; set; }
+            // FR#22 (v2.6.6 Stream C): shaped output envelope (head/tail/full-log-path).
+            // The legacy flat string is kept for backwards compat in non-compact mode.
+            public object Output { get; set; }
+            public string FullLogPath { get; set; }
             public string StartTime { get; set; }
             public string EndTime { get; set; }
             public double? ElapsedSeconds { get; set; }
             public int ExitCode { get; set; }
             public string Error { get; set; }
+            // v2.6.6 Stream D: "inproc" when GeneXus MSBuild tasks ran inside the
+            // worker against the open KB, "msbuild-exe" when we fell back to the
+            // external MSBuild.exe spawn. Surfaced for telemetry / debugging.
+            public string BuildPath { get; set; }
             public List<string> CallersToAlsoBuild { get; set; }
             public string Hint { get; set; }
             // v2.3.8 (Task 5.1/5.2): expansion plan applied to the BuildOne
@@ -104,7 +223,32 @@ namespace GxMcp.Worker.Services
             [JsonIgnore] internal DateTime StartedAt { get; set; }
             [JsonIgnore] internal StringBuilder FullOutput { get; set; } = new StringBuilder();
             [JsonIgnore] internal object _lock = new object();
+            // v2.6.6 Stream F (FR#19 follow-up): event-driven long-poll. Polling
+            // `status` every ~250ms generated 24 round-trips for a 10-minute
+            // build. Wait callers block on this signal until HandleLine sees a
+            // change worth surfacing (phase / counts / TargetsDone / terminal).
+            [JsonIgnore] internal ManualResetEventSlim StateChangeSignal { get; } = new ManualResetEventSlim(false);
+            // Aggregated-warnings memo. AggregateWarnings is O(N log codes) but
+            // is called on every paginated status poll (the LLM polls many times
+            // during a long build). Invalidated whenever WarningCount changes —
+            // _aggregateMemoForCount stores the WarningCount the cache was built at.
+            [JsonIgnore] internal List<BuildOutputShaper.WarningGroup> AggregatedWarningsCache { get; set; }
+            [JsonIgnore] internal int AggregateMemoForCount { get; set; } = -1;
+
+            /// <summary>Compact baseline string used by GetStatusWait for ETag-style change detection.
+            /// Stable across pagination, kept short (&lt;50 chars) so it round-trips cheaply.</summary>
+            internal string ComputeBaseline()
+            {
+                return (Phase ?? "") + "|" + (TargetsDone?.ToString() ?? "") + "|" + ErrorCount + "|" + WarningCount + "|" + (Status ?? "");
+            }
         }
+
+        // v2.6.6 Stream F: terminal statuses always return immediately from GetStatusWait.
+        private static readonly HashSet<string> _terminalStatuses =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "Succeeded", "Failed", "Cancelled", "Error" };
+        private static bool IsTerminalStatus(string s)
+            => !string.IsNullOrEmpty(s) && _terminalStatuses.Contains(s);
 
         public BuildService()
         {
@@ -151,10 +295,14 @@ namespace GxMcp.Worker.Services
                 .ToList();
             var originalSet = new HashSet<string>(originalList, StringComparer.OrdinalIgnoreCase);
 
-            // No graph or "none" → preserve original order, no expansion.
+            // No graph or "none" → preserve original order, but still inject
+            // BC variants (FR#8) since the BC heuristic is index-driven, not
+            // caller-graph-driven.
             if (_callerGraphService == null || string.Equals(plan.IncludeCallees, "none", StringComparison.OrdinalIgnoreCase))
             {
-                plan.Expanded = originalList;
+                var bcOnly = CollectBcVariants(originalList, originalSet, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                plan.Expanded.AddRange(bcOnly);
+                plan.Expanded.AddRange(originalList);
                 return plan;
             }
 
@@ -204,9 +352,44 @@ namespace GxMcp.Worker.Services
             // we want for sequential BuildOne emission.
             calleeOrder.Reverse();
 
+            // v2.6.6 Stream E (FR#8): inject BC variants ahead of the trn so
+            // per-object csprojs see the BC .dll on disk by the time the
+            // Transaction is generated.
+            var bcPrefix = CollectBcVariants(originalList, originalSet, seen);
+            if (bcPrefix.Count > 0)
+            {
+                calleeOrder.InsertRange(0, bcPrefix);
+            }
+
             plan.Expanded.AddRange(calleeOrder);
             plan.Expanded.AddRange(originalList);
             return plan;
+        }
+
+        // v2.6.6 Stream E (FR#8): for each Transaction in <originalList>, if the
+        // index also carries a "<name>_bc" object the build pipeline needs that
+        // variant compiled first. Returns the BC variants in input order; skips
+        // ones already in the original set or already collected as callees.
+        private List<string> CollectBcVariants(IList<string> originalList, HashSet<string> originalSet, HashSet<string> seen)
+        {
+            var result = new List<string>();
+            if (_indexCacheService == null) return result;
+            foreach (var t in originalList)
+            {
+                var entry = _indexCacheService.TryGetEntryByName(t);
+                if (entry == null) continue;
+                if (!string.Equals(entry.Type, "Transaction", StringComparison.OrdinalIgnoreCase)) continue;
+                var bcName = t + "_bc";
+                if (originalSet.Contains(bcName)) continue;
+                if (seen.Contains(bcName)) continue;
+                // Single name-keyed lookup confirms presence; previously this
+                // line redundantly scanned the index a second time via
+                // IsObjectKnown(bcName).
+                if (_indexCacheService.TryGetEntryByName(bcName) == null) continue;
+                result.Add(bcName);
+                seen.Add(bcName);
+            }
+            return result;
         }
 
         public string Build(string action, string target)
@@ -341,7 +524,7 @@ namespace GxMcp.Worker.Services
             return _msbuildEncodingCached;
         }
 
-        public string GetStatus(string taskId, int page = 1, int pageSize = 50)
+        public string GetStatus(string taskId, int page = 1, int pageSize = 50, bool compact = false)
         {
             if (string.IsNullOrEmpty(taskId))
             {
@@ -359,6 +542,23 @@ namespace GxMcp.Worker.Services
                     var jo = JObject.FromObject(status, new JsonSerializer { NullValueHandling = NullValueHandling.Ignore });
                     StripOutputWhileRunning(jo, status.Status);
 
+                    // FR#23: compact=true returns a sibling "warningsAggregated" grouped
+                    // by spc/gen/CS/MSB code so the agent sees N occurrences of the same
+                    // spc0022 collapsed to one row. The flat "warnings" array stays for
+                    // backwards compat with existing consumers.
+                    if (compact)
+                    {
+                        // Memoize the aggregation across polls — invalidate only
+                        // when WarningCount changes.
+                        if (status.AggregatedWarningsCache == null
+                            || status.AggregateMemoForCount != status.WarningCount)
+                        {
+                            status.AggregatedWarningsCache = BuildOutputShaper.AggregateWarnings(status.Warnings);
+                            status.AggregateMemoForCount = status.WarningCount;
+                        }
+                        jo["warningsAggregated"] = JArray.FromObject(status.AggregatedWarningsCache);
+                    }
+
                     // Replace the flat warnings array with a paginated wrapper
                     var paginatedWarnings = BatchService.BuildStatusPayload(status.Warnings, page, pageSize);
                     jo["warnings"] = paginatedWarnings["warnings"];
@@ -368,6 +568,100 @@ namespace GxMcp.Worker.Services
                 }
             }
             return "{\"error\": \"Task ID not found\"}";
+        }
+
+        // v2.6.6 Stream F: event-driven status wait. Replaces the gateway's 25s
+        // polling cap with a worker-side block that wakes on baseline change
+        // (Phase / TargetsDone / ErrorCount / WarningCount / terminal Status).
+        // Caller passes the previous snapshot string under `since`; the response
+        // surfaces the new baseline under `_meta.snapshot` for chaining.
+        // - waitSeconds clamped to [0, 300]; 0 = immediate (today's behaviour).
+        // - Terminal task → returns immediately regardless of since.
+        // - Unknown taskId → returns immediately (Task ID not found).
+        // - Baseline mismatch → returns immediately.
+        public string GetStatusWait(string taskId, int waitSeconds, string sinceBaseline, int page = 1, int pageSize = 50, bool compact = false)
+        {
+            if (waitSeconds < 0) waitSeconds = 0;
+            if (waitSeconds > 300) waitSeconds = 300;
+
+            // No taskId, or wait disabled → match legacy GetStatus shape.
+            if (string.IsNullOrEmpty(taskId) || waitSeconds == 0)
+            {
+                return AnnotateWithBaseline(GetStatus(taskId, page, pageSize, compact), taskId);
+            }
+
+            BuildTaskStatus status;
+            if (!_tasks.TryGetValue(taskId, out status))
+            {
+                // Unknown taskId — GetStatus emits "Task ID not found"; return immediately.
+                return AnnotateWithBaseline(GetStatus(taskId, page, pageSize, compact), taskId);
+            }
+
+            string currentBaseline;
+            bool terminal;
+            lock (status._lock)
+            {
+                currentBaseline = status.ComputeBaseline();
+                terminal = IsTerminalStatus(status.Status);
+            }
+
+            // Terminal → always return now. Baseline mismatch → caller is behind, return now.
+            // Empty sinceBaseline means caller has no prior snapshot; surface current state.
+            bool baselineDiffers = !string.IsNullOrEmpty(sinceBaseline)
+                                   && !string.Equals(sinceBaseline, currentBaseline, StringComparison.Ordinal);
+            if (terminal || baselineDiffers || string.IsNullOrEmpty(sinceBaseline))
+            {
+                return AnnotateWithBaseline(GetStatus(taskId, page, pageSize, compact), taskId);
+            }
+
+            // Wait. ManualResetEventSlim was reset by a previous waiter or never set;
+            // we reset BEFORE wait so an in-flight signal racing with us is honoured.
+            // (We re-check the baseline after wait so a spurious wake is harmless.)
+            try { status.StateChangeSignal.Reset(); } catch { }
+            // Re-check baseline AFTER reset: HandleLine might have signalled and we'd
+            // miss the edge otherwise.
+            string postResetBaseline;
+            lock (status._lock) { postResetBaseline = status.ComputeBaseline(); }
+            if (!string.Equals(postResetBaseline, currentBaseline, StringComparison.Ordinal)
+                || IsTerminalStatus(GetStatusValue(status)))
+            {
+                return AnnotateWithBaseline(GetStatus(taskId, page, pageSize, compact), taskId);
+            }
+
+            try
+            {
+                status.StateChangeSignal.Wait(TimeSpan.FromSeconds(waitSeconds));
+            }
+            catch (ObjectDisposedException)
+            {
+                // Task pruned during wait — fall through to GetStatus (will report not found).
+            }
+
+            return AnnotateWithBaseline(GetStatus(taskId, page, pageSize, compact), taskId);
+        }
+
+        private static string GetStatusValue(BuildTaskStatus s)
+        {
+            lock (s._lock) { return s.Status; }
+        }
+
+        // Adds _meta.snapshot=<current baseline> to a status JSON response so the
+        // caller can chain status wait calls without recomputing the baseline.
+        private string AnnotateWithBaseline(string statusJson, string taskId)
+        {
+            if (string.IsNullOrEmpty(statusJson) || string.IsNullOrEmpty(taskId)) return statusJson;
+            if (!_tasks.TryGetValue(taskId, out var status)) return statusJson;
+            try
+            {
+                var jo = JObject.Parse(statusJson);
+                string baseline;
+                lock (status._lock) { baseline = status.ComputeBaseline(); }
+                var meta = jo["_meta"] as JObject;
+                if (meta == null) { meta = new JObject(); jo["_meta"] = meta; }
+                meta["snapshot"] = baseline;
+                return jo.ToString(Formatting.None);
+            }
+            catch { return statusJson; }
         }
 
         // FR#19 (friction-report 2026-05-14): during long-poll each `status` call used to return
@@ -432,6 +726,7 @@ namespace GxMcp.Worker.Services
                     status.Phase = "Done";
                     EmitPhaseProgress(status.Phase);
                     status.EndTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                    try { status.StateChangeSignal.Set(); } catch { }
                     return JsonConvert.SerializeObject(new { status = "Cancelled", taskId = taskId });
                 }
                 return JsonConvert.SerializeObject(new { status = status.Status, message = "Task already finished" });
@@ -466,6 +761,9 @@ namespace GxMcp.Worker.Services
         private void RunBuild(BuildTaskStatus status, string action, List<string> targets)
         {
             string tempFile = null;
+            // FR#24: thread-tag the Logger so worker_debug.log carries [phase=...]
+            // on every line emitted from this build (and only this build).
+            Helpers.Logger.CurrentPhase = "Starting";
             try
             {
                 if (_kbService != null)
@@ -480,6 +778,75 @@ namespace GxMcp.Worker.Services
                     SetFailure(status, "KB Path not found in Environment (GX_KB_PATH)");
                     return;
                 }
+
+                // v2.6.6 Stream D — in-process build path. Reuse the already-open
+                // KbService._kb instance + invoke GeneXus MSBuild tasks directly
+                // instead of spawning MSBuild.exe (which re-opens the KB out of
+                // process, the dominant cost in targeted builds).
+                //
+                // 2026-05-21 LIVE-TEST FINDING + FIX: ArtechTask's static ctor
+                // activates the GxServiceManager process-singleton and throws
+                // `GxException: O Service Manager já foi ativado` if another
+                // path (KbService.OpenKB → InitializeSdk) activated SM first.
+                // Worker boot now warms the ArtechTask cctor BEFORE
+                // InitializeSdk (Program.TryWarmupArtechTaskCctor) so the IDE
+                // ordering holds and subsequent in-process builds succeed.
+                // ON by default; opt-out with GXMCP_INPROCESS_BUILD=0.
+                bool useInProcess =
+                    !string.Equals(Environment.GetEnvironmentVariable("GXMCP_INPROCESS_BUILD"), "0", StringComparison.OrdinalIgnoreCase)
+                    && _kbService != null && _kbService.IsOpen;
+                if (useInProcess)
+                {
+                    status.Phase = "InProcess-Specifying";
+                    EmitPhaseProgress(status.Phase);
+                    Logger.Info("[BUILD-INPROCESS] taskId=" + status.TaskId
+                                + " kb=" + _kbService.GetKbPath()
+                                + " targets=" + (targets != null ? string.Join(";", targets) : "<all>"));
+                    var sw = Stopwatch.StartNew();
+                    bool ok = false;
+                    try
+                    {
+                        ok = InProcessBuildRunner.Run(
+                            status, action, targets,
+                            (s, l, err) => HandleLine(s, l, err),
+                            _kbService.KbObject, _kbService.KbLock);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error("[BUILD-INPROCESS] orchestrator threw: " + ex.Message);
+                        ok = false;
+                    }
+                    sw.Stop();
+                    Logger.Info("[BUILD-INPROCESS-DONE] taskId=" + status.TaskId
+                                + " ok=" + ok + " elapsedMs=" + sw.ElapsedMilliseconds);
+                    if (ok)
+                    {
+                        status.BuildPath = "inproc";
+                        // FR#22: still emit shaped output envelope from FullOutput.
+                        try
+                        {
+                            string fullText = status.FullOutput.ToString();
+                            string fullLogPath;
+                            BuildOutputShaper.TryWriteFullLog(fullText, status.TaskId, out fullLogPath);
+                            status.FullLogPath = fullLogPath;
+                            status.Output = BuildOutputShaper.Shape(fullText, status.LineCount, fullLogPath);
+                        }
+                        catch { }
+
+                        status.Status = (status.ErrorCount == 0) ? "Succeeded" : "Failed";
+                        status.Phase = "Done";
+                        EmitPhaseProgress(status.Phase);
+                        status.EndTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                        status.ElapsedSeconds = Math.Round((DateTime.UtcNow - status.StartedAt).TotalSeconds, 1);
+                        Logger.Info("Background Build " + status.TaskId + " " + status.Status
+                                    + " (inproc, errors=" + status.ErrorCount + ", warnings=" + status.WarningCount
+                                    + ", " + status.ElapsedSeconds + "s)");
+                        return;
+                    }
+                    Logger.Warn("[BUILD-INPROCESS-FALLBACK] taskId=" + status.TaskId + " falling back to MSBuild.exe spawn");
+                }
+
+                status.BuildPath = "msbuild-exe";
 
                 tempFile = Path.Combine(Path.GetTempPath(), "GxBuild_" + Guid.NewGuid().ToString().Substring(0, 8) + ".msbuild");
                 string importPath = SecurityElement.Escape(Path.Combine(_gxDir, "Genexus.Tasks.targets"));
@@ -498,35 +865,41 @@ namespace GxMcp.Worker.Services
                 {
                     status.TargetsTotal = targets.Count;
                     status.TargetsDone = 0;
-                    // IDE-style "Build With This Only": SpecifyOneOnly + GenerateOnly,
-                    // NOT <BuildOne>. <BuildOne> bundles spec+gen+deploy+IIS-update in a
-                    // single monolithic task and the IIS-update sub-step explodes with
-                    // an opaque "O sistema não pode encontrar o arquivo especificado"
-                    // when run from a standalone msbuild process (the IDE hosts the
-                    // task in-process so its AppDomain resolves Artech.* + IIS COM
-                    // wrappers; standalone msbuild does not). The IDE itself composes
-                    // Specify + Generate (see Genexus.msbuild template in the install
-                    // dir) so we mirror that — deploy of artifacts to the web folder
-                    // happens transparently as part of generate.
+                    // IDE-parity build pipeline. The IDE's "Build With This Only" runs
+                    // Spec → Gen → .NET compile → Web-app config registration through
+                    // <IdeWebBuildAndDeploy> with Output="IDE" + EventsSuspended=true.
+                    // We mirror that here for targeted builds so the produced .dll +
+                    // HandlerFactory registration land in the same state the IDE leaves
+                    // the KB in. SpecifyOneOnly first scopes the work to the requested
+                    // targets; IdeWebBuildAndDeploy then completes the chain.
+                    //
+                    // Why not <BuildOne>? <BuildOne> bundles the same sub-steps but the
+                    // IIS-config sub-step inside it explodes with an opaque
+                    // "O sistema não pode encontrar o arquivo especificado" when run
+                    // from a standalone msbuild process. <IdeWebBuildAndDeploy>
+                    // routes the same work through the IDE-style entry point that
+                    // resolves correctly.
                     string joined = string.Join(";", targets.Select(t => SecurityElement.Escape(t)));
                     sb.AppendLine("    <SpecifyOneOnly ObjectNames=\"" + joined + "\" />");
-                    sb.AppendLine("    <GenerateOnly />");
+                    sb.AppendLine("    <IdeWebBuildAndDeploy ForceRebuild=\"false\" CompileMains=\"true\" Output=\"IDE\" EventsSuspended=\"true\" />");
                 }
                 else if (action.Equals("RebuildAll", StringComparison.OrdinalIgnoreCase))
-                    sb.AppendLine("    <RebuildAll />");
+                {
+                    // Full force-rebuild — same task the IDE's "Rebuild All" fires.
+                    sb.AppendLine("    <IdeWebBuildAndDeploy ForceRebuild=\"true\" CompileMains=\"true\" Output=\"IDE\" EventsSuspended=\"true\" />");
+                }
                 else if (action.Equals("Reorg", StringComparison.OrdinalIgnoreCase))
                     sb.AppendLine("    <CheckAndInstallDatabase />");
                 else if (action.Equals("Validate", StringComparison.OrdinalIgnoreCase) || action.Equals("Check", StringComparison.OrdinalIgnoreCase))
                     sb.AppendLine("    <CheckKnowledgeBase />");
                 else if (action.Equals("Sync", StringComparison.OrdinalIgnoreCase))
                 {
-                    sb.AppendLine("    <SpecifyAll />");
-                    sb.AppendLine("    <GenerateOnly />");
+                    // Sync = full incremental KB build (no force). IDE-style.
+                    sb.AppendLine("    <IdeWebBuildAndDeploy ForceRebuild=\"false\" CompileMains=\"true\" Output=\"IDE\" EventsSuspended=\"true\" />");
                 }
                 else
                 {
-                    sb.AppendLine("    <SpecifyAll />");
-                    sb.AppendLine("    <GenerateOnly />");
+                    sb.AppendLine("    <IdeWebBuildAndDeploy ForceRebuild=\"false\" CompileMains=\"true\" Output=\"IDE\" EventsSuspended=\"true\" />");
                 }
 
                 sb.AppendLine("    <CloseKnowledgeBase />");
@@ -569,14 +942,24 @@ namespace GxMcp.Worker.Services
                     status.ExitCode = process.ExitCode;
                     status.EndTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                     status.ElapsedSeconds = Math.Round((DateTime.UtcNow - status.StartedAt).TotalSeconds, 1);
-                    status.Output = status.FullOutput.ToString();
+
+                    // FR#22 (v2.6.6 Stream C): full log → disk, shaped envelope → status.
+                    string fullText = status.FullOutput.ToString();
+                    string fullLogPath;
+                    BuildOutputShaper.TryWriteFullLog(fullText, status.TaskId, out fullLogPath);
+                    status.FullLogPath = fullLogPath;
+                    status.Output = BuildOutputShaper.Shape(fullText, status.LineCount, fullLogPath);
+
                     status.Phase = "Done";
+                    Helpers.Logger.CurrentPhase = "Done";
                     EmitPhaseProgress(status.Phase);
 
                     if (process.ExitCode == 0 && status.ErrorCount == 0)
                         status.Status = "Succeeded";
                     else
                         status.Status = "Failed";
+                    // Stream F: wake any pending status wait callers.
+                    try { status.StateChangeSignal.Set(); } catch { }
 
                     Logger.Info("Background Build " + status.TaskId + " " + status.Status +
                                 " (errors=" + status.ErrorCount + ", warnings=" + status.WarningCount +
@@ -592,6 +975,8 @@ namespace GxMcp.Worker.Services
             {
                 try { if (tempFile != null && File.Exists(tempFile)) File.Delete(tempFile); } catch { }
                 status.Process = null;
+                // Don't leak the phase tag onto unrelated work on this thread.
+                Helpers.Logger.CurrentPhase = null;
             }
         }
 
@@ -600,6 +985,13 @@ namespace GxMcp.Worker.Services
             if (line == null) return;
             lock (status._lock)
             {
+                // v2.6.6 Stream F: capture pre-mutation baseline so we can fire
+                // the StateChangeSignal once at the end IFF anything that affects
+                // the wait-baseline actually changed (phase / counts / TargetsDone).
+                string baselineBefore = status.ComputeBaseline();
+                try
+                {
+
                 status.LineCount++;
                 status.LastLine = line;
                 status.FullOutput.AppendLine(line);
@@ -627,13 +1019,79 @@ namespace GxMcp.Worker.Services
 
                 if (_rxError.IsMatch(line))
                 {
+                    // v2.6.6 Stream E (FR#9): CS2001 for "<obj>_bc.cs" where the
+                    // underlying Transaction has BC disabled (or doesn't exist) is
+                    // an orphan — the stale generated source file is not the
+                    // requested target's fault. Demote it to a warning so the
+                    // build status reflects the actual failure mode.
+                    if (IsBcOrphanError(line, _indexCacheService))
+                    {
+                        status.DemotedErrors++;
+                        status.WarningCount++;
+                        if (status.Warnings.Count < 50) status.Warnings.Add("[demoted-bc-orphan] " + line.Trim());
+                        return;
+                    }
+
                     status.ErrorCount++;
-                    if (status.Errors.Count < 50) status.Errors.Add(line.Trim());
+
+                    // FR#21 (Stream C followup): rewrite the GxBuild_*.msbuild(N,M)
+                    // location to [gx-object=... phase=...] so the agent gets an
+                    // actionable target instead of a temp-file address. Keep the
+                    // raw form too — ErrorsDetailed carries both for debugging.
+                    string rawErr = line.Trim();
+                    string rewritten;
+                    bool didRewrite = GxMcp.Worker.Helpers.BuildOutputShaper.TryRewriteErrorLocation(
+                        rawErr, status.CurrentObject, status.Phase, out rewritten);
+                    string surface = didRewrite ? rewritten : rawErr;
+                    if (status.Errors.Count < 50) status.Errors.Add(surface);
+                    if (status.ErrorsDetailed.Count < 50)
+                    {
+                        status.ErrorsDetailed.Add(new ErrorDetail
+                        {
+                            raw = rawErr,
+                            rewritten = didRewrite ? rewritten : null,
+                            phase = status.Phase,
+                            gxObject = status.CurrentObject
+                        });
+                    }
+
+                    // CS0246: missing type — wrapper class for an un-built object.
+                    var cs0246 = _rxCs0246Missing.Match(line);
+                    if (cs0246.Success)
+                    {
+                        var norm = NormalizeMissingObjectName(cs0246.Groups[1].Value, _indexCacheService);
+                        if (!string.IsNullOrEmpty(norm) && status.SuggestedRebuildTargets.Count < 50)
+                            status.SuggestedRebuildTargets.Add(norm);
+                    }
+                    // CS2001: missing source file — extract <obj> from "<obj>_bc.cs" / "<obj>.cs".
+                    var cs2001 = _rxCs2001Missing.Match(line);
+                    if (cs2001.Success)
+                    {
+                        var file = cs2001.Groups[1].Value;
+                        var slash = Math.Max(file.LastIndexOf('\\'), file.LastIndexOf('/'));
+                        var bare = slash >= 0 ? file.Substring(slash + 1) : file;
+                        if (bare.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                            bare = bare.Substring(0, bare.Length - 3);
+                        var norm = NormalizeMissingObjectName(bare, _indexCacheService);
+                        if (!string.IsNullOrEmpty(norm) && status.SuggestedRebuildTargets.Count < 50)
+                            status.SuggestedRebuildTargets.Add(norm);
+                    }
                 }
                 else if (_rxWarning.IsMatch(line))
                 {
                     status.WarningCount++;
                     if (status.Warnings.Count < 50) status.Warnings.Add(line.Trim());
+                }
+                }
+                finally
+                {
+                    // Stream F: fire signal exactly once per HandleLine when the
+                    // wait-baseline shifted. Reset+Set so wait callers see an edge
+                    // even if another thread is still inside Wait().
+                    if (!string.Equals(baselineBefore, status.ComputeBaseline(), StringComparison.Ordinal))
+                    {
+                        try { status.StateChangeSignal.Set(); } catch { }
+                    }
                 }
             }
         }
@@ -646,6 +1104,7 @@ namespace GxMcp.Worker.Services
             status.Error = error;
             status.EndTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             status.ElapsedSeconds = Math.Round((DateTime.UtcNow - status.StartedAt).TotalSeconds, 1);
+            try { status.StateChangeSignal.Set(); } catch { }
         }
 
         public string GetKBPath()

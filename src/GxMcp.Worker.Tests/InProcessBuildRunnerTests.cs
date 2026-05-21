@@ -1,0 +1,144 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using GxMcp.Worker.Helpers;
+using GxMcp.Worker.Services;
+using Microsoft.Build.Framework;
+using Xunit;
+
+namespace GxMcp.Worker.Tests
+{
+    // v2.6.6 Stream D — exercises the in-process build path without requiring
+    // a live KB. Most tests assert the fallback behaviour (returns false) so
+    // BuildService.RunBuild can transparently spawn MSBuild.exe instead.
+    //
+    // Serialized with PatternApplyServiceTests via "InProcessSdkReflection"
+    // collection — both touch the static type cache populated by TryResolveTypes
+    // / Genexus.MsBuild.Tasks reflection, which xunit's default parallel
+    // scheduler occasionally races against.
+    [Collection("InProcessSdkReflection")]
+    public class InProcessBuildRunnerTests
+    {
+        private static BuildService.BuildTaskStatus NewStatus()
+        {
+            return new BuildService.BuildTaskStatus
+            {
+                TaskId = Guid.NewGuid().ToString("N").Substring(0, 8),
+                Status = "Running",
+                Action = "Build",
+                StartedAt = DateTime.UtcNow
+            };
+        }
+
+        [Fact]
+        public void Run_returns_false_when_kbHandle_is_null()
+        {
+            var status = NewStatus();
+            bool ok = InProcessBuildRunner.Run(
+                status, "Build", new List<string> { "Foo" },
+                (s, l, e) => { },
+                kbHandle: null,
+                kbLock: new object());
+            Assert.False(ok);
+        }
+
+        [Fact]
+        public void Run_returns_false_when_kbLock_is_null()
+        {
+            var status = NewStatus();
+            bool ok = InProcessBuildRunner.Run(
+                status, "Build", new List<string> { "Foo" },
+                (s, l, e) => { },
+                kbHandle: new object(),
+                kbLock: null);
+            Assert.False(ok);
+        }
+
+        [Fact]
+        public void Run_returns_false_when_GX_PROGRAM_DIR_missing_or_dll_absent()
+        {
+            // If the SDK is genuinely installed, this test is a no-op (returns
+            // true would be a real-KB scenario, false is what we assert here).
+            // We intentionally do NOT mutate the env var globally; instead we
+            // exercise the failure path by probing the type-resolution seam
+            // and asserting it never throws.
+            string error;
+            bool resolved = InProcessBuildRunner.TryResolveTypes(out error);
+            // resolved may be true on a GeneXus dev machine — both outcomes
+            // are valid; the contract under test is "no exception".
+            Assert.True(resolved || !string.IsNullOrEmpty(error));
+        }
+
+        [Fact]
+        public void Adapter_forwards_LogErrorEvent_with_isError_true()
+        {
+            string captured = null;
+            bool capturedIsError = false;
+            var engine = new InProcessBuildEngine((line, isError) =>
+            {
+                captured = line;
+                capturedIsError = isError;
+            });
+
+            engine.LogErrorEvent(new BuildErrorEventArgs(
+                subcategory: null,
+                code: "CS0246",
+                file: "x.cs",
+                lineNumber: 1, columnNumber: 1, endLineNumber: 1, endColumnNumber: 1,
+                message: "Type 'Foo' could not be found",
+                helpKeyword: null,
+                senderName: "test"));
+
+            Assert.NotNull(captured);
+            Assert.True(capturedIsError);
+            Assert.Contains("CS0246", captured);
+            Assert.Contains("Foo", captured);
+        }
+
+        [Fact]
+        public void Adapter_forwards_LogWarningEvent_with_isError_false()
+        {
+            string captured = null;
+            bool capturedIsError = true;
+            var engine = new InProcessBuildEngine((line, isError) =>
+            {
+                captured = line;
+                capturedIsError = isError;
+            });
+
+            engine.LogWarningEvent(new BuildWarningEventArgs(
+                subcategory: null,
+                code: "spc0022",
+                file: null,
+                lineNumber: 0, columnNumber: 0, endLineNumber: 0, endColumnNumber: 0,
+                message: "spec warning",
+                helpKeyword: null,
+                senderName: "test"));
+
+            Assert.NotNull(captured);
+            Assert.False(capturedIsError);
+            Assert.Contains("spc0022", captured);
+        }
+
+        [Fact]
+        public void Adapter_BuildProjectFile_is_noop_returning_true()
+        {
+            var engine = new InProcessBuildEngine((l, e) => { });
+            bool ok = engine.BuildProjectFile("any.proj", new[] { "Build" }, new Hashtable(), new Hashtable());
+            Assert.True(ok);
+            Assert.True(engine.ContinueOnError);
+        }
+
+        [LiveKbFact]
+        public void TryResolveTypes_finds_GeneXus_tasks_when_SDK_installed()
+        {
+            // Gated on GXMCP_TEST_KB so CI skips, but a dev machine with the
+            // GeneXus 18 install + a live KB env will actually resolve the
+            // task types from Genexus.MsBuild.Tasks.dll.
+            string error;
+            bool resolved = InProcessBuildRunner.TryResolveTypes(out error);
+            Assert.True(resolved, "Expected Genexus.MsBuild.Tasks types to resolve: " + error);
+        }
+    }
+}

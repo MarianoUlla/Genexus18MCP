@@ -20,6 +20,16 @@ namespace GxMcp.Worker.Helpers
         private static readonly BlockingCollection<string> _queue = new BlockingCollection<string>();
         private static readonly Thread _writer;
 
+        // FR#24 (v2.6.6 Stream C): per-phase log tag, propagated via AsyncLocal so
+        // BuildService updates affect background tasks too. Setter is internal so
+        // only the worker can mutate it; foreign callers see a read-only surface.
+        private static readonly AsyncLocal<string> _currentPhase = new AsyncLocal<string>();
+        public static string CurrentPhase
+        {
+            get { return _currentPhase.Value; }
+            internal set { _currentPhase.Value = value; }
+        }
+
         static Logger()
         {
             // Preserve the previous log rotation behaviour (rename existing file to .prev.log).
@@ -60,8 +70,14 @@ namespace GxMcp.Worker.Helpers
 
         private static void Enqueue(string level, string message)
         {
-            string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
-            string line = $"[{timestamp}] [{level}] {message}";
+            // ISO-8601 with milliseconds + offset so build phase stalls diff
+            // cleanly against external clocks; phase tag lets the agent grep
+            // a build trace by phase. Phase-empty case avoids the "[" + phase
+            // + "]" intermediate alloc; build emits thousands of lines.
+            string phase = _currentPhase.Value;
+            string line = string.IsNullOrEmpty(phase)
+                ? string.Format("[{0:yyyy-MM-ddTHH:mm:ss.fffzzz}] [{1}] [] {2}", DateTimeOffset.Now, level, message)
+                : string.Format("[{0:yyyy-MM-ddTHH:mm:ss.fffzzz}] [{1}] [{2}] {3}", DateTimeOffset.Now, level, phase, message);
 
             // Surface to stderr synchronously (cheap, non-blocking on the OS level) so the
             // Gateway captures the line immediately even if the file writer is behind.

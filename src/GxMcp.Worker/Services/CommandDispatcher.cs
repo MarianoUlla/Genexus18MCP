@@ -262,6 +262,26 @@ namespace GxMcp.Worker.Services
                             return _kbService.BulkIndex(force);
                         }
                         if (action == "SelfTest") return _selfTestService.RunAllTests();
+                        // v2.6.6 Stream H (FR#26) — surface active-environment metadata
+                        // so the gateway can populate KbHandle.ActiveEnvironment on
+                        // cache miss. Pure SDK read, no side effects.
+                        if (action == "GetActiveEnvironment")
+                        {
+                            string env = _kbService.GetActiveEnvironment();
+                            string ver = _kbService.GetActiveEnvironmentVersion();
+                            return new JObject
+                            {
+                                ["environment"] = env,
+                                ["version"] = ver
+                            }.ToString(Newtonsoft.Json.Formatting.None);
+                        }
+                        // v2.6.6 Stream H (FR#25) — F5 launcher resolver. Returns the KB's
+                        // configured startup object (or first IsMain-tagged WebPanel/SDPanel/Procedure).
+                        if (action == "GetLauncherObject")
+                        {
+                            string launcherObj = _kbService.GetLauncherObjectName();
+                            return new JObject { ["name"] = launcherObj }.ToString(Newtonsoft.Json.Formatting.None);
+                        }
                         if (action == "GetIndexStatus") return _kbService.GetIndexStatus();
                         if (action == "GetIndexState")
                         {
@@ -387,7 +407,28 @@ namespace GxMcp.Worker.Services
                         if (action == "Read") return _objectService.ReadObject(target, args?["type"]?.ToString());
                         if (action == "Create") return _objectService.CreateObject(args?["type"]?.ToString(), target, args);
                         if (action == "Delete") return _objectService.DeleteObject(target, args?["type"]?.ToString(), args?["confirm"]?.ToObject<bool?>() ?? false);
-                        if (action == "WorkerReload") return _objectService.WorkerReload(args?["sourceDir"]?.ToString());
+                        if (action == "WorkerReload")
+                        {
+                            // FR#20 (v2.6.6 Stream B): mode=soft is the new default — drain
+                            // in-flight commands and exit code 0 so the gateway respawns
+                            // without losing JobRegistry state. mode=hard preserves the
+                            // legacy copy-binaries-and-kill flow (still required when the
+                            // caller passed a sourceDir of fresh bits to lay down).
+                            string mode = args?["mode"]?.ToString()?.Trim().ToLowerInvariant();
+                            string srcDir = args?["sourceDir"]?.ToString();
+                            if (string.IsNullOrEmpty(mode))
+                            {
+                                // Negotiate: hard when sourceDir is supplied (copy-binaries
+                                // intent), otherwise soft (clean respawn for state reset).
+                                mode = string.IsNullOrWhiteSpace(srcDir) ? "soft" : "hard";
+                            }
+                            if (mode == "soft")
+                            {
+                                int drainMs = args?["drainTimeoutMs"]?.ToObject<int?>() ?? 30000;
+                                return GxMcp.Worker.Program.PerformSoftReload(drainMs);
+                            }
+                            return _objectService.WorkerReload(srcDir);
+                        }
                         if (action == "ReadLogs") return _objectService.ReadLogs(
                             args?["lines"]?.ToObject<int?>() ?? 50,
                             args?["filterCorrelation"]?.ToString(),
@@ -470,18 +511,37 @@ namespace GxMcp.Worker.Services
                         if (action == "Apply") return _writeService.ApplyJsonPatch(args ?? request);
                         break;
                     case "patch":
-                        if (action == "Apply") return _patchService.ApplyPatch(
-                            target,
-                            args?["part"]?.ToString(),
-                            args?["operation"]?.ToString(),
-                            payload,
-                            args?["context"]?.ToString(),
-                            args?["expectedCount"]?.ToObject<int?>() ?? 1,
-                            args?["type"]?.ToString(),
-                            args?["dryRun"]?.ToObject<bool?>() ?? false,
-                            args?["verifyRollback"]?.ToObject<bool?>() ?? false,
-                            args?["return_post_state"]?.ToObject<bool?>() ?? true,
-                            args?["verbose"]?.ToObject<bool?>() ?? false);
+                        if (action == "Apply")
+                        {
+                            // v2.6.6 FR#13 follow-up: validate=only is the LLM-facing
+                            // contract for "run the patch in-memory, do NOT persist".
+                            // Stream A only plumbed validate through ApplySemanticOps
+                            // (mode=ops). For mode=patch, validate=only maps to
+                            // dryRun=true — the PatchService.ApplyPatch dryRun branch
+                            // returns the exact "Applied / write skipped" envelope the
+                            // validate=only schema promises. validate=best-effort and
+                            // validate=strict (the default) both fall through to the
+                            // current strict path: IsPatchWriteSafe already refuses
+                            // unsafe writes on NoMatch and surfaces the diagnostic
+                            // envelope, so the two are observationally equivalent in
+                            // mode=patch and we don't need a third branch.
+                            string validateMode = args?["validate"]?.ToString();
+                            bool dryRunArg = args?["dryRun"]?.ToObject<bool?>() ?? false;
+                            bool validateOnly = string.Equals(validateMode, "only", StringComparison.OrdinalIgnoreCase)
+                                                || string.Equals(validateMode, "validate-only", StringComparison.OrdinalIgnoreCase);
+                            return _patchService.ApplyPatch(
+                                target,
+                                args?["part"]?.ToString(),
+                                args?["operation"]?.ToString(),
+                                payload,
+                                args?["context"]?.ToString(),
+                                args?["expectedCount"]?.ToObject<int?>() ?? 1,
+                                args?["type"]?.ToString(),
+                                dryRunArg || validateOnly,
+                                args?["verifyRollback"]?.ToObject<bool?>() ?? false,
+                                args?["return_post_state"]?.ToObject<bool?>() ?? true,
+                                args?["verbose"]?.ToObject<bool?>() ?? false);
+                        }
                         break;
                     case "analyze":
                         var analyzeType = args?["type"]?.ToString();
@@ -503,6 +563,7 @@ namespace GxMcp.Worker.Services
                             return _dataInsightService.GetTableDDL(target, includeSub);
                         }
                         if (action == "ExplainCode") return _analyzeService.ExplainCode(target, payload);
+                        if (action == "ParentContext") return _analyzeService.ParentContext(target);
                         if (action == "ImpactAnalysis")
                         {
                             // v2.3.8 (Task 1.4): index-aware impact with optional wait-for-index.
@@ -658,10 +719,21 @@ namespace GxMcp.Worker.Services
                         if (action == "GetLogicStructure") return _structureService.GetLogicStructure(target);
                         break;
                     case "build":
-                        if (action == "Status") return _buildService.GetStatus(
-                            target,
-                            args?["page"]?.ToObject<int?>() ?? 1,
-                            args?["pageSize"]?.ToObject<int?>() ?? 50);
+                        if (action == "Status")
+                        {
+                            // v2.6.6 Stream F: event-driven long-poll. When `wait` is 0/absent
+                            // GetStatusWait short-circuits to the legacy GetStatus shape; >0
+                            // blocks on the per-task StateChangeSignal up to 300s.
+                            int wait = args?["wait"]?.ToObject<int?>() ?? 0;
+                            string since = args?["since"]?.ToString();
+                            return _buildService.GetStatusWait(
+                                target,
+                                wait,
+                                since,
+                                args?["page"]?.ToObject<int?>() ?? 1,
+                                args?["pageSize"]?.ToObject<int?>() ?? 50,
+                                args?["compact"]?.ToObject<bool?>() ?? false);
+                        }
                         if (action == "Result") return _buildService.GetResult(
                             target,
                             args?["page"]?.ToObject<int?>() ?? 1,
@@ -685,8 +757,15 @@ namespace GxMcp.Worker.Services
                     case "health":
                         return _healthService.GetHealthReport();
                     case "history":
-                        int verId = args?["versionId"]?.ToObject<int?>() ?? 0;
-                        return _historyService.Execute(target, action, verId);
+                        {
+                            int verId = args?["versionId"]?.ToObject<int?>() ?? 0;
+                            // v2.6.6 Stream H (FR#28) — forward discard + snapshot + part
+                            // so HistoryService can route restore through EditSnapshotStore.
+                            string partName = args?["part"]?.ToString();
+                            string snapshotToken = args?["snapshot"]?.ToString();
+                            bool discard = args?["discard"]?.ToObject<bool?>() ?? false;
+                            return _historyService.Execute(target, action, verId, partName, snapshotToken, discard);
+                        }
                     case "property":
                         var propType = args?["type"]?.ToString();
                         if (action == "Set")
@@ -738,7 +817,7 @@ namespace GxMcp.Worker.Services
                         }
                         break;
                     case "preview":
-                        if (action == "Render")
+                        if (action == "Render" || action == "Run")
                         {
                             string previewName = target ?? args?["name"]?.ToString();
                             var previewParms = args?["parms"] as JObject;
@@ -748,7 +827,16 @@ namespace GxMcp.Worker.Services
                             string[] capture = (args?["capture"] as JArray)?.Select(t => t.ToString()).ToArray();
                             bool diffBaseline = args?["diffBaseline"]?.ToObject<bool?>() ?? false;
                             bool updateBaseline = args?["updateBaseline"]?.ToObject<bool?>() ?? false;
-                            var previewTask = _previewService.PreviewAsync(previewName, previewParms, launcher, buildFirst, waitMs, capture, diffBaseline, updateBaseline);
+                            // Stream G (v2.6.6): GX-aware fill/click + GAM auth.
+                            var fill = args?["fill"] as JObject;
+                            string click = args?["click"]?.ToString();
+                            var auth = args?["auth"] as JObject;
+                            // v2.6.6 Stream H (FR#25): action=Run resolves the
+                            // KB launcher object when target is omitted; action=Render
+                            // requires an explicit target as before.
+                            var previewTask = action == "Run"
+                                ? _previewService.RunAsync(previewName, previewParms, launcher, buildFirst, waitMs, capture, diffBaseline, updateBaseline, fill, click, auth)
+                                : _previewService.PreviewAsync(previewName, previewParms, launcher, buildFirst, waitMs, capture, diffBaseline, updateBaseline, fill, click, auth);
                             previewTask.Wait();
                             return previewTask.Result.ToString(Newtonsoft.Json.Formatting.None);
                         }

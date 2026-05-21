@@ -55,7 +55,15 @@ namespace GxMcp.Gateway.Tests
             //   v2.6.4 (LLM-UX pass): 6300 → 6700 for new genexus_recipe tool, apply_pattern `validate`
             //   flag + parent-type routing hint, create_object/edit/whoami description front-loading.
             //   Net ~+230 tokens; budget set conservatively at 6700.
-            Assert.True(approxTokens < 6700, $"tool_definitions.json is ~{approxTokens} tokens; budget 6700.");
+            //   v2.6.6 (Stream A FR#13): 6700 → 6800 for genexus_edit `validate` enum
+            //   (strict|best-effort|only) declaration. Net ~+60 tokens.
+            //   v2.6.6 (Stream F FR#19 follow-up): 6800 → 6900 for `wait`/`since` on
+            //   genexus_lifecycle action=status (event-driven long-poll on worker taskId).
+            //   Net ~+45 tokens.
+            //   v2.6.6 (Stream H FR#25/#28): 6900 → 7200 for genexus_preview action=run
+            //   (F5 launcher resolution) plus genexus_history discard/snapshot/part
+            //   (IDE Discard-changes parity) declarations. Net ~+210 tokens.
+            Assert.True(approxTokens < 7200, $"tool_definitions.json is ~{approxTokens} tokens; budget 7200.");
         }
     }
 }

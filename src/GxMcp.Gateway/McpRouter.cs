@@ -98,6 +98,59 @@ namespace GxMcp.Gateway
 
             LoadToolDefinitions();
             SetupToolDefinitionsWatcher();
+            AssertNoDuplicateRouterCoverage();
+        }
+
+        // v2.6.6 router-dup guard: each tool must be claimed by AT MOST one router.
+        // The router list is iterated in order and the first non-null return wins, so
+        // a duplicate doesn't fail at runtime — it silently strips fields that the
+        // losing router would have forwarded. The genexus_history live bug (Stream H
+        // forwarded `discard`/`part`/`snapshot` in OperationsRouter but SystemRouter
+        // had a legacy duplicate that ran first and dropped them) cost us a release
+        // pass. Detecting at startup turns the bug class into a fail-fast.
+        private static void AssertNoDuplicateRouterCoverage()
+        {
+            try
+            {
+                if (_toolDefinitions == null || _toolDefinitions.Count == 0) return;
+                var duplicates = new List<string>();
+                foreach (var def in _toolDefinitions.OfType<JObject>())
+                {
+                    string toolName = def["name"]?.ToString();
+                    if (string.IsNullOrEmpty(toolName)) continue;
+                    int hits = 0;
+                    var claimers = new List<string>();
+                    foreach (var router in _routers)
+                    {
+                        try
+                        {
+                            // null arguments — routers that read args?[...] tolerate this;
+                            // ones that throw are treated as "did not claim".
+                            object result = router.ConvertToolCall(toolName, null);
+                            if (result != null) { hits++; claimers.Add(router.GetType().Name); }
+                        }
+                        catch { /* throwing router doesn't claim the tool */ }
+                    }
+                    if (hits > 1)
+                    {
+                        duplicates.Add(toolName + " → " + string.Join(", ", claimers));
+                    }
+                }
+                if (duplicates.Count > 0)
+                {
+                    string msg = "[McpRouter] FATAL: duplicate router coverage detected. "
+                               + "Each tool must be claimed by exactly one router. Offenders: "
+                               + string.Join(" | ", duplicates);
+                    Program.Log(msg);
+                    throw new InvalidOperationException(msg);
+                }
+                Program.Log($"[McpRouter] Router-dup guard OK ({_toolDefinitions.Count} tools, {_routers.Count} routers).");
+            }
+            catch (InvalidOperationException) { throw; }
+            catch (Exception ex)
+            {
+                Program.Log("[McpRouter] router-dup guard self-check failed: " + ex.Message);
+            }
         }
 
         private static void LoadToolDefinitions()

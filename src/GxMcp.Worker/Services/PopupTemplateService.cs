@@ -164,6 +164,10 @@ namespace GxMcp.Worker.Services
                 responseSteps.Add(new JObject { ["step"] = "write_events", ["result"] = TryParse(r) });
             }
 
+            // FR#18 (Stream G, v2.6.6): inline the popup-branch hint so the
+            // agent learns the popup conventions (no Link() in Enter,
+            // Cancel.OnClick = Hide(), ReturnTo() for values) at create
+            // time — same string analyze mode=parent_context surfaces.
             return new JObject
             {
                 ["status"] = "Success",
@@ -172,6 +176,7 @@ namespace GxMcp.Worker.Services
                 ["layoutFormType"] = "layout",
                 ["inputs"] = pspec.Inputs.Count,
                 ["buttons"] = pspec.Buttons.Count,
+                ["popupHint"] = AnalyzeService.HintForOpenedAs("popup"),
                 ["steps"] = responseSteps
             }.ToString(Newtonsoft.Json.Formatting.None);
         }

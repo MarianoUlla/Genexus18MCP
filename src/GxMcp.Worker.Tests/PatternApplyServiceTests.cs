@@ -21,6 +21,12 @@ namespace GxMcp.Worker.Tests
     //  - engine throws → surfaced as Error envelope (not bubbled)
     //
     // Real end-to-end apply on a live KB is gated on Skip="no WWP license".
+    //
+    // v2.6.6: serialized with InProcessBuildRunnerTests via a shared xunit
+    // Collection because both touch static SDK-reflection probes that race
+    // under xunit's default parallel scheduler. Reliably green either alone
+    // or in a clean run; the Collection just removes the race window.
+    [Collection("InProcessSdkReflection")]
     public class PatternApplyServiceTests
     {
         private const string ObjName = "SomeTransaction";

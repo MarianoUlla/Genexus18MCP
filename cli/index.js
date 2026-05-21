@@ -43,6 +43,7 @@ const GLOBAL_DEFAULTS = {
     clients: null,
     allClients: false,
     mcpSmoke: false,
+    dump: false,
     noSmoke: false,
     warm: false,
     yes: false,
@@ -267,6 +268,9 @@ function parseArgs(argv) {
                 break;
             case 'mcp-smoke':
                 result.options.mcpSmoke = true;
+                break;
+            case 'dump':
+                result.options.dump = true;
                 break;
             case 'no-smoke':
                 result.options.noSmoke = true;

@@ -122,6 +122,59 @@ namespace GxMcp.Worker.Services
             return callees.ToList();
         }
 
+        // v2.6.6 Stream E (FR#8): when a Transaction has BC enabled the GeneXus
+        // compiler emits an <name>_bc class that must be built alongside the
+        // Transaction itself. The CallerGraph BFS misses this because the _bc
+        // variant is not a callee — it's a sibling compile unit. This helper
+        // returns the implicit BC variant targets the build expansion should
+        // prepend (so the _bc compiles before the trn that consumes it).
+        //
+        // Heuristic (no HasBc field on IndexEntry yet):
+        //   1. <transactionName> exists in the index as Type=Transaction, AND
+        //   2. <transactionName>_bc exists in the index (any type).
+        // Returns the bc variant name(s); empty list when no match.
+        public List<string> GetBcVariantTargets(string transactionName)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrEmpty(transactionName) || _index == null) return result;
+            try
+            {
+                var idx = _index.GetIndex();
+                if (idx?.Objects == null) return result;
+
+                // Find the requested name (case-insensitive).
+                SearchIndex.IndexEntry trn = null;
+                foreach (var v in idx.Objects.Values)
+                {
+                    if (v == null || string.IsNullOrEmpty(v.Name)) continue;
+                    if (string.Equals(v.Name, transactionName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        trn = v;
+                        break;
+                    }
+                }
+                if (trn == null) return result;
+                if (!string.Equals(trn.Type, "Transaction", StringComparison.OrdinalIgnoreCase)) return result;
+
+                string bcName = transactionName + "_bc";
+                foreach (var v in idx.Objects.Values)
+                {
+                    if (v == null || string.IsNullOrEmpty(v.Name)) continue;
+                    if (string.Equals(v.Name, bcName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result.Add(v.Name);
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                GxMcp.Worker.Helpers.Logger.Warn(
+                    "[GetBcVariantTargets] lookup failed for '" + transactionName + "': " + ex.Message);
+            }
+            return result;
+        }
+
         // BFS over callers (reverse edges), capped at maxNodes (exclusive of the root). Cycle-safe.
         // v2.3.8 (Task 1.4): symmetric to GetCalleesTransitive. AnalyzeService.ImpactAnalysis
         // previously inlined this BFS over CalledBy; it now delegates here.

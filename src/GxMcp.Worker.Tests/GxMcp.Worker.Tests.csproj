@@ -34,5 +34,6 @@
       <HintPath>$(GX_PATH)\Artech.Architecture.Common.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="Microsoft.Build.Framework" />
   </ItemGroup>
 </Project>

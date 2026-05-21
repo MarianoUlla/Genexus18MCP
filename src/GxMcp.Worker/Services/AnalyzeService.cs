@@ -1085,6 +1085,151 @@ namespace GxMcp.Worker.Services
             return tables;
         }
 
+        // ----------------------------------------------------------------
+        // FR#18 (Stream G, v2.6.6) — analyze mode=parent_context.
+        // Walks IndexCacheService.GetIndex().Objects[target].CalledBy and
+        // classifies each caller by inspecting its Source / Events /
+        // Conditions parts for popup vs link invocations.
+        //
+        // Returns shape:
+        //   { openedAs, popupCallers[], standaloneCallers[], hint }
+        //
+        // A sourceResolver seam lets unit tests inject synthetic source
+        // without standing up a KB; default delegates to ObjectService.
+        // ----------------------------------------------------------------
+        public string ParentContext(string target)
+        {
+            return ParentContext(target, null);
+        }
+
+        internal string ParentContext(string target, Func<string, string, string> sourceResolver)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(target))
+                    return "{\"status\":\"Error\",\"error\":\"target is required\"}";
+
+                var index = _indexCacheService?.GetIndex();
+                if (index == null || index.Objects == null)
+                    return Models.McpResponse.Error("Index not found", target, null, "Run the KB indexing flow before requesting parent_context analysis.");
+
+                // Resolve the target entry (4-stage same as ImpactAnalysis).
+                var entry = ResolveIndexEntry(index, target, out var _);
+                if (entry == null)
+                {
+                    return new JObject
+                    {
+                        ["openedAs"] = "unknown",
+                        ["popupCallers"] = new JArray(),
+                        ["standaloneCallers"] = new JArray(),
+                        ["hint"] = HintForOpenedAs("unknown"),
+                        ["note"] = "Target '" + target + "' not in index. Re-run after `genexus_lifecycle action=index` completes."
+                    }.ToString();
+                }
+                string canonicalName = entry.Name ?? target;
+                var callers = entry.CalledBy ?? new List<string>();
+
+                // Default resolver: best-effort over ObjectService source parts.
+                if (sourceResolver == null)
+                {
+                    sourceResolver = (callerName, partName) =>
+                    {
+                        try
+                        {
+                            if (_objectService == null) return null;
+                            return _objectService.ReadObjectSource(callerName, partName);
+                        }
+                        catch { return null; }
+                    };
+                }
+
+                // Regex set — built per target so we can use the canonical name.
+                string esc = System.Text.RegularExpressions.Regex.Escape(canonicalName);
+                var rePopupDot = new System.Text.RegularExpressions.Regex(
+                    "\\b" + esc + "\\.PopUp\\s*\\(",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var rePopupCtx = new System.Text.RegularExpressions.Regex(
+                    "\\b(?:context|gx|gxContext)\\.PopUp\\s*\\(\\s*[\"']?" + esc,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var reLink = new System.Text.RegularExpressions.Regex(
+                    "\\b" + esc + "\\.Link\\s*\\(",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var reNew = new System.Text.RegularExpressions.Regex(
+                    "&\\w+\\s*=\\s*new\\s+" + esc + "\\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                var popupCallers = new List<string>();
+                var standaloneCallers = new List<string>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var caller in callers)
+                {
+                    if (string.IsNullOrWhiteSpace(caller) || !seen.Add(caller)) continue;
+
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var partName in new[] { "Source", "Events", "Conditions" })
+                    {
+                        string src = null;
+                        try { src = sourceResolver(caller, partName); } catch { }
+                        if (!string.IsNullOrEmpty(src)) sb.Append(src).Append('\n');
+                    }
+                    string combined = sb.ToString();
+                    if (string.IsNullOrEmpty(combined)) continue;
+
+                    bool isPopup = rePopupDot.IsMatch(combined) || rePopupCtx.IsMatch(combined);
+                    if (isPopup)
+                    {
+                        popupCallers.Add(caller);
+                        continue;
+                    }
+                    bool isStandalone = reLink.IsMatch(combined) || reNew.IsMatch(combined);
+                    if (isStandalone) standaloneCallers.Add(caller);
+                    // unmatched → silently ignored per spec
+                }
+
+                string openedAs;
+                if (popupCallers.Count > 0 && standaloneCallers.Count > 0) openedAs = "both";
+                else if (popupCallers.Count > 0) openedAs = "popup";
+                else if (standaloneCallers.Count > 0) openedAs = "standalone";
+                else openedAs = "unknown";
+
+                var pArr = new JArray(); foreach (var c in popupCallers) pArr.Add(c);
+                var sArr = new JArray(); foreach (var c in standaloneCallers) sArr.Add(c);
+
+                return new JObject
+                {
+                    ["target"] = canonicalName,
+                    ["openedAs"] = openedAs,
+                    ["popupCallers"] = pArr,
+                    ["standaloneCallers"] = sArr,
+                    ["hint"] = HintForOpenedAs(openedAs)
+                }.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"status\":\"Error\",\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
+            }
+        }
+
+        /// <summary>
+        /// FR#18 hint table. Public so PopupTemplateService can echo the
+        /// popup-branch hint in its create-popup response envelope.
+        /// </summary>
+        public static string HintForOpenedAs(string openedAs)
+        {
+            switch ((openedAs ?? "").ToLowerInvariant())
+            {
+                case "popup":
+                    return "Opened as popup. Do NOT use Link() in Enter event handlers — it loops because the popup is already a Link() target. Use Cancel.OnClick = Hide() and ReturnTo() to return values. Forms inside the popup should commit via the popup's own confirmation button.";
+                case "standalone":
+                    return "Opened as standalone (Link). Standard form-submit + Link() patterns apply. ReturnTo() in this context will return to the previous page rather than a popup parent.";
+                case "both":
+                    return "Called from both popup and standalone sites. Use IsPopUp() at runtime to branch behavior; treat Cancel.OnClick and Enter event flows defensively.";
+                default:
+                    return "No callers discovered (callers may exist outside the indexed set, or the object is a launcher). Re-run after `genexus_lifecycle action=index` completes.";
+            }
+        }
+
         public string ExplainCode(string target, string codeSnippet)
         {
             // analyze mode=explain was a placeholder that returned a hardcoded

@@ -41,6 +41,13 @@ namespace GxMcp.Worker.Services
         public string IndexStatus => _currentStatus;
         public bool IsOpen { get { lock (_kbLock) { return _kb != null; } } }
 
+        // v2.6.6 Stream D — expose the open KB handle + lock so BuildService can
+        // run GeneXus MSBuild tasks in-process against the same KB instance
+        // instead of spawning MSBuild.exe + reopening the KB out-of-process.
+        // Callers MUST hold KbLock for the duration of any task.Execute() call.
+        public object KbObject { get { lock (_kbLock) { return (object)_kb; } } }
+        public object KbLock => _kbLock;
+
         public string GetKbPath()
         {
             lock (_kbLock)
@@ -570,6 +577,90 @@ namespace GxMcp.Worker.Services
             json["status"] = _currentStatus;
             json["isBusy"] = _isIndexing || _isOpenInProgress;
             return json.ToString();
+        }
+
+        // -----------------------------------------------------------------
+        // v2.6.6 Stream H (FR#26) — active-environment cache surface.
+        //
+        // Worker-side resolver. The gateway calls this on cache miss; the
+        // KbHandle holds the value for 60s and serves subsequent reads in
+        // O(1). KbWatcherService.OnEnvironmentChanged invalidates the
+        // gateway cache when the SDK fires its environment-changed event.
+        // -----------------------------------------------------------------
+        public string GetActiveEnvironment()
+        {
+            lock (_kbLock)
+            {
+                if (_kb == null) return null;
+                // SDK exposes multiple shapes across major versions; probe in order
+                // and swallow individually so a missing property on one branch
+                // doesn't strand the whole call.
+                try { var v = _kb.Environment?.Name; if (v != null) return v.ToString(); } catch { }
+                try { var v = _kb.UserInterface?.ActiveEnvironment?.Name; if (v != null) return v.ToString(); } catch { }
+                try { var v = _kb.DesignModel?.Environment?.Name; if (v != null) return v.ToString(); } catch { }
+                try { var v = _kb.ActiveModel?.Name; if (v != null) return v.ToString(); } catch { }
+                return null;
+            }
+        }
+
+        public string GetActiveEnvironmentVersion()
+        {
+            lock (_kbLock)
+            {
+                if (_kb == null) return null;
+                try { var v = _kb.Environment?.Version; if (v != null) return v.ToString(); } catch { }
+                try { var v = _kb.UserInterface?.ActiveEnvironment?.Version; if (v != null) return v.ToString(); } catch { }
+                try { var v = _kb.ActiveModel?.Version; if (v != null) return v.ToString(); } catch { }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// v2.6.6 Stream H (FR#25) — F5 launcher resolver.
+        ///
+        /// Mirrors the IDE's F5/Run behaviour: pick the KB's configured
+        /// startup/main object. Probes the SDK first; falls back to the
+        /// in-memory index for the first object whose Tags contain "Main"
+        /// (the same heuristic <c>HealthService.IsMainObject</c> uses).
+        /// Returns <c>null</c> when no candidate exists — callers surface
+        /// a <c>NoLauncher</c> envelope rather than guessing wrong.
+        /// </summary>
+        public string GetLauncherObjectName()
+        {
+            lock (_kbLock)
+            {
+                if (_kb != null)
+                {
+                    try { var v = _kb.DefaultStartupObject?.Name; if (!string.IsNullOrEmpty((string)v)) return (string)v; } catch { }
+                    try { var v = _kb.UserInterface?.MainObject?.Name; if (!string.IsNullOrEmpty((string)v)) return (string)v; } catch { }
+                    try { var v = _kb.MainObject?.Name; if (!string.IsNullOrEmpty((string)v)) return (string)v; } catch { }
+                }
+            }
+
+            // Fall back to the index — first "Main"-tagged WebPanel/SDPanel
+            // wins (matches HealthService.IsMainObject heuristic). Reads the
+            // index outside the kb lock to keep startup-thread contention low.
+            try
+            {
+                var idx = _indexCacheService?.GetIndex();
+                if (idx == null) return null;
+                foreach (var entry in idx.Objects.Values)
+                {
+                    if (entry == null) continue;
+                    bool isMain = (entry.Tags != null && entry.Tags.Any(t => t.Equals("Main", StringComparison.OrdinalIgnoreCase)))
+                               || (entry.Description != null && entry.Description.IndexOf("main", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (!isMain) continue;
+                    string type = entry.Type ?? string.Empty;
+                    if (type.Equals("WebPanel", StringComparison.OrdinalIgnoreCase)
+                        || type.Equals("SDPanel", StringComparison.OrdinalIgnoreCase)
+                        || type.Equals("Procedure", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return entry.Name;
+                    }
+                }
+            }
+            catch (Exception ex) { Logger.Debug("GetLauncherObjectName fallback failed: " + ex.Message); }
+            return null;
         }
 
         public string EnsureNotIndexing()
