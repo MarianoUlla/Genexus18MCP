@@ -10,6 +10,18 @@ namespace GxMcp.Worker.Services
         private readonly LinkedList<string> _lru = new LinkedList<string>();
         private readonly object _lock = new object();
 
+        // PERFORMANCE (observability): track cache hit/miss/eviction counts so a degraded
+        // hit ratio (e.g. capacity too small for the query mix) is visible from whoami /
+        // gateway:metrics without standing up an external profiler.
+        private long _hits;
+        private long _misses;
+        private long _evictions;
+        public long Hits => System.Threading.Interlocked.Read(ref _hits);
+        public long Misses => System.Threading.Interlocked.Read(ref _misses);
+        public long Evictions => System.Threading.Interlocked.Read(ref _evictions);
+        public int Count { get { lock (_lock) return _map.Count; } }
+        public int Capacity => _capacity;
+
         public BoundedStringCache(int capacity)
         {
             _capacity = Math.Max(1, capacity);
@@ -19,16 +31,21 @@ namespace GxMcp.Worker.Services
         public bool TryGetValue(string key, out string value)
         {
             value = null;
-            if (string.IsNullOrEmpty(key)) return false;
+            if (string.IsNullOrEmpty(key)) { System.Threading.Interlocked.Increment(ref _misses); return false; }
 
             lock (_lock)
             {
-                if (!_map.TryGetValue(key, out var entry)) return false;
+                if (!_map.TryGetValue(key, out var entry))
+                {
+                    System.Threading.Interlocked.Increment(ref _misses);
+                    return false;
+                }
                 _lru.Remove(entry.Node);
                 _lru.AddFirst(entry.Node);
                 value = entry.Value;
-                return true;
             }
+            System.Threading.Interlocked.Increment(ref _hits);
+            return true;
         }
 
         public void TryAdd(string key, string value)
@@ -51,6 +68,7 @@ namespace GxMcp.Worker.Services
                     if (last == null) break;
                     _map.Remove(last.Value);
                     _lru.RemoveLast();
+                    System.Threading.Interlocked.Increment(ref _evictions);
                 }
 
                 var node = new LinkedListNode<string>(key);
