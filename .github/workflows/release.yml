@@ -2,24 +2,44 @@ name: Release
 
 on:
   release:
-    types: [published]
+    # `edited` / `released` let a late `gh release upload publish.zip` re-trigger
+    # this workflow when the asset was missing on first publish.
+    types: [published, released, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to (re)publish (e.g. v2.6.6)'
+        required: true
+        type: string
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No release tag resolved from event or workflow_dispatch input."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ steps.tag.outputs.tag }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -39,7 +59,7 @@ jobs:
           set -euo pipefail
           NAME="$(node -p "require('./package.json').name")"
           VERSION="$(node -p "require('./package.json').version")"
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ steps.tag.outputs.tag }}"
           EXPECTED="v$VERSION"
           if [[ "$TAG" != "$EXPECTED" ]]; then
             echo "::error::Release tag $TAG does not match package.json version $EXPECTED."
@@ -65,7 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "${{ steps.tag.outputs.tag }}" \
             --pattern publish.zip \
             --dir .
 
