@@ -198,6 +198,17 @@ namespace GxMcp.Worker.Services
                 string exePath = Path.Combine(gxPath, "GeneXus.exe");
                 if (!File.Exists(exePath)) return null;
                 var info = FileVersionInfo.GetVersionInfo(exePath);
+
+                // Reproduce the canonical version string the IDE itself writes to .gxw
+                // (e.g. "18.0.187794 U14"). Reading ProductVersion as a string returns
+                // "18.0.14.187794+<git-sha>" because .NET appends the InformationalVersion
+                // suffix, which doesn't match what the IDE re-detects on its next open and
+                // triggers the "different GeneXus installation than last time" dialog.
+                if (info.FileMajorPart != 0 || info.FilePrivatePart != 0)
+                {
+                    return $"{info.FileMajorPart}.{info.FileMinorPart}.{info.FilePrivatePart} U{info.FileBuildPart}";
+                }
+
                 string version = info.ProductVersion ?? info.FileVersion;
                 if (!string.IsNullOrWhiteSpace(version)) return version.Trim();
             }

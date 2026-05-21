@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`.gxw` version metadata now matches the format the GeneXus IDE writes.** `KbService.DetectGeneXusVersion` was reading `FileVersionInfo.ProductVersion` from `GeneXus.exe`, which on modern .NET includes the `InformationalVersion` suffix (`18.0.14.187794+<git-sha>`). When the IDE later reopened the KB it re-detected its own canonical string (`18.0.187794 U14`) and showed the "different GeneXus installation than last time" dialog every time, even though the install path was identical. The version is now built from the numeric `FileVersionInfo` parts as `{Major}.{Minor}.{Private} U{Build}`, matching the IDE byte-for-byte. The string-based `ProductVersion`/`FileVersion` path is kept as a fallback for installs where the numeric parts come back zeroed.
+
 ## v2.6.5 — 2026-05-21
 
 Two real-session bug hunts. First: `genexus_lifecycle action=build` failed on a 38k-object KB with an opaque `O sistema não pode encontrar o arquivo especificado` at `GxBuild_*.msbuild(5,5)` — same line every time, no further detail even with `/v:diag` or fusion log. Root cause: the worker emitted `<BuildOne>`, a monolithic GeneXus task that bundles spec + gen + IIS deploy and explodes on the deploy step when run from a standalone `MSBuild.exe` (the AppDomain doesn't have the SDK's Artech.* + IIS COM probing the IDE relies on). The IDE itself does NOT use `<BuildOne>` — `C:\Program Files (x86)\GeneXus\GeneXus18\Genexus.msbuild` composes `<SpecifyOneOnly>` + `<GenerateOnly>` instead. Worker now mirrors the IDE template. Validated end-to-end via MCP on `AcademicoHomolog1`: `target=RegProfAlunoUGPopup` finished 0 errors / 0 warnings in 59s and the regenerated `regprofalunougpopup.cs` carries the new eligibility-gate locals exactly as edited.
