@@ -648,7 +648,24 @@ namespace GxMcp.Worker.Services
 
         public string WriteObject(string target, string partName, string code, string typeFilter = null, bool autoValidate = true, bool preferFastSourceSave = false, bool autoInjectVariables = true, bool dryRun = false)
         {
-            string raw = WriteObjectInternal(target, partName, code, typeFilter, autoValidate, preferFastSourceSave, autoInjectVariables, dryRun);
+            // PERFORMANCE (instrumentation): wrap the entire write pipeline (SDK ops + validation +
+            // persistedHash projection) in a Stopwatch so unusually-slow object saves surface in
+            // worker_debug.log. Threshold 250ms matches user-perceived friction: anything over that
+            // is worth diagnosing.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            string raw;
+            try
+            {
+                raw = WriteObjectInternal(target, partName, code, typeFilter, autoValidate, preferFastSourceSave, autoInjectVariables, dryRun);
+            }
+            finally
+            {
+                sw.Stop();
+                if (sw.ElapsedMilliseconds > 250)
+                {
+                    Logger.Info($"[OBJ-SAVE-SLOW] {sw.ElapsedMilliseconds}ms target='{target}' part='{partName}' codeLen={code?.Length ?? 0} dryRun={dryRun}");
+                }
+            }
             // v2.3.8 Task 3.4: every edit response carries persistedHash + persistedSnippet
             // (success, no-change, dry-run, rollback, or error).
             // Default sdkPath = typed-sdk; deeper writers (LayoutService raw-XML) tag their own
