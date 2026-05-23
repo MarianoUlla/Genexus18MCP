@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Artech.Architecture.Common.Objects;
 
@@ -216,6 +217,39 @@ namespace GxMcp.Worker.Helpers
                         });
                     }
                 }
+
+                // Item 6 (friction-report 2026-05-22): gxTextBlock Format="HTML" with <script>,
+                // <iframe>, or <img onerror=...> inside its CDATA — GeneXus HTML generator
+                // escapes these tags so they render as literal text instead of executing. The
+                // write succeeds and builds clean, but the agent's JS never runs. Surface a
+                // warning so the caller knows before a build+browser cycle.
+                if (elName.Equals("gxTextBlock", StringComparison.OrdinalIgnoreCase))
+                {
+                    string fmt = (string)el.Attribute("Format");
+                    if (string.Equals(fmt, "HTML", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Content may be in a CDATA section or as text; XLinq merges both into Value.
+                        string content = el.Value ?? "";
+                        if (ContainsEscapedHtmlPatterns(content))
+                        {
+                            hits.Add(new Gotcha
+                            {
+                                Code = "GotchaHtmlFormatScriptStripped",
+                                Severity = "Warning",
+                                Element = elName,
+                                ControlId = (string)el.Attribute("id") ?? "(no-id)",
+                                Message = "gxTextBlock Format=\"HTML\" contains <script>, <iframe>, or <img onerror=...> — " +
+                                          "the GeneXus HTML generator escapes these tags on render so they appear as " +
+                                          "literal text instead of executing. The write succeeds and builds clean, but " +
+                                          "your JS will NOT run.",
+                                Workaround = "Use <body onmousedown=\"...\"> + addEventListener for runtime JS injection. " +
+                                             "Inline event attributes on raw HTML elements (e.g. <input type=\"radio\" onclick=\"...\">) " +
+                                             "inside Format=\"HTML\" blocks ARE preserved. Only block-level script tags and " +
+                                             "img onerror patterns are escaped."
+                            });
+                        }
+                    }
+                }
             }
 
             // Structural rules — run after element loop so we have the doc available.
@@ -282,6 +316,18 @@ namespace GxMcp.Worker.Helpers
                 if (a != null && !string.IsNullOrWhiteSpace(a.Value)) return a.Value;
             }
             return null;
+        }
+
+        // Item 6: patterns that GeneXus' HTML generator escapes inside gxTextBlock Format="HTML".
+        // Matches: <script, </script, <iframe, </iframe, <img with onerror attribute.
+        private static readonly Regex _rxEscapedHtml = new Regex(
+            @"<\s*(/?script|/?iframe|img\b[^>]*\bonerror\s*=)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        internal static bool ContainsEscapedHtmlPatterns(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return false;
+            return _rxEscapedHtml.IsMatch(content);
         }
 
         // Resolve var:N to the variable name using the object's VariablesPart. Empty/null if

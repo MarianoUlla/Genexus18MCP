@@ -99,6 +99,7 @@ namespace GxMcp.Gateway
         };
 
         private static readonly object _logLock = new object();
+        private static readonly System.Threading.SemaphoreSlim _stdoutGate = new System.Threading.SemaphoreSlim(1, 1);
         private static Configuration? _activeConfig;
 
         public static void TryWriteStderr(string message)
@@ -109,9 +110,14 @@ namespace GxMcp.Gateway
         public static async Task TryWriteStdout(string msg)
         {
             if (string.IsNullOrWhiteSpace(msg)) return;
-            try { 
-                await Console.Out.WriteLineAsync(msg);
-                await Console.Out.FlushAsync();
+            try {
+                await _stdoutGate.WaitAsync().ConfigureAwait(false);
+                try {
+                    await Console.Out.WriteLineAsync(msg);
+                    await Console.Out.FlushAsync();
+                } finally {
+                    _stdoutGate.Release();
+                }
             } catch { }
         }
 
@@ -634,6 +640,7 @@ namespace GxMcp.Gateway
                     ["serverVersion"] = McpRouter.ServerVersion,
                     ["protocolVersion"] = McpRouter.SupportedProtocolVersion
                 },
+                ["worker"] = BuildWorkerBlock(),
                 // Self-update awareness — LLM-visible structured data sourced from the
                 // 24h-cached UpdateNotifier result. Lets the agent check whoami.update.
                 // updateAvailable before each session and proactively offer the upgrade
@@ -650,6 +657,8 @@ namespace GxMcp.Gateway
                 // the roll-up so first-turn cost stays minimal while still surfacing red
                 // flags (high error/timeout ratio, a tool with a >10s p95).
                 ["metricsSummary"] = _operationTracker?.BuildMetricsSummary() ?? new JObject(),
+                // Item 73: per-tool latency breakdown. In-memory, resets on gateway restart.
+                ["stats"] = _operationTracker?.BuildToolStatsBlock() ?? new JObject(),
                 // Inline playbooks for the flows that drove the largest token spend
                 // in real sessions (LLMs were exploring WWP/popup structure before
                 // every change). Embedding the routing here means the agent sees it
@@ -658,6 +667,99 @@ namespace GxMcp.Gateway
                 // fetch genexus_recipe(name=...).
                 ["playbooks"] = BuildPlaybooksBlock()
             };
+        }
+
+        // Friction 2026-05-22: which worker exe is actually running was opaque —
+        // users had to inspect tasklist + git status to know if their rebuilt
+        // worker was in use, or if the gateway was still serving from publish/.
+        // Surface it here so every whoami answers "which binary am I running"
+        // without a side investigation.
+        private static JObject BuildWorkerBlock()
+        {
+            try
+            {
+                WorkerProcess? wp = null;
+                KbHandle? kb = _currentKb.Value;
+                if (kb != null && _workerPool != null)
+                {
+                    wp = _workerPool.TryGet(kb.NormalizedAlias);
+                }
+                if (wp == null && _workerPool != null)
+                {
+                    // No KB selected (multi-KB session or first turn) — pick the first open.
+                    var open = _workerPool.ListOpen();
+                    if (open != null)
+                    {
+                        foreach (var h in open)
+                        {
+                            var w = _workerPool.TryGet(h.NormalizedAlias);
+                            if (w != null) { wp = w; break; }
+                        }
+                    }
+                }
+                if (wp == null)
+                {
+                    return new JObject
+                    {
+                        ["status"] = "not_spawned",
+                        ["hint"] = "Worker hasn't been spawned this session yet. Triggered on the first KB tool call."
+                    };
+                }
+                string? exe = wp.SpawnedExePath;
+                DateTime? builtAt = wp.SpawnedExeBuiltAtUtc;
+                string? sourceLabel = null;
+                if (!string.IsNullOrEmpty(exe))
+                {
+                    string e = exe!.Replace('/', '\\');
+                    if (e.IndexOf(@"\publish\worker\", StringComparison.OrdinalIgnoreCase) >= 0)
+                        sourceLabel = "publish (config.json WorkerExecutable)";
+                    else if (e.IndexOf(@"\src\GxMcp.Worker\bin\Debug\", StringComparison.OrdinalIgnoreCase) >= 0)
+                        sourceLabel = "dev-Debug (bin/Debug fallback)";
+                    else if (e.IndexOf(@"\src\GxMcp.Worker\bin\Release\", StringComparison.OrdinalIgnoreCase) >= 0)
+                        sourceLabel = "dev-Release (bin/Release fallback)";
+                    else
+                        sourceLabel = "custom";
+                }
+                // Item 52: worker memory + uptime for proactive reload hints.
+                long? memoryMb = null;
+                int? uptimeMin = null;
+                string? reloadHint = null;
+                try
+                {
+                    long? wsBytes = wp.WorkingSetBytes;
+                    if (wsBytes.HasValue) memoryMb = wsBytes.Value / (1024 * 1024);
+                    if (wp.SpawnedAtUtc.HasValue)
+                        uptimeMin = (int)(DateTime.UtcNow - wp.SpawnedAtUtc.Value).TotalMinutes;
+                    if (memoryMb > 1500)
+                        reloadHint = "Consider genexus_worker_reload — heap >1.5GB or uptime >2h";
+                    else if (uptimeMin > 120)
+                        reloadHint = "Consider genexus_worker_reload — heap >1.5GB or uptime >2h";
+                }
+                catch { /* non-fatal: process may have exited between checks */ }
+
+                var workerBlock = new JObject
+                {
+                    ["status"] = wp.Pid.HasValue ? "running" : "stopped",
+                    ["pid"] = wp.Pid,
+                    ["exePath"] = exe,
+                    ["exeSource"] = sourceLabel,
+                    ["builtAtUtc"] = builtAt?.ToString("o"),
+                    ["spawnMs"] = wp.SpawnMs,
+                    ["sdkInitMs"] = wp.SdkInitMs,
+                    ["memoryMb"] = memoryMb,
+                    ["uptimeMin"] = uptimeMin
+                };
+                if (reloadHint != null) workerBlock["reloadHint"] = reloadHint;
+                return workerBlock;
+            }
+            catch (Exception ex)
+            {
+                return new JObject
+                {
+                    ["status"] = "error",
+                    ["error"] = ex.Message
+                };
+            }
         }
 
         private static JObject BuildPlaybooksBlock()
@@ -676,7 +778,11 @@ namespace GxMcp.Gateway
                 ["wait_long_builds"] = "Don't poll genexus_lifecycle status in a loop — pass wait_until_done:true on the build call OR wait_seconds:600 on status. One turn instead of 12.",
                 ["xml_comments_in_form"] = "XML comments (<!-- ... -->) inside HTML form Source are emitted as visible text by the generator. Strip them before genexus_edit (or use mode=patch to avoid touching them).",
                 ["partial_success"] = "If a build returns Status=Failed but response.partial_success=true, Generation+Compilation already succeeded — try running the object once before rebuilding. The DLL is updated; only a late MSBuild step (often WebAppConfig) failed.",
-                ["recipes_index"] = "For full step-by-step recipes call genexus_recipe { name: 'wwp_on_webpanel' | 'wwp_on_transaction' | 'create_popup' | 'edit_pattern_instance' | 'add_custom_button' | 'list' }."
+                ["recipes_index"] = "For full step-by-step recipes call genexus_recipe { name: 'wwp_on_webpanel' | 'wwp_on_transaction' | 'create_popup' | 'edit_pattern_instance' | 'add_custom_button' | 'list' }.",
+                // Friction 2026-05-22 items 2, 3, 13.
+                ["html_form_inline_js"] = "GeneXus HTML form sanitization (KB-agnostic but observed in v18):\n  - <script>, <iframe>, <img onerror> inside gxTextBlock Format=\"HTML\" render as\n    literal escaped text — they do NOT execute.\n  - Inline event-attrs in raw HTML are preserved: onclick on <input type=radio>,\n    onmousedown/onunload on <body>, likely other on* on <td>/<div>.\n  - For post-event JS in a popup, hook via <body onmousedown> (installs listeners\n    on first mousedown) + addEventListener at runtime, instead of emitting <script>.",
+                ["popup_call_async"] = ".Popup() is async. The line immediately after .Popup() sees out-params STILL EMPTY —\nchecking &OutVar.IsEmpty() there always returns true. Values arrive on a subsequent\nRefresh fired by AUTO_REFRESH=VARS_CHANGE, IF that property detects a change. In\nseveral KBs AUTO_REFRESH does NOT fire after popup close and the visibility set in\nStart does not restore.\n\nRecipe for \"blocking popup + locked screen + auto-reload\": see\ngenexus://kb/tool-help/recipes/popup_blocking_with_reload.",
+                ["verify_in_browser"] = "chrome-devtools-axi (global npm CLI) drives Chrome via CDP.\nUsage:\n  chrome-devtools-axi open <url>      # navigate + return a11y tree\n  chrome-devtools-axi click @<uid>    # click by accessible uid\n  chrome-devtools-axi eval <js>       # eval JS in page (IIFE for multi-line)\n  chrome-devtools-axi screenshot <path>\n\nFor GeneXus popups (iframe): document.getElementById('gxp0_ifrm').contentDocument\nto access internal DOM."
             };
         }
 
@@ -1947,7 +2053,12 @@ namespace GxMcp.Gateway
                             if (probe != null)
                             {
                                 int waitSeconds = Math.Min(Math.Max(args?["wait_seconds"]?.ToObject<int?>() ?? 0, 0), McpRouter.MaxLongPollSeconds);
-                                JObject pollResult = await McpRouter.LongPollJob(JobRegistry, jobId, waitSeconds);
+                                var clientProgressToken = (request["params"] as JObject)?["_meta"]?["progressToken"];
+                                bool hasProgressToken = clientProgressToken != null && clientProgressToken.Type != JTokenType.Null;
+                                JObject pollResult = await McpRouter.LongPollJob(
+                                    JobRegistry, jobId, waitSeconds,
+                                    progressToken: clientProgressToken,
+                                    heartbeat: hasProgressToken ? (n => TryWriteStdout(n.ToString(Formatting.None))) : null);
                                 bool isError = pollResult["error"] != null;
                                 // v2.3.8 (post-Task 6.1 fix): the DispatchCore compact pass below
                                 // only runs for the worker-side legacy taskId path. job_id results
@@ -2191,7 +2302,12 @@ namespace GxMcp.Gateway
                             if (waitUntilDone)
                             {
                                 int blockingCap = tArgs?["wait_seconds"]?.ToObject<int?>() ?? McpRouter.MaxLongPollSeconds;
-                                JObject pollResult = await McpRouter.LongPollJob(JobRegistry, job.Id, blockingCap);
+                                var clientProgressToken = (request["params"] as JObject)?["_meta"]?["progressToken"];
+                                bool hasProgressToken = clientProgressToken != null && clientProgressToken.Type != JTokenType.Null;
+                                JObject pollResult = await McpRouter.LongPollJob(
+                                    JobRegistry, job.Id, blockingCap,
+                                    progressToken: clientProgressToken,
+                                    heartbeat: hasProgressToken ? (n => TryWriteStdout(n.ToString(Formatting.None))) : null);
                                 // Classify the terminal status so the MCP envelope's isError
                                 // matches the build outcome. LongPollJob surfaces JobEntry.Status
                                 // which is one of: running, completed, failed, cancelled, unknown_job_id.
@@ -2669,6 +2785,10 @@ namespace GxMcp.Gateway
                 // Gated by PerfProfile.V1Enabled. Completions are marked seen so they surface exactly once.
                 if (PerfProfile.V1Enabled)
                     McpRouter.PiggybackJobs(toolInnerResult, sessionId, JobRegistry);
+
+                // Item 61: inject _meta.tokens (used/limit/hint) into every tool response
+                // so the LLM can reason about response size and self-paginate.
+                McpRouter.InjectMetaTokens(toolInnerResult);
 
                 // Wrap tool result in JSON-RPC envelope
                 return new JObject

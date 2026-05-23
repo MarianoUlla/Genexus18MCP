@@ -188,7 +188,10 @@ namespace GxMcp.Gateway.Routers
                             // CommandDispatcher.patch.Apply branch can honor validate=only
                             // (mapped to dryRun=true). Without this the gateway silently
                             // stripped the flag and the schema lied to the LLM.
-                            validate = args?["validate"]?.ToString()
+                            validate = args?["validate"]?.ToString(),
+                            // Item 9 (friction 2026-05-22): replaceAll=true applies patch to all
+                            // occurrences instead of requiring expectedCount to match exactly.
+                            replaceAll = args?["replaceAll"]?.ToObject<bool?>() ?? false
                         };
                     }
                     else

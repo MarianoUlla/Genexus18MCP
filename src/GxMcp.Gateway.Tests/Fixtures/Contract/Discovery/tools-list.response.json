@@ -40,6 +40,7 @@
               "navigation",
               "hierarchy",
               "impact",
+              "callers",
               "data_context",
               "ui_context",
               "pattern_metadata",
@@ -563,6 +564,10 @@
             ],
             "description": "String or {find,replace} object. Prefer operation+context+content."
           },
+          "replaceAll": {
+            "description": "patch mode only. Apply to ALL occurrences instead of requiring expectedCount to match exactly.",
+            "type": "boolean"
+          },
           "return_post_state": {
             "description": "Omit post_state.diff (default true).",
             "type": "boolean"
@@ -897,7 +902,7 @@
       "name": "genexus_inject_context"
     },
     {
-      "description": "Use to snapshot an object: metadata, variables, structure, signature. Raw shape, no source text — use genexus_read for code.",
+      "description": "Use to snapshot an object: metadata, variables, structure, signature. Raw shape, no source text — use genexus_read for code. runtimeIds requires a prior build.",
       "inputSchema": {
         "properties": {
           "include": {
@@ -910,7 +915,8 @@
                 "parts",
                 "controls",
                 "events_repertoire",
-                "callers"
+                "callers",
+                "runtimeIds"
               ],
               "type": "string"
             },
@@ -1218,7 +1224,7 @@
       "name": "genexus_list_objects"
     },
     {
-      "description": "Read worker_debug.log tail for error diagnosis or correlation. since='crash' slices from the last ERROR/CRITICAL marker.",
+      "description": "Read worker_debug.log tail. target=<obj> filters by object name; tail=N last N lines (default 100); since=<ISO|'crash'> lines after timestamp or from last ERROR marker. Response includes logPath so the agent can read other logs directly.",
       "inputSchema": {
         "properties": {
           "filterCorrelation": {
@@ -1227,14 +1233,16 @@
           "grep": {
             "type": "string"
           },
-          "lines": {
+          "since": {
+            "description": "ISO-8601 UTC timestamp to filter lines after, or 'crash' to slice from the last ERROR/CRITICAL marker.",
+            "type": "string"
+          },
+          "tail": {
+            "description": "Last N lines (default 100).",
             "type": "integer"
           },
-          "since": {
-            "description": "'crash' = tail from the most recent ERROR/CRITICAL line + 5 lines of context.",
-            "enum": [
-              "crash"
-            ],
+          "target": {
+            "description": "Only return lines mentioning this object name.",
             "type": "string"
           }
         },
@@ -1582,6 +1590,19 @@
           "caseSensitive": {
             "type": "boolean"
           },
+          "fields": {
+            "description": "Fields to search. Default [source]. Add caption/description/parmNames to widen.",
+            "items": {
+              "enum": [
+                "source",
+                "caption",
+                "description",
+                "parmNames"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
           "includeComments": {
             "type": "boolean"
           },
@@ -1702,6 +1723,24 @@
         "type": "object"
       },
       "name": "genexus_test"
+    },
+    {
+      "description": "Revert the last N edits from EditSnapshotStore (.gx/snapshots). Best-effort: reports which succeeded when any fail.",
+      "inputSchema": {
+        "properties": {
+          "kb": {
+            "description": "KB alias (multi-KB only).",
+            "type": "string"
+          },
+          "last": {
+            "default": 1,
+            "description": "Number of snapshots to revert (default 1, max 20).",
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "genexus_undo"
     },
     {
       "description": "Pre-flight: parse + SDK schema scan + would-be diff vs current state. No save.",

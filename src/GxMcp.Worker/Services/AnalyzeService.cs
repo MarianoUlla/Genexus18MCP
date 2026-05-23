@@ -882,6 +882,27 @@ namespace GxMcp.Worker.Services
                     catch { }
                 }
 
+                // 6.2 Runtime IDs (opt-in: include=["runtimeIds"]).
+                // Parses the generated .cs file from GXSPC*/GEN*/web/ to map
+                // design-time control IDs to their runtime HTML element IDs.
+                // Requires a prior build; returns an empty array when no
+                // generated file is found.
+                if (requested.Contains("runtimeids"))
+                {
+                    try
+                    {
+                        string kbPath = null;
+                        try { kbPath = _kbService?.GetKbPath(); } catch { }
+                        var runtimeIds = GetRuntimeIds(kbPath, obj.Name);
+                        result["runtimeIds"] = runtimeIds;
+                        if (kbPath == null || runtimeIds.Count == 0)
+                        {
+                            result["runtimeIdsNote"] = "runtimeIds requires a prior build. No generated .cs file was found — run genexus_lifecycle action=build first.";
+                        }
+                    }
+                    catch { result["runtimeIds"] = new JArray(); }
+                }
+
                 // 7. Final Summary
                 result["summary"] = GenerateSummary(obj, result);
 
@@ -1268,6 +1289,29 @@ namespace GxMcp.Worker.Services
         // produce a JSON-friendly tree the agent can inspect without a follow-up read call.
         // Returns null when the SDT structure part can't be located so callers fall back to
         // their existing surfaces; callers also surface the DSL text for human eyes.
+        // ----------------------------------------------------------------
+        // Runtime IDs — parses generated .cs files from GXSPC*/GEN*/web/
+        // to map design-time control IDs to their HTML element IDs.
+        // ----------------------------------------------------------------
+
+        internal static JArray GetRuntimeIds(string kbPath, string objectName)
+        {
+            var arr = new JArray();
+            var entries = GxMcp.Worker.Helpers.RuntimeIdParser.ParseFromKbDirectory(kbPath, objectName);
+            foreach (var e in entries)
+            {
+                var item = new JObject();
+                item["designId"] = e.DesignId;
+                item["htmlId"]   = e.HtmlId;
+                if (!string.IsNullOrEmpty(e.Kind))
+                    item["kind"] = e.Kind;
+                if (e.Hidden.HasValue)
+                    item["hidden"] = e.Hidden.Value;
+                arr.Add(item);
+            }
+            return arr;
+        }
+
         private static JObject BuildSdtItemsJson(KBObject sdt)
         {
             if (sdt == null) return null;
@@ -1387,6 +1431,102 @@ namespace GxMcp.Worker.Services
             }
 
             return node;
+        }
+
+        // ----------------------------------------------------------------
+        // Item 24 — mode=callers: per-call-site detail with line + context.
+        // Enumerates every caller from the index and scans their source for
+        // actual call sites, returning line number + 3-line surrounding context.
+        // ----------------------------------------------------------------
+        public string FindCallerSites(string targetName)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(targetName))
+                    return "{\"status\":\"Error\",\"error\":\"target is required\"}";
+
+                var index = _indexCacheService?.GetIndex();
+                if (index == null || index.Objects == null)
+                    return Models.McpResponse.Error("Index not found", targetName, null, "Run the KB indexing flow before requesting callers analysis.");
+
+                var entry = ResolveIndexEntry(index, targetName, out var _);
+                if (entry == null)
+                    return Models.McpResponse.Error("Object not found in index", targetName, null, "The object was not found in the search index.");
+
+                string canonicalName = entry.Name ?? targetName;
+                var callerNames = entry.CalledBy ?? new List<string>();
+
+                var callers = new JArray();
+                const int ctx = 3;
+
+                foreach (var callerName in callerNames)
+                {
+                    // Read each source part that might contain calls
+                    string[] partsToCheck = { "Source", "Events", "Rules" };
+                    foreach (var partName in partsToCheck)
+                    {
+                        string src = null;
+                        try
+                        {
+                            src = _objectService?.ReadObjectSource(callerName, partName);
+                            // Skip ReadObjectSource error envelopes — must look like a JSON error
+                            // object, NOT any source line that happens to contain the word "error".
+                            if (!string.IsNullOrEmpty(src))
+                            {
+                                var trimmed = src.TrimStart();
+                                if (trimmed.StartsWith("{") && trimmed.Contains("\"status\"") && trimmed.Contains("\"Error\""))
+                                    src = null;
+                            }
+                        }
+                        catch { }
+                        if (string.IsNullOrEmpty(src)) continue;
+
+                        var lines = src.Split('\n');
+                        foreach (var call in SourceParser.ParseCalls(src, false))
+                        {
+                            if (!string.Equals(call.Callee, canonicalName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Also match unqualified suffix
+                                int dot = call.Callee?.LastIndexOf('.') ?? -1;
+                                string unqualified = dot >= 0 ? call.Callee.Substring(dot + 1) : call.Callee;
+                                if (!string.Equals(unqualified, canonicalName, StringComparison.OrdinalIgnoreCase))
+                                    continue;
+                            }
+
+                            int idx = call.LineNumber - 1;
+                            string lineText = idx >= 0 && idx < lines.Length ? lines[idx] : "";
+                            var ctxBefore = new JArray();
+                            for (int i = Math.Max(0, idx - ctx); i < idx; i++) ctxBefore.Add(lines[i]);
+                            var ctxAfter = new JArray();
+                            for (int i = idx + 1; i < Math.Min(lines.Length, idx + ctx + 1); i++) ctxAfter.Add(lines[i]);
+
+                            callers.Add(new JObject
+                            {
+                                ["object"] = callerName,
+                                ["part"] = partName,
+                                ["line"] = call.LineNumber,
+                                ["lineText"] = lineText,
+                                ["context"] = ctxBefore.ToString(Newtonsoft.Json.Formatting.None) + "\n" + lineText + "\n" + ctxAfter.ToString(Newtonsoft.Json.Formatting.None),
+                                ["contextBefore"] = ctxBefore,
+                                ["contextAfter"] = ctxAfter,
+                                ["args"] = new JArray(call.Args.ToArray<object>())
+                            });
+                        }
+                    }
+                }
+
+                return new JObject
+                {
+                    ["status"] = "Ready",
+                    ["target"] = canonicalName,
+                    ["callSiteCount"] = callers.Count,
+                    ["callers"] = callers
+                }.ToString();
+            }
+            catch (Exception ex)
+            {
+                return "{\"error\":\"" + CommandDispatcher.EscapeJsonString(ex.Message) + "\"}";
+            }
         }
     }
 }

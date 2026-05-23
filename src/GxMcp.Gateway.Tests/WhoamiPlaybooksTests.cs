@@ -24,6 +24,9 @@ namespace GxMcp.Gateway.Tests
         [InlineData("create_popup")]
         [InlineData("read_object_structure")]
         [InlineData("recipes_index")]
+        [InlineData("html_form_inline_js")]
+        [InlineData("popup_call_async")]
+        [InlineData("verify_in_browser")]
         public void Playbooks_ContainsCanonicalRoutes(string key)
         {
             JObject playbooks = (JObject)Program.BuildWhoamiPayload()["playbooks"]!;

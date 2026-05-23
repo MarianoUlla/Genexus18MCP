@@ -26,6 +26,7 @@ namespace GxMcp.Worker.Services
         public WriteService(ObjectService objectService)
         {
             _objectService = objectService;
+            _objectServiceRef = objectService; // v2.6.9 — static handle for NotePerTargetWrite → EditDirtyTracker
             _patternAnalysisService = new PatternAnalysisService(objectService);
             InitializeFlushTimer();
             AppDomain.CurrentDomain.ProcessExit += (s, e) => FlushBackground();
@@ -734,7 +735,23 @@ namespace GxMcp.Worker.Services
         {
             if (string.IsNullOrWhiteSpace(target)) return;
             _lastWriteAtUtc[target] = DateTime.UtcNow;
+            // v2.6.9 — record edit so the next build of this target does a full
+            // BuildOne (spec+gen+compile) rather than the compile-only fast path.
+            // kbPath best-effort: missing kb maps to a "<no-kb>" bucket which is
+            // still safe (everything in that bucket is treated as dirty by
+            // EditDirtyTracker for unknown-but-not-clean keys).
+            try
+            {
+                string kbPath = null;
+                try { kbPath = _objectServiceRef?.GetKbService()?.GetKbPath(); } catch { }
+                EditDirtyTracker.MarkDirty(kbPath, target);
+            }
+            catch { /* dirty tracking is best-effort */ }
         }
+
+        // Resolved lazily via the WriteService instance ctor so the static
+        // NotePerTargetWrite can reach KbService without a per-call lookup.
+        private static ObjectService _objectServiceRef;
 
         internal static bool WasTargetWrittenSince(string target, DateTime sinceUtc)
         {
@@ -1759,7 +1776,28 @@ namespace GxMcp.Worker.Services
 
         public string DeleteVariable(string target, string varName)
         {
-            return WrapWithPersistedState(DeleteVariableInternal(target, varName), target, "Variables", GxMcp.Worker.Helpers.WriteResultMeta.TypedWriter);
+            var raw = DeleteVariableInternal(target, varName);
+            MarkDirtyIfSuccess(raw, target);
+            return WrapWithPersistedState(raw, target, "Variables", GxMcp.Worker.Helpers.WriteResultMeta.TypedWriter);
+        }
+
+        // v2.6.9 — parse the typed-writer raw response for a Success/NoChange
+        // status and mark the target dirty. NoChange does NOT mark dirty (no
+        // edit actually persisted), Success/PartialSuccess do.
+        private static void MarkDirtyIfSuccess(string raw, string target)
+        {
+            if (string.IsNullOrWhiteSpace(raw) || string.IsNullOrWhiteSpace(target)) return;
+            try
+            {
+                var jo = Newtonsoft.Json.Linq.JObject.Parse(raw);
+                string status = jo?["status"]?.ToString();
+                if (string.Equals(status, "Success", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(status, "PartialSuccess", StringComparison.OrdinalIgnoreCase))
+                {
+                    NotePerTargetWrite(target);
+                }
+            }
+            catch { /* best-effort */ }
         }
 
         private string DeleteVariableInternal(string target, string varName)
@@ -1886,7 +1924,9 @@ namespace GxMcp.Worker.Services
 
         public string AddVariable(string target, string varName, string typeName = null)
         {
-            return WrapWithPersistedState(AddVariableInternal(target, varName, typeName), target, "Variables", GxMcp.Worker.Helpers.WriteResultMeta.TypedWriter);
+            var raw = AddVariableInternal(target, varName, typeName);
+            MarkDirtyIfSuccess(raw, target);
+            return WrapWithPersistedState(raw, target, "Variables", GxMcp.Worker.Helpers.WriteResultMeta.TypedWriter);
         }
 
         private string AddVariableInternal(string target, string varName, string typeName = null)
@@ -2011,7 +2051,9 @@ namespace GxMcp.Worker.Services
         // can roll back if obj.Save() throws.
         public string ModifyVariable(string target, string varName, string newTypeName, string basedOn = null)
         {
-            return WrapWithPersistedState(ModifyVariableInternal(target, varName, newTypeName, basedOn), target, "Variables", GxMcp.Worker.Helpers.WriteResultMeta.TypedWriter);
+            var raw = ModifyVariableInternal(target, varName, newTypeName, basedOn);
+            MarkDirtyIfSuccess(raw, target);
+            return WrapWithPersistedState(raw, target, "Variables", GxMcp.Worker.Helpers.WriteResultMeta.TypedWriter);
         }
 
         private string ModifyVariableInternal(string target, string varName, string newTypeName, string basedOn)

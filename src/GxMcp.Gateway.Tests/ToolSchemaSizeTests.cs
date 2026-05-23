@@ -72,7 +72,9 @@ namespace GxMcp.Gateway.Tests
             //   v2.6.8: 6500 → 6700 for sort/since/modifiedBefore/cursor declarations on
             //   genexus_list_objects + genexus_query. Net ~+55 tokens; budget set with
             //   ~140 tokens of headroom for the next small batch.
-            Assert.True(approxTokens < 6700, $"tool_definitions.json is ~{approxTokens} tokens; budget 6700.");
+            //   2026-05-22 friction items 4/9/17: 6700 → 7000 for replaceAll flag on
+            //   genexus_edit + genexus_inspect runtimeIds enum addition. Net ~+155 tokens.
+            Assert.True(approxTokens < 7000, $"tool_definitions.json is ~{approxTokens} tokens; budget 7000.");
         }
     }
 }

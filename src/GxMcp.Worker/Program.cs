@@ -98,6 +98,13 @@ namespace GxMcp.Worker
                 WriteLine("WORKER_HANDSHAKE_START");
                 Logger.Info("Worker process started (STA Mode).");
 
+                // Friction 2026-05-22: reap orphaned MSBuild.exe processes whose
+                // parent worker died mid-build (worker_reload force=true, crash, etc.).
+                // Safe heuristic: only kill MSBuild.exe whose ProcessParentId points
+                // to a PID that no longer exists. Doesn't touch the user's IDE / VS.
+                try { ReapOrphanMsbuilds(); }
+                catch (Exception ex) { Logger.Warn("[ORPHAN-REAP] failed: " + ex.Message); }
+
                 // ELITE: Configuration Resolve Logic (Env > Local Config > Error)
                 string gxPath = Environment.GetEnvironmentVariable("GX_PROGRAM_DIR");
                 string kbPath = Environment.GetEnvironmentVariable("GX_KB_PATH");
@@ -527,6 +534,80 @@ namespace GxMcp.Worker
 
         public static void WriteLine(string line) => _outputQueue.Add(line);
         public static void WriteError(string line) => _errorQueue.Add(line);
+
+        // Friction 2026-05-22: on startup, kill MSBuild.exe instances whose parent
+        // PID no longer exists. These accumulate when a build is cancelled or the
+        // worker crashes mid-build (the /m worker nodes survive the parent kill on
+        // net48 since Process.Kill(bool) doesn't exist). Opt-out:
+        //   GXMCP_REAP_ORPHAN_MSBUILD=0
+        private static void ReapOrphanMsbuilds()
+        {
+            if (string.Equals(Environment.GetEnvironmentVariable("GXMCP_REAP_ORPHAN_MSBUILD"), "0",
+                              StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            int reaped = 0;
+            try
+            {
+                // Snapshot every process ID once to test parent liveness in O(1).
+                var allPids = new HashSet<int>();
+                foreach (var p in System.Diagnostics.Process.GetProcesses())
+                {
+                    try { allPids.Add(p.Id); } finally { try { p.Dispose(); } catch { } }
+                }
+
+                using (var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT ProcessId, ParentProcessId, CommandLine FROM Win32_Process WHERE Name = 'MSBuild.exe'"))
+                using (var results = searcher.Get())
+                {
+                    foreach (System.Management.ManagementObject mo in results)
+                    {
+                        try
+                        {
+                            int pid = Convert.ToInt32(mo["ProcessId"]);
+                            int parent = Convert.ToInt32(mo["ParentProcessId"]);
+                            // R5/R8: scope by command-line so we only touch GeneXus KB
+                            // builds — VS / IDE MSBuilds and unrelated /m worker nodes
+                            // are left alone even if their parent is gone. The
+                            // command-line filter is the primary scope; the parent-alive
+                            // check below is defense-in-depth against the
+                            // GetProcesses()/WMI snapshot race.
+                            var cmdLine = mo["CommandLine"] as string;
+                            if (string.IsNullOrEmpty(cmdLine)) continue;
+                            bool matchesGxBuild =
+                                cmdLine.IndexOf("LastBuild.sln", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                cmdLine.IndexOf("\\Desenv\\build\\", StringComparison.OrdinalIgnoreCase) >= 0;
+                            if (!matchesGxBuild) continue;
+                            // Parent process either gone, or PID got recycled into a different
+                            // process — in either case, a /m worker node has no one waiting on it.
+                            if (!allPids.Contains(parent))
+                            {
+                                try
+                                {
+                                    using (var child = System.Diagnostics.Process.GetProcessById(pid))
+                                    {
+                                        if (!child.HasExited) { child.Kill(); reaped++; }
+                                    }
+                                }
+                                catch { /* race: already exited */ }
+                            }
+                        }
+                        catch { }
+                        finally { try { mo?.Dispose(); } catch { } }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("[ORPHAN-REAP] WMI scan failed: " + ex.Message);
+                return;
+            }
+
+            if (reaped > 0)
+                Logger.Info("[ORPHAN-REAP] killed " + reaped + " orphan MSBuild.exe process(es) at startup");
+        }
 
         private static void StartOutputThreads()
         {

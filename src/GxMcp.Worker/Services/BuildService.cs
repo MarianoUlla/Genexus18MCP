@@ -48,6 +48,129 @@ namespace GxMcp.Worker.Services
             }
         }
 
+        // Friction 2026-05-22: MSBuild /m spawns N worker nodes per build; killing
+        // only the parent (Process.Kill on net48) orphans the children as zombies.
+        // We walk the tree via WMI's Win32_Process.ParentProcessId, kill leaves first,
+        // then the parent. Tolerant of races (process already exited).
+        internal static int KillProcessTree(System.Diagnostics.Process root)
+        {
+            if (root == null) return 0;
+            int killed = 0;
+            try
+            {
+                int rootPid;
+                try { rootPid = root.Id; } catch { return 0; }
+                // R10: WMI ParentProcessId is creation-time-only; if rootPid was
+                // recycled, descendants of the OLD process get picked up. Capture
+                // the root's start time and filter children born before it.
+                DateTime rootStart;
+                try { rootStart = root.StartTime.ToUniversalTime(); }
+                catch { rootStart = DateTime.MinValue; }
+                var descendants = CollectDescendants(rootPid, rootStart);
+                // Kill leaves first so we don't reparent children to init mid-walk.
+                foreach (var pid in descendants)
+                {
+                    try
+                    {
+                        using (var child = System.Diagnostics.Process.GetProcessById(pid))
+                        {
+                            if (!child.HasExited) { child.Kill(); killed++; }
+                        }
+                    }
+                    catch { /* gone already */ }
+                }
+                try { if (!root.HasExited) { root.Kill(); killed++; } }
+                catch { }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("[KILL-TREE] root pid=" + (root?.Id) + ": " + ex.Message);
+            }
+            if (killed > 0)
+                Logger.Info("[KILL-TREE] killed " + killed + " process(es) under root pid=" + (root?.Id));
+            return killed;
+        }
+
+        private static List<int> CollectDescendants(int rootPid, DateTime rootStartUtc)
+        {
+            var result = new List<int>();
+            // Build full parent → children map via WMI in one query (cheap).
+            var byParent = new Dictionary<int, List<int>>();
+            try
+            {
+                using (var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT ProcessId, ParentProcessId, CreationDate FROM Win32_Process"))
+                using (var results = searcher.Get())
+                {
+                    foreach (System.Management.ManagementObject mo in results)
+                    {
+                        try
+                        {
+                            int pid = Convert.ToInt32(mo["ProcessId"]);
+                            int parent = Convert.ToInt32(mo["ParentProcessId"]);
+                            // R10: skip children that were born before the root —
+                            // they're PID-reuse artifacts. CIM datetime string like
+                            // "20260522141234.123456-180"; on parse failure default
+                            // to INCLUDE (conservative: better to over-kill our own
+                            // descendants than miss them).
+                            bool include = true;
+                            if (rootStartUtc > DateTime.MinValue)
+                            {
+                                try
+                                {
+                                    var cd = mo["CreationDate"] as string;
+                                    if (!string.IsNullOrEmpty(cd))
+                                    {
+                                        var childStart = System.Management.ManagementDateTimeConverter
+                                            .ToDateTime(cd).ToUniversalTime();
+                                        if (childStart < rootStartUtc) include = false;
+                                    }
+                                }
+                                catch { /* parse failure → include */ }
+                            }
+                            if (!include) continue;
+                            if (!byParent.TryGetValue(parent, out var list))
+                            {
+                                list = new List<int>();
+                                byParent[parent] = list;
+                            }
+                            list.Add(pid);
+                        }
+                        catch { }
+                        finally { mo?.Dispose(); }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn("[KILL-TREE] WMI scan failed: " + ex.Message);
+                return result;
+            }
+
+            // BFS from rootPid; collect children, grandchildren, ...
+            var queue = new Queue<int>();
+            queue.Enqueue(rootPid);
+            var seen = new HashSet<int> { rootPid };
+            while (queue.Count > 0)
+            {
+                int cur = queue.Dequeue();
+                if (byParent.TryGetValue(cur, out var kids))
+                {
+                    foreach (var k in kids)
+                    {
+                        if (seen.Add(k))
+                        {
+                            result.Add(k);
+                            queue.Enqueue(k);
+                        }
+                    }
+                }
+            }
+            // Reverse so leaves come first
+            result.Reverse();
+            return result;
+        }
+
         private const int TailBufferSize = 30;
 
         // Regex parsers for MSBuild/GeneXus output
@@ -810,12 +933,25 @@ namespace GxMcp.Worker.Services
                 var p = status.Process;
                 if (p != null && !p.HasExited)
                 {
-                    p.Kill();
+                    // R9: write the cancelled state BEFORE we go kill children so
+                    // the next status poll sees "Cancelled" immediately, even while
+                    // the descendant kill is still in flight.
                     status.Status = "Cancelled";
                     status.Phase = "Done";
                     EmitPhaseProgress(status.Phase);
                     status.EndTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                     try { status.StateChangeSignal.Set(); } catch { }
+                    // Friction 2026-05-22: p.Kill() on net48 kills only the parent.
+                    // MSBuild spawns N child nodes (/m); orphaned children pile up
+                    // as zombies in tasklist after each cancel. Walk the tree and
+                    // kill all descendants before the parent — fire-and-forget so
+                    // the cancel RPC returns quickly (best-effort cleanup; the
+                    // caller has already been told the task is Cancelled).
+                    System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try { KillProcessTree(p); }
+                        catch (Exception ex) { Logger.Warn("[KILL-TREE-BG] " + ex.Message); }
+                    });
                     return JsonConvert.SerializeObject(new { status = "Cancelled", taskId = taskId });
                 }
                 return JsonConvert.SerializeObject(new { status = status.Status, message = "Task already finished" });
@@ -899,7 +1035,8 @@ namespace GxMcp.Worker.Services
                             status, action, targets,
                             (s, l, err) => HandleLine(s, l, err),
                             _kbService.KbObject, _kbService.KbLock,
-                            skipFullDeploy: status.SkipFullDeploy);
+                            skipFullDeploy: status.SkipFullDeploy,
+                            kbPath: _kbService.GetKbPath());
                     }
                     catch (Exception ex)
                     {

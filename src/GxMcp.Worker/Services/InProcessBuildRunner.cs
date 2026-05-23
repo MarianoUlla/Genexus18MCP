@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using GxMcp.Worker.Helpers;
 using Microsoft.Build.Framework;
 
@@ -22,7 +23,27 @@ namespace GxMcp.Worker.Services
         // Type cache — Assembly.LoadFrom is amortised across calls.
         private static Type _typeSpecifyOneOnly;
         private static Type _typeIdeWebBuildAndDeploy;
+        private static Type _typeBuildOne;
         private static bool _assemblyLoadAttempted;
+
+        // Compile-only fast-fast path (env: GXMCP_BUILD_COMPILE_ONLY=1).
+        // Bypasses BuildOne's hardcoded BuildOptions.BuildProcess (Specify|Generate|Compile,
+        // ~25s on a warm worker for our reference KB) and invokes
+        // GenexusBLServices.Build.Build(workingSet, BuildOptions.Compile|ContinueOnError, keys, token)
+        // directly via reflection. Requires the .cs to already be current for the target
+        // (i.e. nothing changed since the last Specify/Generate). If the SDK errors
+        // because the .cs is stale, we fall back to the regular BuildOne path.
+        private static Type _typeObjectNameHelper;
+        private static Type _typeDevelopmentWorkingSet;
+        private static Type _typeBuildOptions;
+        private static Type _typeGenexusBLServices;
+        private static Type _typeIBuildServiceBL;
+        private static System.Reflection.MethodInfo _miBuildBuild; // Build(workingSet, BuildOptions, IEnumerable<EntityKey>, CancellationToken)
+        // 2026-05-22: Build.Build(...) is a dead-end because the internal BuildProcess does
+        // `options = 0x3800 | options` — Spec+Gen+Compile are forced regardless of caller flags.
+        // The IDE's true "Compile only" path is IRunService.Compile(KBModel, EntityKey), which
+        // the MSBuild Compile task wraps. Reflect through GenexusBLServices.Run.Compile(model, key).
+        private static System.Reflection.MethodInfo _miRunCompile; // Compile(KBModel, EntityKey) -> bool
         private static readonly object _typeCacheLock = new object();
 
         // Public entry. Returns true on success (caller writes the final
@@ -35,7 +56,8 @@ namespace GxMcp.Worker.Services
             Action<BuildService.BuildTaskStatus, string, bool> sink,
             object kbHandle,
             object kbLock,
-            bool skipFullDeploy = false)
+            bool skipFullDeploy = false,
+            string kbPath = null)
         {
             if (status == null) return false;
             if (kbHandle == null)
@@ -89,7 +111,203 @@ namespace GxMcp.Worker.Services
                         && action.Equals("Build", StringComparison.OrdinalIgnoreCase)
                         && targets != null
                         && targets.Count > 0;
+                    bool forceRebuild = action != null && action.Equals("RebuildAll", StringComparison.OrdinalIgnoreCase);
 
+                    // Friction 2026-05-22 fast path: use BuildOne — the same task the
+                    // GeneXus IDE F5 invokes for "Build this object only". It does
+                    // spec + gen + compile + targeted deploy of the changed object
+                    // and skips the full IdeWebBuildAndDeploy (which copies every
+                    // module + runs WebAppConfig and is the ~6.5min bottleneck).
+                    //
+                    // Path enabled by default for action=Build with explicit targets.
+                    // RebuildAll (force-rebuild whole KB) still goes through
+                    // IdeWebBuildAndDeploy because BuildOne is per-object. Opt-out
+                    // with GXMCP_INPROCESS_BUILD_FASTPATH=0.
+                    bool useBuildOne =
+                        isBuildWithTargets
+                        && !forceRebuild
+                        && _typeBuildOne != null
+                        && !string.Equals(Environment.GetEnvironmentVariable("GXMCP_INPROCESS_BUILD_FASTPATH"), "0", StringComparison.OrdinalIgnoreCase);
+
+                    // Compile-only fast-fast path (experimental).
+                    // GXMCP_BUILD_COMPILE_ONLY=1 → call GenexusBLServices.Build.Build with only
+                    // BuildOptions.Compile, skipping Specify (~16s) + Generate (~9s). Requires the
+                    // .cs to already be current — falls back to full BuildOne on any failure.
+                    bool tryCompileOnly =
+                        isBuildWithTargets && !forceRebuild
+                        && string.Equals(Environment.GetEnvironmentVariable("GXMCP_BUILD_COMPILE_ONLY"), "1", StringComparison.Ordinal)
+                        && _miRunCompile != null;
+                    if (tryCompileOnly)
+                    {
+                        lineSink("[BUILD-INPROCESS] fast-fast path (experimental): Compile-only x" + targets.Count, false);
+                        bool allOk = true;
+                        foreach (var t in targets)
+                        {
+                            if (!ExecuteCompileOnly(kbHandle, t, lineSink))
+                            {
+                                lineSink("[BUILD-INPROCESS] compile-only failed for '" + t + "' — falling back to BuildOne", false);
+                                allOk = false;
+                                break;
+                            }
+                        }
+                        if (allOk) return true;
+                        // Reset engine flags before the BuildOne fallback so leftover state
+                        // from this attempt doesn't contaminate the BuildOne partial-success check.
+                        engine.ResetSectionFlags();
+                    }
+
+                    if (useBuildOne)
+                    {
+                        lineSink("[BUILD-INPROCESS] fast path: BuildOne x" + targets.Count + " — Theme/Image/Style/Module deploy steps are SKIPPED. If your change touches theme CSS, generated JS, or shared module DLLs and they don't appear in web/, set GXMCP_INPROCESS_BUILD_FASTPATH=0 to use the full deploy.", false);
+
+                        // 2026-05-22: Multi-target batch path (Option D, "BuildBatch").
+                        // BuildOne is a thin wrapper around
+                        //   GenexusBLServices.Build.Build(workingSet, BuildOptions, IEnumerable<EntityKey>, token)
+                        // (4-arg bool overload). That interface natively accepts N keys and
+                        // does shared spec/gen/compile setup. For >1 target we resolve all
+                        // EntityKeys up-front and invoke the BL once instead of looping
+                        // BuildOne.Execute N times. The kbLock still serializes the call,
+                        // but the inner SDK shares one Specify pass, one Generate pass, one
+                        // Compile sweep, and one deploy hook — wall-clock for 2 targets goes
+                        // from ~68s (2×34s) to one shared pipeline.
+                        //
+                        // Single target still uses ExecuteBuildOne for IDE-F5 parity (lower
+                        // risk: identical to the path that's been live).
+                        //
+                        // 2026-05-22: BuildBatch is OPT-IN (GXMCP_INPROCESS_BUILD_BATCH=1).
+                        // Live-test 16:34 found that the BL.Build N-key call on the reference
+                        // KB throws Win32Exception "arquivo não encontrado" at the late
+                        // WebAppConfig deploy step — same root cause as the IdeWebBuildAndDeploy
+                        // failure mode we already work around with InProcessBuildEngine's
+                        // section markers + partial-success branch. BuildBatch bypasses
+                        // InProcessBuildEngine entirely (no engine subscription on Build.Build),
+                        // so the partial-success check can't help; worse, the failure leaves
+                        // the SDK pipeline in a broken state that propagates to the
+                        // subsequent ExecuteCompileOnly attempt in the per-target loop.
+                        // Per-target BuildOne (with engine.CompileSucceeded markers) remains
+                        // the safe default. Re-enable per-call for KBs where WebAppConfig
+                        // works cleanly.
+                        bool tryBatch = targets.Count > 1
+                            && _miBuildBuild != null
+                            && _typeDevelopmentWorkingSet != null
+                            && _typeBuildOptions != null
+                            && _typeObjectNameHelper != null
+                            && string.Equals(Environment.GetEnvironmentVariable("GXMCP_INPROCESS_BUILD_BATCH"), "1", StringComparison.OrdinalIgnoreCase);
+                        // v2.6.9 — if EVERY target in the batch is "clean" (no MCP edit since
+                        // last successful BuildOne), the .cs files are all current. Skip the
+                        // shared spec+gen batch and run Run.Compile per target — same fast-fast
+                        // path the per-target loop uses below, but applied to all of them.
+                        bool allClean = _miRunCompile != null && targets.All(t => !EditDirtyTracker.IsDirty(kbPath, t));
+                        if (tryBatch && allClean)
+                        {
+                            lineSink("[BUILD-INPROCESS] all " + targets.Count + " targets clean — using compile-only fast-fast path for the whole batch.", false);
+                            bool allOk = true;
+                            foreach (var t in targets)
+                            {
+                                if (!ExecuteCompileOnly(kbHandle, t, lineSink))
+                                {
+                                    lineSink("[BUILD-INPROCESS] compile-only failed for clean target '" + t + "' — falling through to BuildBatch / per-target.", false);
+                                    allOk = false;
+                                    break;
+                                }
+                            }
+                            if (allOk)
+                            {
+                                foreach (var t in targets) EditDirtyTracker.MarkClean(kbPath, t);
+                                return true;
+                            }
+                            engine.ResetSectionFlags();
+                        }
+
+                        if (tryBatch)
+                        {
+                            engine.ResetSectionFlags();
+                            var batchResult = ExecuteBuildBatch(kbHandle, targets, lineSink);
+                            if (batchResult == BatchOutcome.Success)
+                            {
+                                lineSink("[BUILD-INPROCESS] batch BuildBatch x" + targets.Count + " — OK (shared spec/gen/compile pipeline).", false);
+                                foreach (var t in targets) EditDirtyTracker.MarkClean(kbPath, t);
+                                return true;
+                            }
+                            if (batchResult == BatchOutcome.NotApplicable)
+                            {
+                                // Type/key resolution failed up front — fall through to the
+                                // existing per-target loop.
+                                lineSink("[BUILD-INPROCESS] batch path unavailable — falling through to per-target BuildOne.", false);
+                            }
+                            else
+                            {
+                                // BL.Build returned false. Fall through to per-target loop so
+                                // partial-success per-target heuristics still apply (some targets
+                                // may succeed, late-stage WebAppConfig failure is non-blocking).
+                                lineSink("[BUILD-INPROCESS] batch BuildBatch returned false — falling back to per-target BuildOne loop.", false);
+                                engine.ResetSectionFlags();
+                            }
+                        }
+
+                        foreach (var t in targets)
+                        {
+                            // R1: clear sticky section flags from any previous target in
+                            // this loop. Otherwise target N's CompileSucceeded /
+                            // WebAppConfigStarted leak into target N+1's partial-success
+                            // decision.
+                            engine.ResetSectionFlags();
+
+                            // v2.6.9 — per-target fast-fast path. If the dirty tracker has
+                            // an explicit "clean" record (= built successfully since the
+                            // last MCP edit), skip Specify+Generate and call Run.Compile
+                            // directly. On any compile-only failure, fall back to BuildOne
+                            // for this target (which regenerates the .cs).
+                            if (_miRunCompile != null && !EditDirtyTracker.IsDirty(kbPath, t))
+                            {
+                                lineSink("[BUILD-INPROCESS] '" + t + "' is clean — compile-only fast-fast path.", false);
+                                if (ExecuteCompileOnly(kbHandle, t, lineSink))
+                                {
+                                    EditDirtyTracker.MarkClean(kbPath, t);
+                                    continue;
+                                }
+                                lineSink("[BUILD-INPROCESS] compile-only failed for '" + t + "' — falling back to full BuildOne.", false);
+                                engine.ResetSectionFlags();
+                            }
+
+                            if (!ExecuteBuildOne(kbHandle, t, engine, buildCalled: false))
+                            {
+                                // Friction 2026-05-22: BuildOne.Execute may return false even
+                                // when the C# compile already succeeded. The GeneXus build
+                                // pipeline emits ">E1...Compilation" when the .dll is written,
+                                // then proceeds to WebAppConfig (web.config update) which
+                                // often fails on dev KBs without IIS plumbing — the
+                                // late-stage failure is non-blocking for serving the object.
+                                // If the engine trace shows compile OK + the only failed
+                                // stage was post-compile, treat as PartialSuccess and skip
+                                // the costly MSBuild.exe fallback. Net wall-clock drops from
+                                // ~6min to ~56s for single-target builds.
+                                if (engine.CompileSucceeded && engine.WebAppConfigStarted)
+                                {
+                                    lineSink("[BUILD-INPROCESS] BuildOne late-stage failure after compile OK — accepting as PARTIAL SUCCESS (DLL written, web.config step skipped).", false);
+                                    Logger.Info("[BUILD-INPROCESS] PartialSuccess: compile OK for '" + t + "'; web.config / deploy step failed but DLL is in place.");
+                                    EditDirtyTracker.MarkClean(kbPath, t); // v2.6.9 — DLL written so .cs is current
+                                    continue;
+                                }
+                                Logger.Warn("[BUILD-INPROCESS] BuildOne returned false for '" + t + "' — falling back");
+                                // Dump the engine's captured trace so we can see WHY the
+                                // task failed (errorless silent failure would otherwise be invisible).
+                                try
+                                {
+                                    string trace = engine.DrainTrace();
+                                    foreach (var ln in trace.Split('\n'))
+                                        Logger.Info("[BUILD-INPROCESS] TRACE: " + ln);
+                                }
+                                catch { }
+                                return false;
+                            }
+                            // v2.6.9 — BuildOne returned true; .cs and .dll are current for this target.
+                            EditDirtyTracker.MarkClean(kbPath, t);
+                        }
+                        return true;
+                    }
+
+                    // Legacy path (RebuildAll, opt-out, or empty targets): SpecifyOneOnly + IdeWebBuildAndDeploy.
                     if (isBuildWithTargets)
                     {
                         if (!ExecuteSpecifyOneOnly(kbHandle, targets, engine))
@@ -100,8 +318,6 @@ namespace GxMcp.Worker.Services
                             return false;
                         }
                     }
-
-                    bool forceRebuild = action != null && action.Equals("RebuildAll", StringComparison.OrdinalIgnoreCase);
 
                     // Friction 2026-05-22 (experimental): when the caller passes
                     // skipFullDeploy=true on a single-target Build with no callees,
@@ -129,6 +345,249 @@ namespace GxMcp.Worker.Services
                     LogExceptionChain("Outer-Execute", ex);
                     return false;
                 }
+            }
+        }
+
+        // Compile-only fast-fast path. Bypasses BuildOne's hardcoded BuildOptions.BuildProcess
+        // (which forces Specify+Generate+Compile, ~25s warm on our reference KB) and invokes
+        // GenexusBLServices.Build.Build(...) directly with only the Compile flag. The .cs file
+        // must already be current — if it's stale the SDK errors and we fall back to BuildOne.
+        // Returns true on success, false on any reflection / execute failure.
+        private static bool ExecuteCompileOnly(object kbHandle, string objectName, Action<string, bool> lineSink)
+        {
+            try
+            {
+                if (_miRunCompile == null || _typeGenexusBLServices == null || _typeObjectNameHelper == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: required types not resolved");
+                    return false;
+                }
+
+                // KBObject = ObjectNameHelper.Get(kb.DesignModel, objectName)
+                var designModelProp = kbHandle.GetType().GetProperty("DesignModel", BindingFlags.Public | BindingFlags.Instance);
+                object designModel = designModelProp?.GetValue(kbHandle);
+                if (designModel == null) { Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: KB.DesignModel not found"); return false; }
+
+                // The Compile MSBuild task uses kb.DesignModel.Environment.TargetModel (not DesignModel itself).
+                // Mirror that — TargetModel is the language-specific model the compiler walks.
+                var envProp = designModel.GetType().GetProperty("Environment", BindingFlags.Public | BindingFlags.Instance);
+                object envObj = envProp?.GetValue(designModel);
+                object targetModel = null;
+                if (envObj != null)
+                {
+                    var tmProp = envObj.GetType().GetProperty("TargetModel", BindingFlags.Public | BindingFlags.Instance);
+                    targetModel = tmProp?.GetValue(envObj);
+                }
+                if (targetModel == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: KB.DesignModel.Environment.TargetModel not found — falling back to DesignModel");
+                    targetModel = designModel;
+                }
+
+                var getMi = _typeObjectNameHelper.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Get" && m.GetParameters().Length == 2 && m.GetParameters()[1].ParameterType == typeof(string));
+                if (getMi == null) { Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: ObjectNameHelper.Get not found"); return false; }
+
+                // ObjectNameHelper.Get(targetModel, name) — same as the MSBuild Compile task does.
+                object kbObject = getMi.Invoke(null, new object[] { targetModel, objectName });
+                if (kbObject == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: object '" + objectName + "' not found in target model");
+                    return false;
+                }
+                var keyProp = kbObject.GetType().GetProperty("Key", BindingFlags.Public | BindingFlags.Instance);
+                object entityKey = keyProp?.GetValue(kbObject);
+                if (entityKey == null) { Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: KBObject.Key not found"); return false; }
+
+                // Resolve the live IRunService instance.
+                var runProp = _typeGenexusBLServices.GetProperty("Run", BindingFlags.Public | BindingFlags.Static);
+                object runService = runProp?.GetValue(null);
+                if (runService == null) { Logger.Warn("[BUILD-INPROCESS] ExecuteCompileOnly: GenexusBLServices.Run returned null"); return false; }
+
+                lineSink("[BUILD-INPROCESS] compile-only (Run.Compile): targetModel + [" + objectName + "]", false);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                object result = _miRunCompile.Invoke(runService, new object[] { targetModel, entityKey });
+                sw.Stop();
+                bool ok = result is bool b && b;
+                Logger.Info("[BUILD-INPROCESS] ExecuteCompileOnly('" + objectName + "') returned " + ok + " in " + sw.ElapsedMilliseconds + "ms");
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                LogExceptionChain("ExecuteCompileOnly(" + objectName + ")", ex);
+                return false;
+            }
+        }
+
+        private enum BatchOutcome { Success, Failure, NotApplicable }
+
+        // Multi-target batch build. Resolves all object names to EntityKeys via
+        // ObjectNameHelper, builds a DevelopmentWorkingSet, and invokes the
+        // 4-arg overload of GenexusBLServices.Build.Build(workingSet, BuildOptions,
+        // IEnumerable<EntityKey>, CancellationToken). This is the same BL method
+        // BuildOne.Execute calls — but with N keys instead of 1, so the SDK runs
+        // a single shared Specify + Generate + Compile pipeline.
+        //
+        // Options match BuildOne exactly:
+        //   ContinueOnError | BuildProcess | BuildCalled
+        // (no Rebuild, no DetailedNavigation — those are RebuildAll / opt-in paths
+        // that don't reach this fast path today.)
+        //
+        // Returns Success / Failure based on the BL return value. NotApplicable
+        // signals "couldn't even attempt — fall through to per-target loop"
+        // (missing types, no object resolved).
+        private static BatchOutcome ExecuteBuildBatch(object kbHandle, List<string> objectNames, Action<string, bool> lineSink)
+        {
+            try
+            {
+                if (_miBuildBuild == null || _typeDevelopmentWorkingSet == null
+                    || _typeBuildOptions == null || _typeObjectNameHelper == null
+                    || _typeGenexusBLServices == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: required types not resolved");
+                    return BatchOutcome.NotApplicable;
+                }
+
+                // kb.DesignModel — same instance used by BuildOne.
+                var designModelProp = kbHandle.GetType().GetProperty("DesignModel", BindingFlags.Public | BindingFlags.Instance);
+                object designModel = designModelProp?.GetValue(kbHandle);
+                if (designModel == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: KB.DesignModel not found");
+                    return BatchOutcome.NotApplicable;
+                }
+
+                // Resolve every object name → EntityKey via ObjectNameHelper.Get(designModel, name).
+                // Mirrors BuildOne.Execute line: KBObject kBObject = ObjectNameHelper.Get(base.KB.DesignModel, ObjectName).
+                var getMi = _typeObjectNameHelper.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m => m.Name == "Get" && m.GetParameters().Length == 2 && m.GetParameters()[1].ParameterType == typeof(string));
+                if (getMi == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: ObjectNameHelper.Get(model,string) not found");
+                    return BatchOutcome.NotApplicable;
+                }
+
+                // Need EntityKey type to build the strongly-typed List<EntityKey> the BL expects.
+                var keysList = new List<string>(); // names, for log
+                System.Collections.IList typedList = null;
+                Type entityKeyType = _miBuildBuild.GetParameters()[2].ParameterType.IsGenericType
+                    ? _miBuildBuild.GetParameters()[2].ParameterType.GetGenericArguments()[0]
+                    : null;
+                if (entityKeyType == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: cannot infer EntityKey generic argument");
+                    return BatchOutcome.NotApplicable;
+                }
+                var listType = typeof(List<>).MakeGenericType(entityKeyType);
+                typedList = (System.Collections.IList)Activator.CreateInstance(listType);
+
+                foreach (var name in objectNames)
+                {
+                    object kbObject = getMi.Invoke(null, new object[] { designModel, name });
+                    if (kbObject == null)
+                    {
+                        // BuildOne treats an unresolved name as `return true` (no-op). To preserve
+                        // that semantics in a batch (one unknown name shouldn't poison the others),
+                        // we just skip it.
+                        lineSink("[BUILD-INPROCESS] batch: object '" + name + "' not found in DesignModel — skipping.", false);
+                        continue;
+                    }
+                    var keyProp = kbObject.GetType().GetProperty("Key", BindingFlags.Public | BindingFlags.Instance);
+                    object entityKey = keyProp?.GetValue(kbObject);
+                    if (entityKey == null)
+                    {
+                        Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: KBObject.Key null for '" + name + "'");
+                        continue;
+                    }
+                    typedList.Add(entityKey);
+                    keysList.Add(name);
+                }
+
+                if (typedList.Count == 0)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: no resolvable objects in target list");
+                    return BatchOutcome.NotApplicable;
+                }
+
+                // DevelopmentWorkingSet(designModel) — same single-arg ctor BuildOne uses.
+                var workingSetCtor = _typeDevelopmentWorkingSet.GetConstructors()
+                    .FirstOrDefault(c => c.GetParameters().Length == 1
+                        && string.Equals(c.GetParameters()[0].ParameterType.Name, "KBModel", StringComparison.Ordinal));
+                if (workingSetCtor == null)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: DevelopmentWorkingSet(KBModel) ctor not found");
+                    return BatchOutcome.NotApplicable;
+                }
+                object workingSet = workingSetCtor.Invoke(new object[] { designModel });
+
+                // BuildOptions = ContinueOnError | BuildProcess | BuildCalled (matches BuildOne).
+                // Composed as the enum's underlying int and cast back to the enum type.
+                int rawOpts = 0xE0 /*ContinueOnError*/ | 0x3800 /*BuildProcess*/ | 0x1 /*BuildCalled*/;
+                object buildOptions = Enum.ToObject(_typeBuildOptions, rawOpts);
+
+                using (var cts = new CancellationTokenSource())
+                {
+                    var buildProp = _typeGenexusBLServices.GetProperty("Build", BindingFlags.Public | BindingFlags.Static);
+                    object buildService = buildProp?.GetValue(null);
+                    if (buildService == null)
+                    {
+                        Logger.Warn("[BUILD-INPROCESS] ExecuteBuildBatch: GenexusBLServices.Build returned null");
+                        return BatchOutcome.NotApplicable;
+                    }
+
+                    lineSink("[BUILD-INPROCESS] batch BuildBatch: " + typedList.Count + " keys → BL.Build (shared spec/gen/compile).", false);
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    object result = _miBuildBuild.Invoke(buildService, new object[] { workingSet, buildOptions, typedList, cts.Token });
+                    sw.Stop();
+                    bool ok = result is bool b && b;
+                    Logger.Info("[BUILD-INPROCESS] ExecuteBuildBatch(" + string.Join(",", keysList) + ") returned " + ok
+                                + " in " + sw.ElapsedMilliseconds + "ms");
+                    return ok ? BatchOutcome.Success : BatchOutcome.Failure;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogExceptionChain("ExecuteBuildBatch(" + string.Join(",", objectNames) + ")", ex);
+                return BatchOutcome.Failure;
+            }
+        }
+
+        // Fast per-object build (IDE F5 parity). Returns true on Execute returning
+        // true; engine sink already captured any spec/gen/compile diagnostics.
+        private static bool ExecuteBuildOne(object kbHandle, string objectName, IBuildEngine engine, bool buildCalled)
+        {
+            try
+            {
+                var typeBuildOne = _typeBuildOne;
+                if (typeBuildOne == null)
+                {
+                    Logger.Error("[BUILD-INPROCESS] BuildOne type not loaded");
+                    return false;
+                }
+                object task = Activator.CreateInstance(typeBuildOne);
+                SetProp(task, "KB", kbHandle);
+                SetProp(task, "ObjectName", objectName);
+                SetProp(task, "ForceRebuild", false);
+                SetProp(task, "BuildCalled", buildCalled);
+                SetProp(task, "Output", "IDE");
+                SetProp(task, "EventsSuspended", true);
+                SetProp(task, "BuildEngine", engine);
+
+                var execute = typeBuildOne.GetMethod("Execute", BindingFlags.Public | BindingFlags.Instance);
+                if (execute == null)
+                {
+                    Logger.Error("[BUILD-INPROCESS] BuildOne.Execute method not found");
+                    return false;
+                }
+                object result = execute.Invoke(task, null);
+                bool ok = result is bool b && b;
+                if (!ok) Logger.Warn("[BUILD-INPROCESS] BuildOne.Execute returned false for '" + objectName + "'");
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                LogExceptionChain("BuildOne(" + objectName + ")", ex);
+                return false;
             }
         }
 
@@ -172,16 +631,138 @@ namespace GxMcp.Worker.Services
 
                 _typeSpecifyOneOnly = asm.GetType("Genexus.MsBuild.Tasks.SpecifyOneOnly", throwOnError: false);
                 _typeIdeWebBuildAndDeploy = asm.GetType("Genexus.MsBuild.Tasks.IdeWebBuildAndDeploy", throwOnError: false);
+                _typeBuildOne = asm.GetType("Genexus.MsBuild.Tasks.BuildOne", throwOnError: false);
 
                 if (_typeSpecifyOneOnly == null || _typeIdeWebBuildAndDeploy == null)
                 {
                     Logger.Error("[BUILD-INPROCESS] Required task types missing in Genexus.MsBuild.Tasks.dll "
                                  + "(SpecifyOneOnly=" + (_typeSpecifyOneOnly != null) + ", "
-                                 + "IdeWebBuildAndDeploy=" + (_typeIdeWebBuildAndDeploy != null) + ")");
+                                 + "IdeWebBuildAndDeploy=" + (_typeIdeWebBuildAndDeploy != null) + ", "
+                                 + "BuildOne=" + (_typeBuildOne != null) + ")");
                     return false;
                 }
 
-                Logger.Info("[BUILD-INPROCESS] Task types loaded from " + asmPath);
+                Logger.Info("[BUILD-INPROCESS] Task types loaded from " + asmPath
+                            + " (BuildOne fast path: " + (_typeBuildOne != null ? "available" : "missing") + ")");
+
+                // Compile-only fast-fast path: load the GeneXus BL types via the
+                // referenced assemblies of Genexus.MsBuild.Tasks (already loaded above).
+                // Failure here is non-fatal — we only lose the fast-fast path.
+                try
+                {
+                    Assembly LoadByName(string name)
+                    {
+                        var an = asm.GetReferencedAssemblies().FirstOrDefault(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                        return an != null ? Assembly.Load(an) : null;
+                    }
+                    var asmGxCommon = LoadByName("Artech.Genexus.Common");
+                    var asmArchCommon = LoadByName("Artech.Architecture.Common");
+                    if (asmGxCommon != null)
+                    {
+                        _typeGenexusBLServices = asmGxCommon.GetType("Artech.Genexus.Common.Services.GenexusBLServices", false);
+                        _typeBuildOptions = asmGxCommon.GetType("Artech.Genexus.Common.Commands.BuildOptions", false);
+                    }
+                    if (asmArchCommon != null)
+                    {
+                        // Confirmed via ilspycmd -l class: types live under .Objects and .Helpers,
+                        // not .Helpers.Build as the BuildOne decompile suggested.
+                        _typeDevelopmentWorkingSet = asmArchCommon.GetType("Artech.Architecture.Common.Objects.DevelopmentWorkingSet", false);
+                        _typeObjectNameHelper = asmArchCommon.GetType("Artech.Architecture.Common.Helpers.ObjectNameHelper", false);
+                    }
+                    // Resolve IBuildServiceBL.Build(workingSet, BuildOptions, IEnumerable<EntityKey>, CancellationToken).
+                    if (_typeGenexusBLServices != null && _typeBuildOptions != null && _typeDevelopmentWorkingSet != null)
+                    {
+                        var buildProp = _typeGenexusBLServices.GetProperty("Build", BindingFlags.Public | BindingFlags.Static);
+                        var serviceType = buildProp?.PropertyType;
+                        if (serviceType != null)
+                        {
+                            foreach (var mi in serviceType.GetMethods())
+                            {
+                                if (!string.Equals(mi.Name, "Build", StringComparison.Ordinal)) continue;
+                                var ps = mi.GetParameters();
+                                if (ps.Length != 4) continue;
+                                if (ps[0].ParameterType != _typeDevelopmentWorkingSet) continue;
+                                if (ps[1].ParameterType != _typeBuildOptions) continue;
+                                // ps[2] is IEnumerable<EntityKey>, ps[3] is CancellationToken
+                                _miBuildBuild = mi;
+                                break;
+                            }
+                        }
+                    }
+                    // Resolve IRunService.Compile(KBModel, EntityKey) → bool.
+                    if (_typeGenexusBLServices != null)
+                    {
+                        var runProp = _typeGenexusBLServices.GetProperty("Run", BindingFlags.Public | BindingFlags.Static);
+                        var runServiceType = runProp?.PropertyType;
+                        if (runServiceType != null)
+                        {
+                            foreach (var mi in runServiceType.GetMethods())
+                            {
+                                if (!string.Equals(mi.Name, "Compile", StringComparison.Ordinal)) continue;
+                                var ps = mi.GetParameters();
+                                if (ps.Length != 2) continue;
+                                // ps[0] is KBModel, ps[1] is EntityKey — match by type name (avoids type-loading cycles).
+                                if (!string.Equals(ps[0].ParameterType.Name, "KBModel", StringComparison.Ordinal)) continue;
+                                if (!string.Equals(ps[1].ParameterType.Name, "EntityKey", StringComparison.Ordinal)) continue;
+                                _miRunCompile = mi;
+                                break;
+                            }
+                        }
+                    }
+
+                    Logger.Info("[BUILD-INPROCESS] Compile-only path: "
+                                + (_miRunCompile != null ? "available (Run.Compile)" : (_miBuildBuild != null ? "available (Build.Build — slow, forces spec)" : "missing"))
+                                + " (BL=" + (_typeGenexusBLServices != null)
+                                + ", BuildOptions=" + (_typeBuildOptions != null)
+                                + ", DevSet=" + (_typeDevelopmentWorkingSet != null)
+                                + ", ObjNameHelper=" + (_typeObjectNameHelper != null)
+                                + ", RunCompile=" + (_miRunCompile != null) + ")");
+                }
+                catch (Exception coEx)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] Compile-only resolution failed (non-fatal): " + coEx.Message);
+                }
+
+                // 2026-05-22 (Path 1) — SDK has a "resilient Specifier daemon" mode
+                // (SpecifierRecycleCount=0) that keeps the daemon + caches alive between
+                // BuildOne calls. Live benchmark on the reference KB showed this REGRESSED
+                // warm spec time from ~16s to ~25s — without recycle the daemon accumulates
+                // state and gets slower, not faster. Kept as opt-in (GXMCP_RESILIENT_SPEC=1)
+                // for KBs where the trade-off might be different. The override path is
+                // safe (InProcessBag in-memory only, no disk write). Default OFF.
+                try
+                {
+                    if (string.Equals(Environment.GetEnvironmentVariable("GXMCP_RESILIENT_SPEC"), "1", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Assembly LoadByName2(string name)
+                        {
+                            var an = asm.GetReferencedAssemblies().FirstOrDefault(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                            return an != null ? Assembly.Load(an) : null;
+                        }
+                        var commonHelpers = LoadByName2("Artech.Common.Helpers") ?? AppDomain.CurrentDomain.GetAssemblies()
+                            .FirstOrDefault(a => a.GetName().Name.Equals("Artech.Common.Helpers", StringComparison.OrdinalIgnoreCase));
+                        if (commonHelpers == null)
+                        {
+                            commonHelpers = Assembly.LoadFrom(Path.Combine(gxDir, "Artech.Common.Helpers.dll"));
+                        }
+                        var bagType = commonHelpers?.GetType("Artech.Common.Helpers.SharedMemory.InProcessBag", false);
+                        var getBagMi = bagType?.GetMethod("GetBag", BindingFlags.Public | BindingFlags.Static);
+                        var bag = getBagMi?.Invoke(null, new object[] { "DAEMON" }) as System.Collections.IDictionary;
+                        if (bag != null)
+                        {
+                            bag["SpecifierRecycleCount"] = "0"; // 0 = resilient mode (keep daemon + caches alive)
+                            Logger.Info("[BUILD-INPROCESS] Resilient Specifier daemon enabled (SpecifierRecycleCount=0 in DAEMON bag)");
+                        }
+                        else
+                        {
+                            Logger.Warn("[BUILD-INPROCESS] Resilient Specifier setup: InProcessBag(DAEMON) not resolvable — leaving SDK default (-1).");
+                        }
+                    }
+                }
+                catch (Exception rsEx)
+                {
+                    Logger.Warn("[BUILD-INPROCESS] Resilient Specifier setup failed (non-fatal): " + rsEx.Message);
+                }
 
                 // Force-trigger Artech.MsBuild.Common.ArtechTask's static ctor in
                 // isolation so we can capture the REAL cause (the live runtime hides

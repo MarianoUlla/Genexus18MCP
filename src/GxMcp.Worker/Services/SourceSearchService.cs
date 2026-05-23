@@ -17,6 +17,12 @@ namespace GxMcp.Worker.Services
         public bool CaseSensitive { get; set; }
         public string TypeFilter { get; set; }
         public List<string> Scope { get; set; } = new List<string> { "source" };
+        /// <summary>
+        /// Item 22: wider field search. Values: source (default), caption,
+        /// description, parmNames. When any non-source value is present the
+        /// search scans that metadata field instead of / in addition to source.
+        /// </summary>
+        public List<string> Fields { get; set; } = null; // null = default [source]
         public int MaxResults { get; set; } = 50;
         public bool IncludeComments { get; set; }
         // v2.3.8 (Task 2.1): hard wall-clock cap. Distinct from the legacy
@@ -169,6 +175,75 @@ namespace GxMcp.Worker.Services
                                     hits.Add(BuildHit(e, part, lines, li + 1, null));
                                     produced++;
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Item 22: fields=[caption,description,parmNames] — metadata-only search.
+                // Only runs when Fields contains non-source values AND a pattern is supplied.
+                var extraFields = c.Fields != null
+                    ? c.Fields.Where(f => !string.Equals(f, "source", StringComparison.OrdinalIgnoreCase)).ToList()
+                    : new List<string>();
+                if (extraFields.Count > 0 && rx != null)
+                {
+                    var allEntries = index.Objects.Values
+                        .Where(e => string.IsNullOrEmpty(c.TypeFilter) || string.Equals(e.Type, c.TypeFilter, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    foreach (var e in allEntries)
+                    {
+                        if (produced >= c.MaxResults) break;
+                        if (ct.IsCancellationRequested) break;
+                        if (swBudget.ElapsedMilliseconds > timeoutMs) break;
+
+                        foreach (var field in extraFields)
+                        {
+                            if (produced >= c.MaxResults) break;
+                            string fieldValue = null;
+                            if (string.Equals(field, "description", StringComparison.OrdinalIgnoreCase))
+                                fieldValue = e.Description;
+                            else if (string.Equals(field, "caption", StringComparison.OrdinalIgnoreCase) ||
+                                     string.Equals(field, "parmNames", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Caption / parmNames require SDK access
+                                KBObject obj2 = null;
+                                try { obj2 = _objectService.FindObject(e.Name); } catch { }
+                                if (obj2 == null) continue;
+                                if (string.Equals(field, "caption", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    try
+                                    {
+                                        dynamic dyn = obj2;
+                                        fieldValue = dyn?.Form?.Caption?.ToString() ?? dyn?.Caption?.ToString() ?? "";
+                                    }
+                                    catch { fieldValue = ""; }
+                                }
+                                else // parmNames — scan Rules part for 'parm(' signature
+                                {
+                                    try
+                                    {
+                                        string rulesSrc = TryGetPartSource(obj2, "rules");
+                                        if (!string.IsNullOrEmpty(rulesSrc))
+                                        {
+                                            var parmMatch = System.Text.RegularExpressions.Regex.Match(
+                                                rulesSrc, @"parm\s*\(([^)]+)\)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                            fieldValue = parmMatch.Success ? parmMatch.Groups[1].Value : "";
+                                        }
+                                    }
+                                    catch { fieldValue = ""; }
+                                }
+                            }
+                            if (string.IsNullOrEmpty(fieldValue)) continue;
+                            if (rx.IsMatch(fieldValue))
+                            {
+                                hits.Add(new JObject
+                                {
+                                    ["objectName"] = e.Name,
+                                    ["type"] = e.Type,
+                                    ["field"] = field,
+                                    ["matchedValue"] = fieldValue
+                                });
+                                produced++;
                             }
                         }
                     }

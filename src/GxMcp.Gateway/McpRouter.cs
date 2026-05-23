@@ -1059,6 +1059,64 @@ namespace GxMcp.Gateway
         }
 
         /// <summary>
+        /// Default token limit reported in <c>_meta.tokens</c>. Configurable; default 25000.
+        /// </summary>
+        internal const int MetaTokenLimit = 25000;
+
+        /// <summary>
+        /// Injects <c>_meta.tokens</c> into the inner JSON payload carried by
+        /// <c>toolResult.content[0].text</c>.  Tokens are estimated as
+        /// <c>Math.Round(charCount / 4)</c>.  When <c>_meta.tokens</c> already exists it is
+        /// merged rather than replaced.  A non-null <c>hint</c> is added when usage exceeds
+        /// 50% of <see cref="MetaTokenLimit"/>.
+        /// </summary>
+        internal static void InjectMetaTokens(JObject toolResult)
+        {
+            try
+            {
+                var content = toolResult["content"] as JArray;
+                var first = content?[0] as JObject;
+                var textToken = first?["text"];
+                if (textToken == null) return;
+
+                string textStr = textToken.ToString();
+
+                JObject? inner;
+                try { inner = JObject.Parse(textStr); }
+                catch { return; /* non-JSON text payload — leave alone */ }
+
+                // Merge: don't overwrite an existing _meta.tokens block if already set.
+                var meta = (JObject?)inner["_meta"] ?? new JObject();
+                if (meta["tokens"] == null)
+                {
+                    // Stamp the block first so the size estimate reflects the *emitted*
+                    // payload, not the pre-injection text — otherwise responses near the
+                    // 50% threshold are under-reported and never get the pagination hint.
+                    var tokenBlock = new JObject
+                    {
+                        ["used"] = 0,
+                        ["limit"] = MetaTokenLimit,
+                        ["hint"] = JValue.CreateNull()
+                    };
+                    meta["tokens"] = tokenBlock;
+                    inner["_meta"] = meta;
+
+                    string emitted = inner.ToString(Newtonsoft.Json.Formatting.None);
+                    int used = (int)Math.Round(emitted.Length / 4.0);
+                    tokenBlock["used"] = used;
+                    if (used > MetaTokenLimit / 2)
+                    {
+                        tokenBlock["hint"] = used > MetaTokenLimit
+                            ? "Response exceeds token limit. Use fields/axiCompact=true, narrower filters, or pagination to reduce size."
+                            : "Response is over 50% of the token limit. Consider fields/axiCompact=true or pagination for follow-up calls.";
+                    }
+                    first["text"] = inner.ToString(Newtonsoft.Json.Formatting.None);
+                }
+            }
+            catch { /* token injection must never break the response */ }
+        }
+
+        /// <summary>
         /// Resolves a background-job ID from lifecycle tool arguments.
         /// Tries <c>job_id</c>, then <c>jobId</c>, then <c>target</c> (the lifecycle tool's
         /// conventional parameter), returning the first non-empty value found.
@@ -1107,6 +1165,17 @@ namespace GxMcp.Gateway
         // long-poll cover the slowest realistic build.
         public const int MaxLongPollSeconds = 600;
 
+        // Bug 2026-05-22: blocking the stdio response for >~60s with no traffic
+        // makes Claude Code's MCP client treat the request as dead and close
+        // the transport ("MCP error -32000: Connection closed"). When the
+        // caller did NOT include a progressToken we have no way to keep the
+        // client alive, so cap the effective wait below the observed client
+        // timeout and let the caller re-poll. With a progressToken we emit
+        // notifications/progress on HeartbeatIntervalSeconds and can safely
+        // respect the full MaxLongPollSeconds.
+        public const int SafeLongPollSecondsWithoutProgress = 50;
+        public const int HeartbeatIntervalSeconds = 15;
+
         /// <summary>
         /// Long-polls <paramref name="registry"/> for <paramref name="jobId"/> until it reaches a terminal
         /// state or <paramref name="waitSeconds"/> elapses (clamped 0–<see cref="MaxLongPollSeconds"/>).
@@ -1115,24 +1184,65 @@ namespace GxMcp.Gateway
         ///   <item><c>wait_seconds=0</c> (or omitted) → immediate single poll, no blocking.</item>
         ///   <item>Unknown job → envelope with <c>error="unknown_job_id"</c>.</item>
         ///   <item>Terminal job → returns immediately regardless of <paramref name="waitSeconds"/>.</item>
+        ///   <item>When <paramref name="progressToken"/> is supplied and <paramref name="heartbeat"/> is non-null,
+        ///         emits an MCP <c>notifications/progress</c> JSON-RPC payload every <see cref="HeartbeatIntervalSeconds"/>
+        ///         so the client doesn't time out the in-flight request.</item>
+        ///   <item>When no <paramref name="progressToken"/> is available the effective wait is capped at
+        ///         <see cref="SafeLongPollSecondsWithoutProgress"/> regardless of the requested
+        ///         <paramref name="waitSeconds"/> — callers re-poll to cover longer waits.</item>
         /// </list>
         /// </summary>
         internal static async Task<JObject> LongPollJob(
             BackgroundJobRegistry registry,
             string jobId,
-            int waitSeconds)
+            int waitSeconds,
+            JToken? progressToken = null,
+            Func<JObject, Task>? heartbeat = null)
         {
             // Clamp wait_seconds to [0, MaxLongPollSeconds]
-            waitSeconds = Math.Min(Math.Max(waitSeconds, 0), MaxLongPollSeconds);
+            int requestedWaitSeconds = Math.Min(Math.Max(waitSeconds, 0), MaxLongPollSeconds);
 
-            var deadline = DateTime.UtcNow.AddSeconds(waitSeconds);
+            // A JToken with Type=Null is not C# null but carries no useful progressToken
+            // value (client sent `_meta.progressToken: null`). Treat it as absent so the
+            // safe-wait cap fires and we don't emit progress notifications with a null token.
+            bool hasUsefulProgressToken = progressToken != null && progressToken.Type != Newtonsoft.Json.Linq.JTokenType.Null;
+            bool canHeartbeat = hasUsefulProgressToken && heartbeat != null;
+            int effectiveWaitSeconds = canHeartbeat
+                ? requestedWaitSeconds
+                : Math.Min(requestedWaitSeconds, SafeLongPollSecondsWithoutProgress);
+            bool capApplied = effectiveWaitSeconds < requestedWaitSeconds;
+
+            var startedAt = DateTime.UtcNow;
+            var deadline = startedAt.AddSeconds(effectiveWaitSeconds);
+            var nextHeartbeatAt = startedAt.AddSeconds(HeartbeatIntervalSeconds);
             JobEntry? job;
 
             do
             {
                 job = registry.Get(jobId);
-                if (job == null || job.Status != "running" || waitSeconds == 0)
+                if (job == null || job.Status != "running" || effectiveWaitSeconds == 0)
                     break;
+
+                if (canHeartbeat && DateTime.UtcNow >= nextHeartbeatAt)
+                {
+                    int elapsed = (int)(DateTime.UtcNow - startedAt).TotalSeconds;
+                    var note = new JObject
+                    {
+                        ["jsonrpc"] = "2.0",
+                        ["method"] = "notifications/progress",
+                        ["params"] = new JObject
+                        {
+                            ["progressToken"] = progressToken!.DeepClone(),
+                            ["progress"] = elapsed,
+                            ["total"] = effectiveWaitSeconds,
+                            ["message"] = $"job {jobId} still running ({elapsed}s elapsed, status={job.Status})"
+                        }
+                    };
+                    try { await heartbeat!(note).ConfigureAwait(false); }
+                    catch { /* heartbeat failure must not abort the poll */ }
+                    nextHeartbeatAt = DateTime.UtcNow.AddSeconds(HeartbeatIntervalSeconds);
+                }
+
                 await Task.Delay(250).ConfigureAwait(false);
             }
             while (DateTime.UtcNow < deadline);
@@ -1146,7 +1256,7 @@ namespace GxMcp.Gateway
                 };
             }
 
-            return new JObject
+            var envelope = new JObject
             {
                 ["job_id"] = job.Id,
                 ["status"] = job.Status,
@@ -1155,6 +1265,17 @@ namespace GxMcp.Gateway
                 ["estimated_seconds"] = job.EstimatedSeconds,
                 ["result"] = job.Result
             };
+
+            // Surface the safe-wait cap so callers know to re-poll: we returned early
+            // (relative to their requested wait_seconds) because no progressToken was
+            // available to keep their connection alive past SafeLongPollSecondsWithoutProgress.
+            if (capApplied && string.Equals(job.Status, "running", StringComparison.OrdinalIgnoreCase))
+            {
+                envelope["capped"] = true;
+                envelope["cappedAtSeconds"] = SafeLongPollSecondsWithoutProgress;
+            }
+
+            return envelope;
         }
 
         // v2.6.4 (#18): lifecycle action=result for op:<id> reads the stored

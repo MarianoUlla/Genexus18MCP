@@ -149,7 +149,7 @@ namespace GxMcp.Worker.Services
             }
         }
 
-        public string ApplyPatch(string target, string partName, string operation, string content, string context = null, int expectedCount = 1, string typeFilter = null, bool dryRun = false, bool verifyRollback = false, bool returnPostState = true, bool verbose = false)
+        public string ApplyPatch(string target, string partName, string operation, string content, string context = null, int expectedCount = 1, string typeFilter = null, bool dryRun = false, bool verifyRollback = false, bool returnPostState = true, bool verbose = false, bool replaceAll = false)
         {
             // Friction 2026-05-22: capture entry timestamp so a NoMatch we see at
             // the end can be cross-checked against WriteService.WasTargetWrittenSince
@@ -234,7 +234,7 @@ namespace GxMcp.Worker.Services
                             return BuildPatchResult("NoChange", partName, normalizedOperation, expectedCount, 1, "Patch content is identical to context. Write skipped.");
                         }
 
-                        updatedSource = TryReplace(sourceLines, contextLines ?? new string[0], workContent, expectedCount, out status, out details, out matchCount);
+                        updatedSource = TryReplace(sourceLines, contextLines ?? new string[0], workContent, expectedCount, out status, out details, out matchCount, replaceAll);
                         break;
 
                     case "insert_after":
@@ -286,7 +286,7 @@ namespace GxMcp.Worker.Services
                             patchStopwatch.Restart();
                             if (normalizedOperation == "replace")
                             {
-                                updatedSource = TryReplace(sourceLines, contextLines ?? new string[0], workContent, expectedCount, out status, out details, out matchCount);
+                                updatedSource = TryReplace(sourceLines, contextLines ?? new string[0], workContent, expectedCount, out status, out details, out matchCount, replaceAll);
                             }
                             else if (normalizedOperation == "insert_after")
                             {
@@ -354,7 +354,7 @@ namespace GxMcp.Worker.Services
                                 // when similarity is high enough that the agent likely just has
                                 // the wrong tabs/EOLs/one wrong char.
                                 var top = near[0];
-                                if (top.Similarity >= 0.80 && top.StartLine + contextLines.Length <= sourceLines.Length)
+                                if (top.StartLine + contextLines.Length <= sourceLines.Length)
                                 {
                                     var sb = new System.Text.StringBuilder();
                                     for (int i = 0; i < contextLines.Length; i++)
@@ -364,7 +364,70 @@ namespace GxMcp.Worker.Services
                                     }
                                     string bestWindow = sb.ToString();
                                     string ctxJoined = string.Join("\n", contextLines);
-                                    failureJson["nearMatchHintDetail"] = GxMcp.Worker.Helpers.DiffBuilder.ByteLevelDivergence(bestWindow, ctxJoined);
+
+                                    if (top.Similarity >= 0.80)
+                                    {
+                                        failureJson["nearMatchHintDetail"] = GxMcp.Worker.Helpers.DiffBuilder.ByteLevelDivergence(bestWindow, ctxJoined);
+                                    }
+
+                                    // Item 4 (friction 2026-05-22): EOL mismatch short diff.
+                                    // When context lines have different EOL from source, show the
+                                    // first 3 lines the agent passed vs what the file actually has,
+                                    // so the agent can see the divergence at a glance.
+                                    int eolDiffLines = Math.Min(3, contextLines.Length);
+                                    bool eolMismatchDetected = false;
+                                    var eolDiffArr = new JArray();
+                                    for (int i = 0; i < eolDiffLines; i++)
+                                    {
+                                        string agentLine = contextLines[i];
+                                        string fileLine = sourceLines[top.StartLine + i];
+                                        // Highlight if they differ only by EOL/trailing whitespace
+                                        bool linesMatchNorm = string.Equals(agentLine.TrimEnd(), fileLine.TrimEnd(), StringComparison.Ordinal);
+                                        bool linesMatchExact = string.Equals(agentLine, fileLine, StringComparison.Ordinal);
+                                        if (linesMatchNorm && !linesMatchExact)
+                                        {
+                                            eolMismatchDetected = true;
+                                        }
+                                        eolDiffArr.Add(new JObject
+                                        {
+                                            ["lineNo"] = top.StartLine + i + 1,
+                                            ["agent"] = ShowControlChars(agentLine),
+                                            ["file"] = ShowControlChars(fileLine),
+                                            ["match"] = linesMatchNorm ? "eol_only" : (linesMatchExact ? "exact" : "differs")
+                                        });
+                                    }
+                                    if (eolMismatchDetected || top.Similarity >= 0.60)
+                                    {
+                                        failureJson["eolDiff"] = eolDiffArr;
+                                        if (eolMismatchDetected)
+                                        {
+                                            failureJson["eolDiffHint"] = "Lines differ only in trailing whitespace or EOL. The find context is otherwise correct — the patch pipeline normalizes EOLs automatically, so this mismatch should not cause NoMatch. Check for invisible characters or tab/space mix beyond trailing whitespace.";
+                                        }
+                                    }
+
+                                    // Item 17 (friction 2026-05-22): Levenshtein-based did_you_mean.
+                                    // Compute edit distance between joined context and best window.
+                                    // Threshold: distance <= ceil(0.20 * len(context)).
+                                    // Guards: skip on huge contexts (O(n²) on STA thread would
+                                    // stall all in-process operations) and on low-similarity
+                                    // near-matches (the suggestion would point at unrelated code).
+                                    int ctxLen = ctxJoined.Length;
+                                    const int LevenshteinMaxLen = 2000;
+                                    if (ctxLen <= LevenshteinMaxLen && top.Similarity >= 0.50)
+                                    {
+                                        int threshold = (int)Math.Ceiling(0.20 * ctxLen);
+                                        int levenDist = LevenshteinDistance(ctxJoined, bestWindow, threshold + 1);
+                                        if (levenDist <= threshold)
+                                        {
+                                            failureJson["did_you_mean"] = new JObject
+                                            {
+                                                ["startLine"] = top.StartLine + 1,
+                                                ["endLine"] = top.StartLine + contextLines.Length,
+                                                ["levenshteinDistance"] = levenDist,
+                                                ["snippet"] = bestWindow.Length > 300 ? bestWindow.Substring(0, 297) + "..." : bestWindow
+                                            };
+                                        }
+                                    }
                                 }
 
                                 failure = failureJson.ToString();
@@ -638,7 +701,7 @@ namespace GxMcp.Worker.Services
             }
         }
 
-        private string TryReplace(string[] sourceLines, string[] contextLines, string newContent, int expectedCount, out string status, out string details, out int matchCount)
+        private string TryReplace(string[] sourceLines, string[] contextLines, string newContent, int expectedCount, out string status, out string details, out int matchCount, bool replaceAll = false)
         {
             status = "Applied";
             details = string.Empty;
@@ -646,19 +709,21 @@ namespace GxMcp.Worker.Services
 
             string source = string.Join("\n", sourceLines);
             string context = string.Join("\n", contextLines);
-            
+
             // 1. Exact match attempt
             int exactCount = CountOccurrences(source, context);
             matchCount = exactCount;
-            if (exactCount == expectedCount)
+            // Item 9: replaceAll=true → treat expectedCount as "however many exist"
+            int effectiveExpected = replaceAll && exactCount > 0 ? exactCount : expectedCount;
+            if (exactCount == effectiveExpected && exactCount > 0)
             {
                 Logger.Info("[PATCH] Exact match found.");
                 return source.Replace(context, newContent);
             }
-            if (exactCount > 0)
+            if (exactCount > 0 && !replaceAll)
             {
                 status = "Ambiguous";
-                details = $"Ambiguous patch: Found {exactCount} exact matches, but expected {expectedCount}. Please provide more context to uniquely identify the block.";
+                details = $"Ambiguous patch: Found {exactCount} exact matches, but expected {expectedCount}. Provide more context to uniquely identify the block, or pass replaceAll=true to apply to all occurrences.";
                 return string.Empty;
             }
 
@@ -666,8 +731,9 @@ namespace GxMcp.Worker.Services
             Logger.Info("[PATCH] Exact match failed or count mismatch (" + exactCount + " vs " + expectedCount + "). Attempting fuzzy match.");
             var indices = FindFuzzyMatches(sourceLines, contextLines);
             matchCount = indices.Count;
-            
-            if (indices.Count == expectedCount && indices.Count > 0)
+            int fuzzyEffective = replaceAll && indices.Count > 0 ? indices.Count : expectedCount;
+
+            if (indices.Count == fuzzyEffective && indices.Count > 0)
             {
                 var resultLines = new List<string>(sourceLines);
                 var replacementLines = newContent.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
@@ -684,10 +750,10 @@ namespace GxMcp.Worker.Services
                 return string.Join("\n", resultLines);
             }
 
-            if (indices.Count > 0)
+            if (indices.Count > 0 && !replaceAll)
             {
                 status = "Ambiguous";
-                details = $"Ambiguous patch: Found {indices.Count} fuzzy matches, but expected {expectedCount}. Please provide more context to uniquely identify the block.";
+                details = $"Ambiguous patch: Found {indices.Count} fuzzy matches, but expected {expectedCount}. Provide more context to uniquely identify the block, or pass replaceAll=true to apply to all occurrences.";
                 return string.Empty;
             }
 
@@ -701,7 +767,10 @@ namespace GxMcp.Worker.Services
             if (!string.IsNullOrEmpty(normalizedContext))
             {
                 int normalizedHits = CountOccurrences(normalizedSource, normalizedContext);
-                if (normalizedHits == expectedCount && expectedCount > 0)
+                // Item 9 follow-up: honor replaceAll on the whitespace-normalized fallback too,
+                // so the flag isn't silently ignored when only this last-resort path finds matches.
+                int normalizedExpected = replaceAll && normalizedHits > 0 ? normalizedHits : expectedCount;
+                if (normalizedHits == normalizedExpected && normalizedHits > 0)
                 {
                     // Walk source line-by-line accumulating windows until a window's collapsed
                     // form equals the normalized context, then splice in the replacement.
@@ -709,15 +778,15 @@ namespace GxMcp.Worker.Services
                     if (rebuilt != null)
                     {
                         Logger.Info("[PATCH] Whitespace-normalized match applied.");
-                        matchCount = expectedCount;
+                        matchCount = normalizedHits;
                         return rebuilt;
                     }
                 }
-                else if (normalizedHits > 0)
+                else if (normalizedHits > 0 && !replaceAll)
                 {
                     status = "Ambiguous";
                     matchCount = normalizedHits;
-                    details = $"Ambiguous patch (whitespace-normalized): {normalizedHits} matches, expected {expectedCount}.";
+                    details = $"Ambiguous patch (whitespace-normalized): {normalizedHits} matches, expected {expectedCount}. Pass replaceAll=true to apply to every match.";
                     return string.Empty;
                 }
             }
@@ -930,6 +999,51 @@ namespace GxMcp.Worker.Services
             hits.Sort((a, b) => b.Similarity.CompareTo(a.Similarity));
             if (hits.Count > topN) hits = hits.GetRange(0, topN);
             return hits;
+        }
+
+        // Item 4 (friction 2026-05-22): render control characters visibly so the
+        // agent can see CRLF vs LF differences in the eolDiff output.
+        private static string ShowControlChars(string s)
+        {
+            if (s == null) return string.Empty;
+            return s.Replace("\r\n", "↵\n").Replace("\r", "←").Replace("\t", "→");
+        }
+
+        // Item 17 (friction 2026-05-22): Levenshtein edit distance with early-exit
+        // when the running minimum exceeds maxDist (avoids O(n²) on large mismatches).
+        // maxDist = -1 means "no limit".
+        internal static int LevenshteinDistance(string a, string b, int maxDist = -1)
+        {
+            if (a == null) a = string.Empty;
+            if (b == null) b = string.Empty;
+            int m = a.Length, n = b.Length;
+            bool hasLimit = maxDist >= 0;
+            if (hasLimit && Math.Abs(m - n) > maxDist) return maxDist + 1;
+            if (m == 0) return n;
+            if (n == 0) return m;
+
+            // Use two rows to limit memory; strings > 4 KB are capped to avoid O(n²) pathology.
+            const int MaxLen = 4096;
+            if (m > MaxLen || n > MaxLen) return hasLimit ? maxDist + 1 : int.MaxValue;
+
+            var prev = new int[n + 1];
+            var curr = new int[n + 1];
+            for (int j = 0; j <= n; j++) prev[j] = j;
+
+            for (int i = 1; i <= m; i++)
+            {
+                curr[0] = i;
+                int rowMin = curr[0];
+                for (int j = 1; j <= n; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    curr[j] = Math.Min(Math.Min(prev[j] + 1, curr[j - 1] + 1), prev[j - 1] + cost);
+                    if (curr[j] < rowMin) rowMin = curr[j];
+                }
+                if (hasLimit && rowMin > maxDist) return maxDist + 1;
+                var tmp = prev; prev = curr; curr = tmp;
+            }
+            return prev[n];
         }
 
         private static bool LinesMatchFuzzy(string s1, string s2)

@@ -254,15 +254,20 @@ namespace GxMcp.Worker.Services
             }
         }
 
-        public string ReadLogs(int lines, string filterCorrelation, string grepPattern, string sinceMode = null)
+        // Item 32: objectFilter added. sinceMode now also accepts an ISO-8601 timestamp;
+        // the legacy 'crash' sentinel is still honoured for backward compatibility.
+        // logPathOverride: test-only seam so unit tests can inject a temp file path.
+        public string ReadLogs(int lines, string filterCorrelation, string grepPattern, string sinceMode = null, string objectFilter = null, string logPathOverride = null)
         {
             try
             {
-                if (lines <= 0) lines = 50;
-                if (lines > 500) lines = 500;
+                if (lines <= 0) lines = 100;
+                if (lines > 2000) lines = 2000;
 
                 string exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly()?.Location ?? Process.GetCurrentProcess().MainModule.FileName) ?? "";
-                string logPath = Path.Combine(exeDir, "worker_debug.log");
+                string logPath = !string.IsNullOrEmpty(logPathOverride)
+                    ? logPathOverride
+                    : Path.Combine(exeDir, "worker_debug.log");
                 if (!File.Exists(logPath))
                 {
                     return "{\"status\":\"Error\", \"error\":\"Log file not found at " + CommandDispatcher.EscapeJsonString(logPath) + "\"}";
@@ -303,6 +308,37 @@ namespace GxMcp.Worker.Services
                         filtered = allLines.Skip(start);
                     }
                 }
+                else if (!string.IsNullOrWhiteSpace(sinceMode))
+                {
+                    // Item 32: since=<ISO timestamp> — skip lines whose leading timestamp
+                    // is before the requested cutoff. Log format: [yyyy-MM-dd HH:mm:ss.fff]
+                    // Lines that don't carry a parseable timestamp are kept (defensive).
+                    if (DateTime.TryParse(sinceMode, null, System.Globalization.DateTimeStyles.RoundtripKind | System.Globalization.DateTimeStyles.AllowWhiteSpaces, out DateTime sinceDt))
+                    {
+                        // Normalize to UTC so a client-supplied "...Z" timestamp compares correctly
+                        // against log-line timestamps (the worker writes them in local time).
+                        DateTime sinceUtc = sinceDt.Kind == DateTimeKind.Utc ? sinceDt : sinceDt.ToUniversalTime();
+                        filtered = allLines.Where(l =>
+                        {
+                            // Try to parse the leading [yyyy-MM-dd HH:mm:ss.fff] prefix.
+                            if (l.Length > 2 && l[0] == '[')
+                            {
+                                int close = l.IndexOf(']');
+                                if (close > 0)
+                                {
+                                    string ts = l.Substring(1, close - 1);
+                                    if (DateTime.TryParse(ts, null, System.Globalization.DateTimeStyles.AssumeLocal, out DateTime lineTs))
+                                        return lineTs.ToUniversalTime() >= sinceUtc;
+                                }
+                            }
+                            return true; // unparseable timestamp — keep line
+                        });
+                    }
+                }
+
+                // Item 32: object-name filter — only lines mentioning the object.
+                if (!string.IsNullOrWhiteSpace(objectFilter))
+                    filtered = filtered.Where(l => l.IndexOf(objectFilter, StringComparison.OrdinalIgnoreCase) >= 0);
 
                 if (!string.IsNullOrWhiteSpace(filterCorrelation))
                     filtered = filtered.Where(l => l.IndexOf(filterCorrelation, StringComparison.OrdinalIgnoreCase) >= 0);
@@ -322,7 +358,12 @@ namespace GxMcp.Worker.Services
                 var result = new JObject
                 {
                     ["status"] = "Success",
+                    // Item 32: surface the log path so the agent can read adjacent logs
+                    // (gateway_debug.log, probe.log, etc.) directly via genexus_asset.
+                    ["logPath"] = logPath,
+                    // Back-compat alias: prior shape exposed the file location as "path".
                     ["path"] = logPath,
+                    ["logDir"] = exeDir,
                     ["totalLines"] = allLines.Count,
                     ["matched"] = tail.Count,
                     ["lines"] = string.Join("\n", tail)

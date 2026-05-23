@@ -61,6 +61,9 @@ namespace GxMcp.Gateway.Routers
                             return new { module = "Analyze", action = "Summarize", target = target, type = type };
                         case "explain":
                             return new { module = "Analyze", action = "ExplainCode", target = target, payload = args?["code"]?.ToString(), type = type };
+                        case "callers":
+                            // Item 24: per-call-site detail with line + context.
+                            return new { module = "Analyze", action = "FindCallerSites", target = target, type = type };
                         case "parent_context":
                             // FR#18 (Stream G, v2.6.6): classifies how a WebPanel / SDPanel is
                             // invoked by its callers (popup vs standalone) so the agent picks

@@ -59,6 +59,7 @@ namespace GxMcp.Worker.Services
         private readonly EditAndBuildOrchestrator _editAndBuildOrchestrator;
         private readonly PreviewService _previewService;
         private readonly PopupTemplateService _popupTemplateService;
+        private readonly UndoService _undoService;
 
         private CommandDispatcher()
         {
@@ -111,6 +112,7 @@ namespace GxMcp.Worker.Services
             _editAndBuildOrchestrator = new EditAndBuildOrchestrator(_writeService, _analyzeService, _buildService);
             _previewService = new PreviewService(_objectService, _buildService);
             _popupTemplateService = new PopupTemplateService(_objectService, _writeService);
+            _undoService = new UndoService(_objectService, _writeService, _indexCacheService);
 
             // Phase 2: Late Linking
             _kbService.SetBuildService(_buildService);
@@ -394,6 +396,9 @@ namespace GxMcp.Worker.Services
                             };
                             if (args?["scope"] is JArray scopeArr)
                                 criteria.Scope = scopeArr.Select(t => t.ToString()).ToList();
+                            // Item 22: fields=[source,caption,description,parmNames]
+                            if (args?["fields"] is JArray fieldsArr)
+                                criteria.Fields = fieldsArr.Select(t => t.ToString()).ToList();
                             if (args?["argMatches"] is JObject am)
                             {
                                 criteria.ArgMatches = new Dictionary<int, string>();
@@ -490,10 +495,12 @@ namespace GxMcp.Worker.Services
                             return _objectService.WorkerReload(srcDir);
                         }
                         if (action == "ReadLogs") return _objectService.ReadLogs(
-                            args?["lines"]?.ToObject<int?>() ?? 50,
+                            args?["lines"]?.ToObject<int?>() ?? 100,
                             args?["filterCorrelation"]?.ToString(),
                             args?["grep"]?.ToString(),
-                            args?["since"]?.ToString());
+                            args?["since"]?.ToString(),
+                            // Item 32: objectFilter = target param for object-name filtering.
+                            args?["objectFilter"]?.ToString());
                         if (action == "ExportText")
                         {
                             return _objectService.ExportObjectToText(
@@ -601,7 +608,8 @@ namespace GxMcp.Worker.Services
                                 dryRunArg || validateOnly,
                                 args?["verifyRollback"]?.ToObject<bool?>() ?? false,
                                 args?["return_post_state"]?.ToObject<bool?>() ?? true,
-                                args?["verbose"]?.ToObject<bool?>() ?? false);
+                                args?["verbose"]?.ToObject<bool?>() ?? false,
+                                args?["replaceAll"]?.ToObject<bool?>() ?? false);
                         }
                         break;
                     case "analyze":
@@ -625,6 +633,8 @@ namespace GxMcp.Worker.Services
                         }
                         if (action == "ExplainCode") return _analyzeService.ExplainCode(target, payload);
                         if (action == "ParentContext") return _analyzeService.ParentContext(target);
+                        // Item 24: mode=callers — per-call-site detail with line + context.
+                        if (action == "FindCallerSites") return _analyzeService.FindCallerSites(target);
                         if (action == "ImpactAnalysis")
                         {
                             // v2.3.8 (Task 1.4): index-aware impact with optional wait-for-index.
@@ -684,6 +694,13 @@ namespace GxMcp.Worker.Services
                             string patKey = args?["pattern"]?.ToString();
                             if (reapply) return _patternApplyService.ReapplyPattern(target, patSettings);
                             return _patternApplyService.ApplyPattern(target, patKey, patSettings);
+                        }
+                        if (action == "Diagnose")
+                        {
+                            // Item 45: read-only preflight — returns structured reasons without mutating.
+                            var patSettings = args?["settings"] as JObject;
+                            string patKey = args?["pattern"]?.ToString();
+                            return _patternApplyService.DiagnosePattern(target, patKey, patSettings);
                         }
                         break;
                     case "sdkprobe":
@@ -827,6 +844,12 @@ namespace GxMcp.Worker.Services
                             string snapshotToken = args?["snapshot"]?.ToString();
                             bool discard = args?["discard"]?.ToObject<bool?>() ?? false;
                             return _historyService.Execute(target, action, verId, partName, snapshotToken, discard);
+                        }
+                    // Item 16 — genexus_undo last=N
+                    case "undo":
+                        {
+                            int last = args?["last"]?.ToObject<int?>() ?? 1;
+                            return _undoService.Undo(last);
                         }
                     case "property":
                         var propType = args?["type"]?.ToString();

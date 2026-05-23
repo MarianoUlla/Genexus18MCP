@@ -58,6 +58,15 @@ namespace GxMcp.Gateway
             }
         }
 
+        // Friction 2026-05-22: surface the exe path the worker was actually
+        // spawned from so whoami can show it. Worker can come from publish/worker/
+        // (config.json default), dev bin/Debug (fallback), or the gateway-relative
+        // worker/ dir — telling them apart used to require ps + filesystem inspection.
+        public string? SpawnedExePath { get; private set; }
+        public DateTime? SpawnedExeBuiltAtUtc { get; private set; }
+        // Item 52: uptime tracking — set when the worker process is successfully started.
+        public DateTime? SpawnedAtUtc { get; private set; }
+
         public long? WorkingSetBytes
         {
             get
@@ -441,6 +450,9 @@ namespace GxMcp.Gateway
                     throw new FileNotFoundException($"Worker NOT FOUND at {workerPath}");
                 }
 
+                SpawnedExePath = workerPath;
+                try { SpawnedExeBuiltAtUtc = File.GetLastWriteTimeUtc(workerPath); } catch { SpawnedExeBuiltAtUtc = null; }
+
                 var startInfo = new ProcessStartInfo
                 {
                     FileName = workerPath,
@@ -461,6 +473,25 @@ namespace GxMcp.Gateway
                 startInfo.EnvironmentVariables["GX_KB_PATH"] = kbPath;
                 startInfo.EnvironmentVariables["GX_SHADOW_PATH"] = _config.Environment?.GX_SHADOW_PATH ?? Path.Combine(kbPath, ".gx_mirror");
                 startInfo.EnvironmentVariables["PATH"] = (_config.GeneXus?.InstallationPath ?? string.Empty) + ";" + Environment.GetEnvironmentVariable("PATH");
+
+                // Forward any GXMCP_* env vars from the gateway process to the worker.
+                // Lets benchmarks / opt-outs (GXMCP_BUILD_COMPILE_ONLY, GXMCP_INPROCESS_BUILD_FASTPATH,
+                // GXMCP_BUILD_PROFILE, GXMCP_REAP_ORPHAN_MSBUILD, ...) be set on the gateway and
+                // automatically reach the worker without editing config files.
+                try
+                {
+                    foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+                    {
+                        string key = entry.Key?.ToString();
+                        if (!string.IsNullOrEmpty(key)
+                            && key.StartsWith("GXMCP_", StringComparison.OrdinalIgnoreCase)
+                            && !startInfo.EnvironmentVariables.ContainsKey(key))
+                        {
+                            startInfo.EnvironmentVariables[key] = entry.Value?.ToString() ?? string.Empty;
+                        }
+                    }
+                }
+                catch { /* env forwarding is best-effort */ }
 
                 if (_process != null)
                 {
@@ -533,6 +564,7 @@ namespace GxMcp.Gateway
                     try
                     {
                         _process.Start();
+                        SpawnedAtUtc = DateTime.UtcNow;
                         _spawnWatch.Stop();
                         System.Threading.Interlocked.Exchange(ref _spawnMs, _spawnWatch.ElapsedMilliseconds);
                         Program.Log($"[Gateway] worker_spawned pid={_process.Id} spawnMs={_spawnWatch.ElapsedMilliseconds} attempt={attempt} idleTimeoutMinutes={_workerIdleTimeout.TotalMinutes}");

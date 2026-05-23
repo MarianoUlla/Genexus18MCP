@@ -289,6 +289,31 @@ namespace GxMcp.Gateway
             };
         }
 
+        // Item 73: per-tool latency stats for whoami.stats.tools.
+        // In-memory ring buffer (lost on gateway restart); count/p50/p95 per tool.
+        // Limitation: stats reset on every gateway restart — document this in the block.
+        public JObject BuildToolStatsBlock()
+        {
+            var toolsObj = new JObject();
+            foreach (var kvp in _toolMetrics)
+            {
+                var j = kvp.Value.ToJObject();
+                long count = j["count"]?.ToObject<long>() ?? 0;
+                if (count == 0) continue;
+                toolsObj[kvp.Key] = new JObject
+                {
+                    ["p50Ms"] = j["p50Ms"],
+                    ["p95Ms"] = j["p95Ms"],
+                    ["count"] = count
+                };
+            }
+            return new JObject
+            {
+                ["tools"] = toolsObj,
+                ["note"] = "In-memory only; resets on gateway restart."
+            };
+        }
+
         public void CleanupExpired()
         {
             DateTime cutoff = DateTime.UtcNow - _retention;

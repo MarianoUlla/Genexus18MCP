@@ -1431,6 +1431,172 @@ namespace GxMcp.Worker.Services
             };
             return j.ToString(Newtonsoft.Json.Formatting.None);
         }
+
+        // ── Item 45: Pattern Diagnose ────────────────────────────────────────────
+        // Read-only preflight: resolve target + pattern, then run every validation
+        // gate that ApplyPattern would run, but return structured reasons instead of
+        // mutating anything. No SDK apply is called.
+        //
+        // Returned reasons (one or more may fire):
+        //   parentTypeMismatch   — target type is not supported by the pattern
+        //   overrideConflict     — an existing PatternInstance host already exists
+        //   templateInvalid      — caller-supplied template not found in KB
+        //   missingRequiredAttribute — target is null / unresolvable
+        //   ok                   — all checks pass; apply would proceed
+        //
+        // Each finding object: { reason, severity, detail, remediation }
+        public string DiagnosePattern(string objectName, string patternKey, JObject settings = null)
+        {
+            try
+            {
+                var findings = new JArray();
+
+                // ── 1. Parameter validation ──────────────────────────────────────
+                if (string.IsNullOrWhiteSpace(objectName))
+                {
+                    findings.Add(Finding("missingRequiredAttribute", "critical",
+                        "objectName is empty or null.",
+                        "Pass name=<KBObject name>."));
+                    return DiagnoseResponse(objectName, patternKey, findings);
+                }
+                if (string.IsNullOrWhiteSpace(patternKey))
+                {
+                    findings.Add(Finding("missingRequiredAttribute", "critical",
+                        "pattern key is empty or null.",
+                        "Pass pattern='WorkWithPlus' or a known GUID."));
+                    return DiagnoseResponse(objectName, patternKey, findings);
+                }
+
+                // ── 2. Pattern resolution ────────────────────────────────────────
+                if (!TryResolvePatternId(patternKey, out Guid patternId))
+                {
+                    findings.Add(Finding("templateInvalid", "critical",
+                        $"Unknown pattern key '{patternKey}'. Not in known-patterns registry and not a valid GUID.",
+                        "Use 'WorkWithPlus' (or alias 'WWP') or supply a raw pattern GUID."));
+                    return DiagnoseResponse(objectName, patternKey, findings);
+                }
+
+                // ── 3. Engine / license availability ────────────────────────────
+                object patternDef = null;
+                try { patternDef = _engine.GetPatternDefinition(patternId); } catch { }
+                if (patternDef == null)
+                {
+                    findings.Add(Finding("templateInvalid", "critical",
+                        "Pattern engine returned null for the given pattern GUID — package probably not installed or license inactive.",
+                        "Verify the WorkWithPlus package is present in GeneXus\\Packages\\Patterns\\WorkWithPlus\\. Check license activation."));
+                    return DiagnoseResponse(objectName, patternKey, findings);
+                }
+
+                // ── 4. Object resolution ─────────────────────────────────────────
+                KBObject obj = ResolveObject(objectName);
+                if (obj == null)
+                {
+                    findings.Add(Finding("missingRequiredAttribute", "critical",
+                        $"Object '{objectName}' not found in the KB.",
+                        "Verify the name with genexus_query or genexus_list_objects."));
+                    return DiagnoseResponse(objectName, patternKey, findings);
+                }
+
+                string parentType = obj.TypeDescriptor?.Name ?? "";
+
+                // ── 5. Parent-type gate ──────────────────────────────────────────
+                string callerTemplate = settings?["template"]?.ToString();
+                List<string> availableTemplates = null;
+                bool isWebPanelKind = string.Equals(parentType, "WebPanel", StringComparison.OrdinalIgnoreCase)
+                                   || string.Equals(parentType, "SDPanel", StringComparison.OrdinalIgnoreCase);
+                if (isWebPanelKind)
+                {
+                    try { availableTemplates = ListWwpWebTemplates(); } catch { availableTemplates = new List<string>(); }
+                }
+
+                string typeGateReject = TryBuildTypeGateRejection(obj.Name, patternKey, parentType, callerTemplate, availableTemplates);
+                if (typeGateReject != null)
+                {
+                    var rejectEnv = JObject.Parse(typeGateReject);
+                    bool isTemplateIssue = rejectEnv["error"]?.ToString()?.Contains("Template") == true
+                                       || rejectEnv["error"]?.ToString()?.Contains("template") == true;
+                    string reason = isTemplateIssue ? "templateInvalid" : "parentTypeMismatch";
+                    string detail = rejectEnv["error"]?.ToString() ?? "Type gate rejected apply.";
+                    string remediation = rejectEnv["hint"]?.ToString()
+                        ?? (rejectEnv["availableTemplates"] != null
+                            ? "Pass settings.template equal to one of availableTemplates: " + rejectEnv["availableTemplates"]
+                            : "Apply WorkWithPlus only to Transaction, WebPanel or SDPanel.");
+                    findings.Add(Finding(reason, "critical", detail, remediation));
+                }
+
+                // ── 6. Override / existing instance conflict ─────────────────────
+                object existingInstance = null;
+                try { existingInstance = _engine.GetPatternInstance(obj, patternId); } catch { }
+                if (existingInstance != null)
+                {
+                    findings.Add(Finding("overrideConflict", "warn",
+                        $"An existing PatternInstance for '{patternKey}' was found on '{objectName}'. A first-apply will be a no-op; use reapply=true.",
+                        "Call genexus_apply_pattern with reapply=true to regenerate the existing pattern instance."));
+                }
+
+                // ── 7. Missing required attribute: template for WebPanel targets ──
+                if (isWebPanelKind && string.IsNullOrEmpty(callerTemplate) && typeGateReject == null)
+                {
+                    if (availableTemplates != null && availableTemplates.Count > 0)
+                    {
+                        findings.Add(Finding("missingRequiredAttribute", "info",
+                            $"No settings.template supplied for {parentType} target. MCP will auto-discover one ({availableTemplates[0]}).",
+                            $"Pass settings.template explicitly to pin the template. Available: {string.Join(", ", availableTemplates)}."));
+                    }
+                    else
+                    {
+                        findings.Add(Finding("missingRequiredAttribute", "warn",
+                            $"No settings.template supplied and no 'WorkWithPlus for Web Template' objects found in this KB.",
+                            "Import or create a 'WorkWithPlus for Web Template' object before applying to a WebPanel."));
+                    }
+                }
+
+                // ── 8. ok — all critical checks passed ──────────────────────────
+                if (!findings.Any(f => f["severity"]?.ToString() == "critical"))
+                {
+                    findings.Add(Finding("ok", "info",
+                        "All pre-apply checks passed. The pattern should apply cleanly.",
+                        existingInstance != null
+                            ? "Remember to pass reapply=true (an instance already exists)."
+                            : "Call genexus_apply_pattern to proceed."));
+                }
+
+                return DiagnoseResponse(obj.Name, patternKey, findings);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("PatternApplyService.DiagnosePattern failed: " + ex);
+                return McpResponse.Error(ex.Message, objectName);
+            }
+        }
+
+        // ── helpers used only by DiagnosePattern ────────────────────────────────
+
+        private static JObject Finding(string reason, string severity, string detail, string remediation)
+        {
+            return new JObject
+            {
+                ["reason"] = reason,
+                ["severity"] = severity,
+                ["detail"] = detail,
+                ["remediation"] = remediation
+            };
+        }
+
+        private static string DiagnoseResponse(string target, string patternKey, JArray findings)
+        {
+            var hasAnyOk = findings.Any(f => f["reason"]?.ToString() == "ok");
+            var hasCritical = findings.Any(f => f["severity"]?.ToString() == "critical");
+            string overallStatus = hasCritical ? "blocked" : (hasAnyOk ? "ok" : "warnings");
+            var resp = new JObject
+            {
+                ["status"] = overallStatus,
+                ["target"] = target ?? "",
+                ["patternKey"] = patternKey ?? "",
+                ["findings"] = findings
+            };
+            return resp.ToString(Newtonsoft.Json.Formatting.None);
+        }
     }
 
     /// <summary>

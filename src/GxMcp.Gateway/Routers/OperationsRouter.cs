@@ -59,12 +59,15 @@ namespace GxMcp.Gateway.Routers
                         module = "Object",
                         action = "ReadLogs",
                         target = "_self",
-                        lines = args?["lines"]?.ToObject<int?>() ?? 50,
+                        // Item 32: new filter params. tail replaces the old lines param
+                        // (both forwarded; ObjectService prefers tail when non-zero).
+                        lines = args?["tail"]?.ToObject<int?>() ?? args?["lines"]?.ToObject<int?>() ?? 100,
                         filterCorrelation = args?["filterCorrelation"]?.ToString(),
                         grep = args?["grep"]?.ToString(),
-                        // v2.6.8: since=crash slices the log from the most recent
-                        // ERROR/CRITICAL marker so users have a focused snippet to share.
-                        since = args?["since"]?.ToString()
+                        // since: 'crash' or ISO-8601 timestamp.
+                        since = args?["since"]?.ToString(),
+                        // Item 32: object-name filter.
+                        objectFilter = args?["target"]?.ToString()
                     };
 
                 case "genexus_refactor":
@@ -128,13 +131,18 @@ namespace GxMcp.Gateway.Routers
                     };
 
                 case "genexus_apply_pattern":
+                {
+                    // Item 45: mode=diagnose routes to read-only Diagnose action; default → Apply.
+                    string apPatMode = args?["mode"]?.ToString();
+                    bool isDiagnose = string.Equals(apPatMode, "diagnose", System.StringComparison.OrdinalIgnoreCase);
                     return new
                     {
                         module = "Pattern",
-                        action = "Apply",
+                        action = isDiagnose ? "Diagnose" : "Apply",
                         target = args?["name"]?.ToString(),
                         @params = args
                     };
+                }
 
                 case "genexus_sdk_probe":
                     return new
@@ -188,6 +196,15 @@ namespace GxMcp.Gateway.Routers
                         part = RouterArgs.Str(args, "part"),
                         snapshot = RouterArgs.Str(args, "snapshot"),
                         discard = RouterArgs.Bool(args, "discard")
+                    };
+
+                // Item 16 — genexus_undo last=N
+                case "genexus_undo":
+                    return new
+                    {
+                        module = "Undo",
+                        action = "Undo",
+                        last = args?["last"]?.ToObject<int?>() ?? 1
                     };
 
                 case "genexus_structure":

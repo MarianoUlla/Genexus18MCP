@@ -41,7 +41,9 @@ namespace GxMcp.Gateway.Routers
                         includeComments = args?["includeComments"]?.ToObject<bool?>() ?? false,
                         maxResults = args?["maxResults"]?.ToObject<int?>() ?? 50,
                         scope = args?["scope"],
-                        argMatches = args?["argMatches"]
+                        argMatches = args?["argMatches"],
+                        // Item 22: fields=[source,caption,description,parmNames]
+                        fields = args?["fields"]
                     };
                 case "genexus_list_objects":
                     return new
