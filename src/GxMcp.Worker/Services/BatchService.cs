@@ -38,11 +38,16 @@ namespace GxMcp.Worker.Services
                     string operation = change["operation"]?.ToString() ?? "Replace";
                     int expectedCount = change["expectedCount"]?.ToObject<int?>() ?? 1;
                     bool dryRun = change["dryRun"]?.ToObject<bool?>() ?? false;
+                    // Item 9 follow-up: forward replaceAll into the batch path so
+                    // genexus_edit {targets:[...]} honours the same semantics as the
+                    // single-target call. Without this, a per-change replaceAll is
+                    // silently dropped and the call returns Ambiguous on N>1 matches.
+                    bool replaceAll = change["replaceAll"]?.ToObject<bool?>() ?? false;
 
                     string result;
                     if (mode == "patch")
                     {
-                        result = _patchService.ApplyPatch(target, part, operation, content, context, expectedCount, null, dryRun);
+                        result = _patchService.ApplyPatch(target, part, operation, content, context, expectedCount, null, dryRun, verifyRollback: false, returnPostState: true, verbose: false, replaceAll: replaceAll);
                     }
                     else
                     {

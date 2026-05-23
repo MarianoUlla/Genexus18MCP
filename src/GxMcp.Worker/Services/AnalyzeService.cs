@@ -1471,11 +1471,24 @@ namespace GxMcp.Worker.Services
                             src = _objectService?.ReadObjectSource(callerName, partName);
                             // Skip ReadObjectSource error envelopes — must look like a JSON error
                             // object, NOT any source line that happens to contain the word "error".
+                            // Two shapes occur: {"status":"Error",...} and {"error":"..."} (no status).
+                            // Match both, case-insensitively, while still rejecting real source that
+                            // merely mentions "error" mid-line.
                             if (!string.IsNullOrEmpty(src))
                             {
                                 var trimmed = src.TrimStart();
-                                if (trimmed.StartsWith("{") && trimmed.Contains("\"status\"") && trimmed.Contains("\"Error\""))
-                                    src = null;
+                                if (trimmed.StartsWith("{"))
+                                {
+                                    bool looksLikeStatusError = trimmed.IndexOf("\"status\"", StringComparison.OrdinalIgnoreCase) >= 0
+                                                                 && trimmed.IndexOf("\"Error\"", StringComparison.OrdinalIgnoreCase) >= 0;
+                                    // Front-of-payload error envelope: "error" key within the first 64 bytes
+                                    // of the JSON object. Real source rarely opens with a JSON object whose
+                                    // very first key is "error".
+                                    int errorKey = trimmed.IndexOf("\"error\"", StringComparison.OrdinalIgnoreCase);
+                                    bool looksLikeBareError = errorKey > 0 && errorKey < 64;
+                                    if (looksLikeStatusError || looksLikeBareError)
+                                        src = null;
+                                }
                             }
                         }
                         catch { }

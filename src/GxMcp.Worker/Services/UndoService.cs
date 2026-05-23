@@ -56,6 +56,10 @@ namespace GxMcp.Worker.Services
             List<string> allFiles;
             try
             {
+                // Sort newest-first by the timestamp embedded in the filename
+                // (<guidSanitized>-<part>-<yyyyMMddTHHmmssfffZ>.bak) — ordinal sort
+                // of full paths is dominated by the leading GUID and would pick
+                // arbitrary GUID-buckets instead of the actually-most-recent edits.
                 allFiles = Directory.EnumerateFiles(root)
                     .Where(p =>
                     {
@@ -63,7 +67,7 @@ namespace GxMcp.Worker.Services
                         return fn.EndsWith(".bak", StringComparison.OrdinalIgnoreCase)
                             || fn.EndsWith(".bak.gz", StringComparison.OrdinalIgnoreCase);
                     })
-                    .OrderByDescending(p => p, StringComparer.Ordinal)
+                    .OrderByDescending(p => ExtractSnapshotTimestamp(p), StringComparer.Ordinal)
                     .Take(last)
                     .ToList();
             }
@@ -181,6 +185,25 @@ namespace GxMcp.Worker.Services
                 resp["hint"] = $"Requested last={requestedLast} clamped to 20 (per-call hard cap). Call again to revert older snapshots.";
             }
             return resp.ToString();
+        }
+
+        /// Pulls the ISO-8601 timestamp segment out of a snapshot filename.
+        /// Filename shape: <c>&lt;guidSanitized&gt;-&lt;part&gt;-&lt;yyyyMMddTHHmmssfffZ&gt;.bak[.gz]</c>.
+        /// Returns the timestamp portion (sortable lexically); falls back to
+        /// the full file name when the shape doesn't match so degraded sort
+        /// is still deterministic instead of throwing.
+        private static string ExtractSnapshotTimestamp(string path)
+        {
+            string fn = Path.GetFileName(path) ?? string.Empty;
+            // Drop extension(s)
+            if (fn.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+                fn = fn.Substring(0, fn.Length - 3);
+            if (fn.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))
+                fn = fn.Substring(0, fn.Length - 4);
+            int lastDash = fn.LastIndexOf('-');
+            if (lastDash >= 0 && lastDash + 1 < fn.Length)
+                return fn.Substring(lastDash + 1);
+            return fn;
         }
 
         /// <summary>
