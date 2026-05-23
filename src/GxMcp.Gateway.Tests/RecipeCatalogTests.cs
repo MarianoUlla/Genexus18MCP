@@ -28,6 +28,9 @@ namespace GxMcp.Gateway.Tests
         [InlineData("create_popup")]
         [InlineData("edit_pattern_instance")]
         [InlineData("add_custom_button")]
+        [InlineData("popup_blocking_with_reload")]
+        [InlineData("radio_group_show_hide")]
+        [InlineData("extract_to_procedure")]
         public void Get_KnownRecipe_ReturnsGoalStepsPitfalls(string recipeName)
         {
             var r = RecipeCatalog.Get(recipeName);

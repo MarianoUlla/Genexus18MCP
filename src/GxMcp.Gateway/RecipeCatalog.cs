@@ -168,6 +168,139 @@ namespace GxMcp.Gateway
                         )
                     }),
 
+                ["popup_blocking_with_reload"] = new RecipeMeta(
+                    "Open a popup synchronously from a parent WebPanel and force a Refresh once it closes.",
+                    "genexus_recipe { name: 'popup_blocking_with_reload' }",
+                    () => new JObject
+                    {
+                        ["goal"] = "Parent WebPanel opens a popup, locks the screen until the user finishes the gate condition, and reloads on close. Mitigates the AUTO_REFRESH=VARS_CHANGE not firing after .Popup() (see playbook popup_call_async).",
+                        ["prereq"] = new JArray(
+                            "Parent is a WebPanel; popup is a WebPanel with Form type='layout' and an out-param matching the gate variable.",
+                            "Gate condition (e.g. &Aluno.NumRegProf.IsEmpty()) is expressible at Start subroutine time."
+                        ),
+                        ["steps"] = new JArray(
+                            Step("genexus_inspect", new JObject { ["name"] = "<ParentWebPanel>", ["include"] = new JArray("metadata", "variables") },
+                                 "Confirm parent is a WebPanel and the gate variable exists."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<ParentWebPanel>",
+                                ["part"] = "Events",
+                                ["mode"] = "patch",
+                                ["operation"] = "Insert_After",
+                                ["context"] = "Sub 'Start'",
+                                ["content"] = "    if <gate_condition>\n        UnnamedGroup1.Visible = 0\n        <Popup>.Popup(<inParms>, &Out1)\n    endif"
+                            }, "Hide blocking group + invoke popup synchronously. .Popup() returns immediately — out-param arrives via the Refresh."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<ParentWebPanel>",
+                                ["part"] = "Events",
+                                ["mode"] = "patch",
+                                ["operation"] = "Insert_After",
+                                ["context"] = "Sub 'Refresh'",
+                                ["content"] = "    if not <gate_condition>\n        UnnamedGroup1.Visible = 1\n    endif"
+                            }, "Restore visibility in Refresh once out-params populate the gate variable."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<ParentWebPanel>",
+                                ["part"] = "WebForm",
+                                ["mode"] = "patch",
+                                ["operation"] = "Replace",
+                                ["context"] = "<body",
+                                ["content"] = "<body onmousedown=\"if(!window.__gx_reloaded){window.__gx_reloaded=true;window.location.reload();}\""
+                            }, "First user mousedown after popup close → page reload. AUTO_REFRESH=VARS_CHANGE is unreliable across KBs.")
+                        ),
+                        ["pitfalls"] = new JArray(
+                            ".Popup() is asynchronous — out-params are EMPTY on the line right after. Always handle them in Refresh.",
+                            "Do NOT emit <script> for the reload hook inside gxTextBlock Format=\"HTML\" — the sanitizer escapes it. The <body onmousedown> route is preserved (see playbook html_form_inline_js).",
+                            "If the popup itself can be triggered before Start, gate the .Popup() call with a flag variable to avoid double-open."
+                        )
+                    }),
+
+                ["radio_group_show_hide"] = new RecipeMeta(
+                    "Build a radio-group whose selection toggles visibility of dependent controls.",
+                    "genexus_recipe { name: 'radio_group_show_hide' }",
+                    () => new JObject
+                    {
+                        ["goal"] = "Render a radio group as raw HTML inside a Format=\"HTML\" gxTextBlock and route onclick handlers to a hidden gxAttribute carrying the selected value. Dependent controls toggle visibility via inline onclick.",
+                        ["prereq"] = new JArray(
+                            "Target WebPanel/popup with Form type='layout'.",
+                            "Hidden gxAttribute backing variable (e.g. &Opcao Character(1)) declared in Variables.",
+                            "Dependent control IDs known (use genexus_inspect with include=['runtimeIds'] after a build)."
+                        ),
+                        ["steps"] = new JArray(
+                            Step("genexus_add_variable", new JObject { ["name"] = "<WebPanel>", ["variable"] = new JObject { ["name"] = "Opcao", ["type"] = "Character", ["length"] = 1 } },
+                                 "Backing variable for the selected radio."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<WebPanel>",
+                                ["part"] = "WebForm",
+                                ["mode"] = "patch",
+                                ["operation"] = "Insert_After",
+                                ["context"] = "<!-- radio_group anchor -->",
+                                ["content"] =
+                                    "<gxTextBlock Format=\"HTML\" Width=\"100%\"><![CDATA[\n" +
+                                    "<input type='radio' name='r' value='A' onclick=\"document.getElementById('vOPCAO').value='A';document.getElementById('GRPDETAILA').style.display='';document.getElementById('GRPDETAILB').style.display='none';\"> Opção A\n" +
+                                    "<input type='radio' name='r' value='B' onclick=\"document.getElementById('vOPCAO').value='B';document.getElementById('GRPDETAILA').style.display='none';document.getElementById('GRPDETAILB').style.display='';\"> Opção B\n" +
+                                    "]]></gxTextBlock>"
+                            }, "Raw HTML radios are preserved by the sanitizer (inline event-attrs ARE kept; <script> is not). htmlIds come from runtimeIds (uppercase of design id)."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<WebPanel>",
+                                ["part"] = "WebForm",
+                                ["mode"] = "patch",
+                                ["operation"] = "Insert_After",
+                                ["context"] = "<gxAttribute id=\"Opcao\"",
+                                ["content"] = " Visible=\"false\""
+                            }, "Hide the backing gxAttribute; the JS writes to its value via the document.getElementById('vOPCAO').value = '...' bridge.")
+                        ),
+                        ["pitfalls"] = new JArray(
+                            "Radio inputs inside a gxAttribute ControlType=\"Radio\" become read-only on Form type='free style'. Use raw HTML inside Format=\"HTML\" + a hidden gxAttribute, OR switch Form type to 'layout'.",
+                            "htmlIds are UPPERCASE in v18 runtime. genexus_inspect include=['runtimeIds'] returns the design→html mapping.",
+                            "Use semicolons between statements inside onclick — newlines inside the HTML attribute do NOT separate JS statements."
+                        )
+                    }),
+
+                ["extract_to_procedure"] = new RecipeMeta(
+                    "Move a WebPanel Events block that writes attributes (would hit spc0150) into a Procedure.",
+                    "genexus_recipe { name: 'extract_to_procedure' }",
+                    () => new JObject
+                    {
+                        ["goal"] = "Fix spc0150 (\"Attribute cannot be assigned in this context\") by extracting an attribute-writing For each block from a WebPanel Events part into a Procedure. Receives the same in/out variables and is called from the original spot.",
+                        ["prereq"] = new JArray(
+                            "Build returned spc0150, OR the genexus_edit PreflightSpc0150 warning fired.",
+                            "Know the variable scope used by the offending block (the parm signature for the new Procedure)."
+                        ),
+                        ["steps"] = new JArray(
+                            Step("genexus_create_object", new JObject {
+                                ["type"] = "Procedure",
+                                ["name"] = "<ParentWebPanel>WriteHelper",
+                                ["description"] = "Extracted from <ParentWebPanel> Events to satisfy spc0150."
+                            }, "New Procedure that owns the database mutation."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<ParentWebPanel>WriteHelper",
+                                ["part"] = "Rules",
+                                ["mode"] = "full",
+                                ["content"] = "parm(in:&InVar1, in:&InVar2, ...);"
+                            }, "Declare parm signature matching the variables the block reads/writes."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<ParentWebPanel>WriteHelper",
+                                ["part"] = "Source",
+                                ["mode"] = "full",
+                                ["content"] = "For each <Table>\n    where <key_var_equals_attr>\n    <Attr> = &Value\nendfor"
+                            }, "Body matches the original For each, but Procedure Source DOES allow attribute writes."),
+                            Step("genexus_edit", new JObject {
+                                ["name"] = "<ParentWebPanel>",
+                                ["part"] = "Events",
+                                ["mode"] = "patch",
+                                ["context"] = "<original For each block>",
+                                ["operation"] = "Replace",
+                                ["content"] = "<ParentWebPanel>WriteHelper.Call(&InVar1, &InVar2, ...)"
+                            }, "Replace the original block with a call to the new Procedure."),
+                            Step("genexus_lifecycle", new JObject { ["action"] = "build", ["target"] = "<ParentWebPanel>WriteHelper" },
+                                 "Build the new Procedure to validate the schema before rebuilding the WebPanel.")
+                        ),
+                        ["pitfalls"] = new JArray(
+                            "Procedures Allow attribute writes; WebPanel Events DO NOT. Don't try to keep the For each in the WebPanel.",
+                            "Pass variables by value (no `out:`) unless you actually need them mutated back — simpler signature, easier to reason about.",
+                            "If the original block had a `commit` rule, add `Rules: commit;` to the new Procedure so transactional semantics carry over."
+                        )
+                    }),
+
                 ["add_custom_button"] = new RecipeMeta(
                     "Add a custom action button to a WWP grid/toolbar.",
                     "genexus_recipe { name: 'add_custom_button' }",
